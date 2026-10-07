@@ -2761,8 +2761,9 @@ describe("automation visibility in chat", () => {
 		};
 		const view = render(<ChatWorkspace snapshot={snapshot} hasOlder onLoadOlder={vi.fn()} />);
 		await user.click(screen.getByRole("button", { name: "Hide automation messages" }));
-		expect(screen.getByText("1 automation message hidden")).toBeInTheDocument();
+		expect(screen.getByText("1 automation message hidden")).toHaveAttribute("aria-live", "polite");
 		expect(view.container.querySelectorAll("[data-index]")).toHaveLength(0);
+		expect(view.container.querySelectorAll(".cursor-chat-origin-message")).toHaveLength(0);
 		expect(screen.getByRole("button", { name: "Load earlier messages" })).toBeInTheDocument();
 		view.rerender(<ChatWorkspace snapshot={{ ...snapshot, latestSequence: 2, items: [...snapshot.items, { ...humanMessage("second-card"), id: "two", origin: "automation", sequence: 2 }] }} />);
 		expect(screen.getByText("2 automation messages hidden")).toBeInTheDocument();
@@ -2817,6 +2818,21 @@ describe("automation visibility in chat", () => {
 			expect(screen.queryByText(/automation message.*hidden/)).not.toBeInTheDocument();
 		},
 	);
+
+	it("preserves an automation-only recovered turn and its unknown-outcome notice", async () => {
+		const user = userEvent.setup();
+		const snapshot: ConversationSnapshot = {
+			...idleSnapshot(), latestSequence: 1,
+			turns: [{ id: "recovered", state: "recovered", requestedAt: "2026-10-07T12:00:00Z", completedAt: "2026-10-07T12:00:01Z" }],
+			items: [{ ...humanMessage("Recovered automation card"), id: "recovered-card", turnId: "recovered", origin: "automation" }],
+		};
+		render(<ChatWorkspace snapshot={snapshot} />);
+		expect(await screen.findByText("This turn was recovered from an earlier session")).toBeInTheDocument();
+		await user.click(screen.getByRole("button", { name: "Hide automation messages" }));
+		expect(screen.getByText("This turn was recovered from an earlier session")).toBeInTheDocument();
+		expect(screen.getByText("Recovered automation card")).toBeInTheDocument();
+		expect(screen.queryByText(/automation message.*hidden/)).not.toBeInTheDocument();
+	});
 
 	it("keeps uncertain delivery visible for browser-feedback automation cards", async () => {
 		const user = userEvent.setup();
