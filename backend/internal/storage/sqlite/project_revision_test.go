@@ -155,6 +155,72 @@ func TestProjectRevisionExplicitResetCannotReenableStaleCAS(t *testing.T) {
 	}
 }
 
+func TestProjectRevisionUpgradePreservesPopulatedReleaseData(t *testing.T) {
+	dir := t.TempDir()
+	db := openMigratedDatabaseCopyAt(t, dir, 189, pragmas)
+	config := `{"env":{"CLAUDE_CONFIG_DIR":"fixture-profile"},"worker":{"agent":"claude-code"},"orchestrator":{"agent":"claude-code"},"reviewers":[{"harness":"claude-code"}],"postCreate":["fixture hook"]}`
+	for _, seed := range []struct {
+		query string
+		args  []any
+	}{
+		{`INSERT INTO projects (id,path,registered_at,config) VALUES ('upgrade','fixture-workspace',CURRENT_TIMESTAMP,?)`, []any{config}},
+		{`INSERT INTO sessions (id,project_id,num,harness,activity_last_at,created_at,updated_at) VALUES ('upgrade-1','upgrade',1,'claude-code',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`, nil},
+		{`INSERT INTO conversations (id,scope,project_id,session_id,current_session_id,created_at,updated_at) VALUES ('upgrade-conversation','session','upgrade','upgrade-1','upgrade-1',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`, nil},
+		{`INSERT INTO conversation_messages (id,conversation_id,sequence,role,origin,text,created_at,updated_at) VALUES ('upgrade-message','upgrade-conversation',1,'user','automation','preserved report',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`, nil},
+	} {
+		if _, err := db.Exec(seed.query, seed.args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	upgraded, err := Open(dir)
+	if err != nil {
+		t.Fatalf("production upgrade failed: %v", err)
+	}
+	if err := upgraded.Close(); err != nil {
+		t.Fatal(err)
+	}
+	verify, err := sql.Open("sqlite", databaseURI(dir)+readOnlyPragmas)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = verify.Close() }()
+	var storedConfig, message string
+	var revision, sessions, conversations int64
+	if err := verify.QueryRow(`SELECT config,revision FROM projects WHERE id='upgrade'`).Scan(&storedConfig, &revision); err != nil {
+		t.Fatal(err)
+	}
+	if err := verify.QueryRow(`SELECT text FROM conversation_messages WHERE id='upgrade-message'`).Scan(&message); err != nil {
+		t.Fatal(err)
+	}
+	if err := verify.QueryRow(`SELECT count(*) FROM sessions WHERE id='upgrade-1'`).Scan(&sessions); err != nil {
+		t.Fatal(err)
+	}
+	if err := verify.QueryRow(`SELECT count(*) FROM conversations WHERE id='upgrade-conversation'`).Scan(&conversations); err != nil {
+		t.Fatal(err)
+	}
+	if storedConfig != config || revision != 0 || message != "preserved report" || sessions != 1 || conversations != 1 {
+		t.Fatalf("upgrade changed populated release data: revision=%d sessions=%d conversations=%d", revision, sessions, conversations)
+	}
+	var violations string
+	if err := verify.QueryRow(`PRAGMA integrity_check`).Scan(&violations); err != nil || violations != "ok" {
+		t.Fatalf("integrity: %q %v", violations, err)
+	}
+	rows, err := verify.Query(`PRAGMA foreign_key_check`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	if rows.Next() {
+		t.Fatal("foreign key violation after upgrade")
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestProjectRevisionCoversEveryWrite(t *testing.T) {
 	db, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "ao.db")+pragmas)
 	if err != nil {
