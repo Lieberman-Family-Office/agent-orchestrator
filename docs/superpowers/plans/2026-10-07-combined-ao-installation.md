@@ -17,6 +17,7 @@ No companion worktree edit, unconditional project-config PUT, CAS removal, lifec
 - Pinned backend head: `af6132514fe5c842c617e4f4285acfead60ebfaf`, branch `fix/post-create-session-context`.
 - Companion source: `~/dev/worktrees/ao_postcreate_context`, read-only. It has uncommitted changes beyond the pin; those are excluded.
 - Workflow consumer: `scripts/ao/route_9router.py`, merged workflow PR https://github.com/Lieberman-Family-Office/og-model-build-cursor-workflow/pull/3478, merge `a32f2ea3c86f26b11363ac40d9c2e9861e613a9f`.
+- Separately authorized compatibility correction: workflow branch `fix/ao-routing-sync-admission`, local commit `8d950b7fa`. It adds only synchronous `idle/ready` to proven PostCreate admission, retaining exact protected context, setup-running/agent-pending, no-controller, and reviewer checks. Intended RED reproduced for both modes; module GREEN is 45 tests and 768 subtests; lint/format pass. Independent review and PR landing/sync are still pending. Do not run production routing apply until the reviewed correction is landed and synced.
 - Backend contribution: https://github.com/OrchestratorInc/agent-orchestrator/pull/6365, inspected open at the pinned backend head. Its reported test results are not substituted for combined-source validation.
 
 Complete required backend commits, in order:
