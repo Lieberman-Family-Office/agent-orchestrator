@@ -1,4 +1,11 @@
 {
+	"chat.automation.hide": "隐藏自动化消息",
+	"chat.automation.show": "显示",
+	"chat.automation.hidden_one": "已隐藏 {{count}} 条自动化消息",
+	"chat.automation.hidden_other": "已隐藏 {{count}} 条自动化消息",
+	"chat.automation.scope": "数量仅包含已加载的对话历史。",
+	"chat.automation.storageTitle": "显示偏好未保存",
+	"chat.automation.storageBody": "此选择在当前窗口中有效，但重启后可能重置。",
 	"agentSelector.manage": "管理代理…",
 	"agentSelector.manageCloud": "管理 Harness 连接…",
 	"agentSelector.noneReady": "暂无可用代理",

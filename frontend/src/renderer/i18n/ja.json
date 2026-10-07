@@ -1,4 +1,11 @@
 {
+	"chat.automation.hide": "自動化メッセージを非表示",
+	"chat.automation.show": "表示",
+	"chat.automation.hidden_one": "自動化メッセージ {{count}} 件を非表示",
+	"chat.automation.hidden_other": "自動化メッセージ {{count}} 件を非表示",
+	"chat.automation.scope": "件数は読み込み済みの会話履歴のみを対象とします。",
+	"chat.automation.storageTitle": "表示設定を保存できませんでした",
+	"chat.automation.storageBody": "現在のウィンドウでは有効ですが、再起動後にリセットされる可能性があります。",
 	"agentSelector.manage": "エージェントを管理…",
 	"agentSelector.manageCloud": "ハーネスの接続を管理…",
 	"agentSelector.noneReady": "利用可能なエージェントがありません",

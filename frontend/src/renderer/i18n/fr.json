@@ -1,4 +1,12 @@
 {
+	"chat.automation.hide": "Masquer les messages d’automatisation",
+	"chat.automation.show": "Afficher",
+	"chat.automation.hidden_one": "{{count}} message d’automatisation masqué",
+	"chat.automation.hidden_many": "{{count}} messages d’automatisation masqués",
+	"chat.automation.hidden_other": "{{count}} messages d’automatisation masqués",
+	"chat.automation.scope": "Le nombre concerne uniquement l’historique de conversation chargé.",
+	"chat.automation.storageTitle": "La préférence d’affichage n’a pas été enregistrée",
+	"chat.automation.storageBody": "Ce choix fonctionne dans cette fenêtre, mais peut être réinitialisé au redémarrage.",
 	"agentSelector.manage": "Gérer les agents…",
 	"agentSelector.manageCloud": "Gérer les connexions des harnesses…",
 	"agentSelector.noneReady": "Aucun agent prêt",

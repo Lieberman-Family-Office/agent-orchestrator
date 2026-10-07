@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { appI18n } from "../i18n";
 import { aoBridge } from "../lib/bridge";
 import type { ProjectSettingsSection as ProjectFormSection } from "../components/ProjectSettingsForm";
 import type { TerminalTarget } from "../types/terminal";
@@ -106,6 +107,7 @@ export type UiState = {
 	remoteHosts: boolean;
 	/** Copy the terminal selection to the clipboard on mouse-up, like native terminals. Default on. */
 	terminalCopyOnSelect: boolean;
+	hideAutomationMessages: boolean;
 	restartingProjectIds: ReadonlySet<string>;
 	// Projects whose initial orchestrator spawn (after import/clone) is still
 	// running in the background. The board renders a progress banner and gates
@@ -152,6 +154,7 @@ export type UiState = {
 	setDeveloperMode: (enabled: boolean) => void;
 	setRemoteHosts: (enabled: boolean) => void;
 	setTerminalCopyOnSelect: (enabled: boolean) => void;
+	setHideAutomationMessages: (hidden: boolean) => void;
 	/** True while the restart-to-update confirmation is open. */
 	updateInstallPromptOpen: boolean;
 	openUpdateInstallPrompt: () => void;
@@ -205,6 +208,15 @@ const sidebarStorageKey = "ao.sidebar.open";
 const developerModeStorageKey = "ao.developerMode";
 const remoteHostsStorageKey = "ao.remoteHosts";
 const terminalCopyOnSelectStorageKey = "ao.terminalCopyOnSelect";
+// ponytail: Renderer-local preference; add storage-event sync if separate AO windows need live synchronization.
+const hideAutomationMessagesStorageKey = "ao.chat.hideAutomationMessages";
+function initialHideAutomationMessages(): boolean {
+	try {
+		return getLocalStorage()?.getItem(hideAutomationMessagesStorageKey) === "true";
+	} catch {
+		return false;
+	}
+}
 function getLocalStorage() {
 	if (typeof window === "undefined" || !window.localStorage) return null;
 	return window.localStorage;
@@ -266,6 +278,21 @@ export const useUiStore = create<UiState>((set, get) => ({
 	developerMode: initialDeveloperModeValue,
 	remoteHosts: initialRemoteHosts(),
 	terminalCopyOnSelect: initialTerminalCopyOnSelect(),
+	hideAutomationMessages: initialHideAutomationMessages(),
+	setHideAutomationMessages: (hideAutomationMessages) => {
+		set({ hideAutomationMessages });
+		try {
+			const storage = getLocalStorage();
+			if (!storage) throw new Error("Storage unavailable");
+			storage.setItem(hideAutomationMessagesStorageKey, String(hideAutomationMessages));
+		} catch {
+			get().showGlobalToast(
+				appI18n.t("chat.automation.storageTitle"),
+				appI18n.t("chat.automation.storageBody"),
+				{ tone: "error", dedupeKey: "automation-visibility-storage" },
+			);
+		}
+	},
 	restartingProjectIds: new Set<string>(),
 	provisioningProjectIds: new Set<string>(),
 	orchestratorReplacementErrors: {},

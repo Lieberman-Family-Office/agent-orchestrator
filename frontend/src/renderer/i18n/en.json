@@ -1,4 +1,11 @@
 {
+	"chat.automation.hide": "Hide automation messages",
+	"chat.automation.show": "Show",
+	"chat.automation.hidden_one": "{{count}} automation message hidden",
+	"chat.automation.hidden_other": "{{count}} automation messages hidden",
+	"chat.automation.scope": "Count covers loaded conversation history.",
+	"chat.automation.storageTitle": "Display preference was not saved",
+	"chat.automation.storageBody": "This choice works for this window but may reset after restart.",
 	"agentSelector.manage": "Manage agents…",
 	"agentSelector.manageCloud": "Manage harness connections…",
 	"agentSelector.noneReady": "No agents ready",
