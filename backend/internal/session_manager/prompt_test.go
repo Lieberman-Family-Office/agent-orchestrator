@@ -173,7 +173,7 @@ func TestBuildSystemPrompt_WorkerMayDelegateToNativeSubagents(t *testing.T) {
 func TestBuildSystemPrompt_NoWorkerVariantProhibitsNativeDelegation(t *testing.T) {
 	for _, cfg := range []systemPromptConfig{
 		{Role: sessionPromptRoleWorker, Project: promptProject{ID: "mer", Repo: "https://github.com/acme/mercury"}, OrchestratorSessionID: "mer-orchestrator"},
-		{Role: sessionPromptRoleWorker, Project: promptProject{ID: "mer", Repo: "https://github.com/acme/mercury", WorkersRequestReview: true}},
+		{Role: sessionPromptRoleWorker, Project: promptProject{ID: "mer", Repo: "https://github.com/acme/mercury"}},
 		{Role: sessionPromptRoleWorker, Project: promptProject{ID: "mer"}},
 		{Role: sessionPromptRoleWorker, Project: promptProject{ID: "mer"}, OrchestratorSessionID: "mer-orchestrator"},
 		{Role: sessionPromptRoleWorker, Standalone: true},
