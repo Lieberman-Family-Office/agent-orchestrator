@@ -195,3 +195,56 @@ describe("workspace file open requests", () => {
 		expect(useUiStore.getState().workspaceFileOpenRequest).toBeNull();
 	});
 });
+
+const visibilityKey = "ao.chat.hideAutomationMessages";
+
+describe("automation message visibility", () => {
+	beforeEach(() => {
+		window.localStorage.clear();
+		vi.resetModules();
+		useUiStore.setState({ hideAutomationMessages: false });
+		useUiStore.getState().clearGlobalToast();
+	});
+
+	it("shows messages by default and ignores invalid stored values", async () => {
+		expect((await bootStore()).getState().hideAutomationMessages).toBe(false);
+		localStorage.setItem(visibilityKey, "not-a-boolean");
+		vi.resetModules();
+		expect((await bootStore()).getState().hideAutomationMessages).toBe(false);
+	});
+
+	it("persists hiding and revealing across a fresh module boot", async () => {
+		useUiStore.getState().setHideAutomationMessages(true);
+		expect(localStorage.getItem(visibilityKey)).toBe("true");
+		expect((await bootStore()).getState().hideAutomationMessages).toBe(true);
+		useUiStore.getState().setHideAutomationMessages(false);
+		expect(localStorage.getItem(visibilityKey)).toBe("false");
+		vi.resetModules();
+		expect((await bootStore()).getState().hideAutomationMessages).toBe(false);
+	});
+
+	it("fails open to showing messages when storage cannot be read", async () => {
+		const read = vi.spyOn(window.localStorage, "getItem").mockImplementation((key) => {
+			if (key === visibilityKey) throw new DOMException("blocked", "SecurityError");
+			return null;
+		});
+		try {
+			expect((await bootStore()).getState().hideAutomationMessages).toBe(false);
+		} finally {
+			read.mockRestore();
+		}
+	});
+
+	it("keeps the current choice usable and reports a failed write", () => {
+		const write = vi.spyOn(window.localStorage, "setItem").mockImplementation(() => {
+			throw new DOMException("full", "QuotaExceededError");
+		});
+		try {
+			expect(() => useUiStore.getState().setHideAutomationMessages(true)).not.toThrow();
+			expect(useUiStore.getState().hideAutomationMessages).toBe(true);
+			expect(useUiStore.getState().globalToast?.title).toBe("Display preference was not saved");
+		} finally {
+			write.mockRestore();
+		}
+	});
+});

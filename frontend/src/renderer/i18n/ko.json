@@ -1,4 +1,11 @@
 {
+	"chat.automation.hide": "자동화 메시지 숨기기",
+	"chat.automation.show": "표시",
+	"chat.automation.hidden_one": "자동화 메시지 {{count}}개 숨김",
+	"chat.automation.hidden_other": "자동화 메시지 {{count}}개 숨김",
+	"chat.automation.scope": "개수는 불러온 대화 기록에만 적용됩니다.",
+	"chat.automation.storageTitle": "표시 설정이 저장되지 않았습니다",
+	"chat.automation.storageBody": "현재 창에서는 적용되지만 재시작 후 초기화될 수 있습니다.",
 	"chat.startup.queuePlaceholder": "{{agent}} 시작 중. 메시지는 순서대로 전송됩니다",
 	"settings.coder11x.navLabel": "Coder",
 	"settings.coder11x.templatesListLabel": "Templates on your Coder",
