@@ -2673,6 +2673,7 @@ function Timeline({
 			}));
 	}, [items, localEchos, snapshot.latestSequence]);
 	const timelineItems = useStableList([...items, ...localItems], itemKey, sameContent);
+	const { t } = useTranslation();
 	const hideAutomationMessages = useUiStore((state) => state.hideAutomationMessages);
 	const setHideAutomationMessages = useUiStore((state) => state.setHideAutomationMessages);
 	const { grouped, hiddenAutomationCount } = useMemo(() => {

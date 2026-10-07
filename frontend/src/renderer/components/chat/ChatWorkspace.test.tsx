@@ -1976,7 +1976,7 @@ describe("automation visibility in chat", () => {
 		const view = render(<ChatWorkspace snapshot={snapshot} hasOlder onLoadOlder={vi.fn()} />);
 		await user.click(screen.getByRole("button", { name: "Hide automation messages" }));
 		expect(screen.getByText("1 automation message hidden")).toBeInTheDocument();
-		expect(view.container.querySelectorAll("[data-index]")).toHaveLength(0);
+		expect(view.container.querySelectorAll(".cursor-chat-origin-message")).toHaveLength(0);
 		expect(screen.getByRole("button", { name: "Load earlier messages" })).toBeInTheDocument();
 		view.rerender(<ChatWorkspace snapshot={{ ...snapshot, latestSequence: 2, items: [...snapshot.items, { ...humanMessage("second-card"), id: "two", origin: "automation", sequence: 2 }] }} />);
 		expect(screen.getByText("2 automation messages hidden")).toBeInTheDocument();
@@ -1994,8 +1994,7 @@ describe("automation visibility in chat", () => {
 		expect(screen.getByText("routine one")).toBeInTheDocument();
 	});
 
-	it("keeps errors and assistant replies in a virtualized history", async () => {
-		stubVirtualTimelineGeometry();
+	it("keeps errors and assistant replies in a long history", async () => {
 		const user = userEvent.setup();
 		const snapshot: ConversationSnapshot = {
 			...idleSnapshot(),
