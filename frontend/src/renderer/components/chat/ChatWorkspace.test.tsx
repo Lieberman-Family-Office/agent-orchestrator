@@ -1900,6 +1900,170 @@ Task: Address the feedback below according to its wording. Visual adjustments ar
 	});
 });
 
+function visibilitySnapshot(): ConversationSnapshot {
+	const base = idleSnapshot();
+	const approval = chatFixture.items.find((item) => item.id === "a-7")!;
+	const items: ConversationSnapshot["items"] = [
+		{ ...humanMessage("Human says AUTOMATION but is still human"), id: "human", sequence: 1 },
+		{ ...humanMessage("routine one"), id: "auto-1", origin: "automation", sequence: 2 },
+		{ ...humanMessage("routine two"), id: "auto-2", origin: "automation", delivery: "accepted", sequence: 3 },
+		{ ...humanMessage("Assistant response stays"), id: "assistant", role: "assistant", origin: "automation", sequence: 4 },
+		{ ...humanMessage("uncertain report"), id: "uncertain", origin: "automation", delivery: "uncertain", sequence: 5 },
+		{ ...humanMessage("failed delivery report"), id: "failed-delivery", origin: "automation", delivery: "failed", sequence: 6 },
+		{ ...humanMessage("queued report"), id: "queued", origin: "automation", delivery: "queued", sequence: 7 },
+		{ ...humanMessage("sending report"), id: "sending", origin: "automation", delivery: "sending", sequence: 8 },
+		{ ...humanMessage("failed turn report"), id: "failed-turn-message", turnId: "failed-turn", origin: "automation", sequence: 9 },
+		{ ...approval, id: "approval", turnId: "active-turn", sequence: 10 },
+		{ kind: "activity", id: "error", sequence: 11, revision: 0, activityKind: "error", status: "failed", summary: "Transport failed", createdAt: "2026-10-07T12:00:00Z" },
+		{ ...humanMessage("daemon notice stays"), id: "daemon", origin: "daemon", sequence: 12 },
+		{ ...humanMessage("provider notice stays"), id: "provider", origin: "provider", sequence: 13 },
+		{ ...humanMessage("streaming report stays"), id: "streaming", origin: "automation", streaming: true, sequence: 14 },
+	];
+	return {
+		...base,
+		controller: { state: "busy" },
+		items,
+		turns: [
+			{ id: "active-turn", state: "running", requestedAt: "2026-10-07T12:00:00Z" },
+			{ id: "failed-turn", state: "failed", requestedAt: "2026-10-07T11:59:00Z", completedAt: "2026-10-07T12:00:00Z", errorMessage: "Turn failed" },
+		],
+		latestSequence: 14,
+	};
+}
+
+describe("automation visibility in chat", () => {
+	beforeEach(() => {
+		useUiStore.setState({ hideAutomationMessages: false });
+		localStorage.removeItem("ao.chat.hideAutomationMessages");
+	});
+	afterEach(() => useUiStore.setState({ hideAutomationMessages: false }));
+
+	it("hides routine cards only, reports the exact count, and restores original content", async () => {
+		const user = userEvent.setup();
+		const snapshot = visibilitySnapshot();
+		const original = structuredClone(snapshot);
+		const onSend = vi.fn();
+		const view = render(<ChatWorkspace snapshot={snapshot} onSend={onSend} />);
+		const toggle = screen.getByRole("button", { name: "Hide automation messages" });
+		expect(toggle).toHaveAttribute("aria-pressed", "false");
+		await user.click(toggle);
+		expect(toggle).toHaveAttribute("aria-pressed", "true");
+		expect(screen.queryByText("routine one")).not.toBeInTheDocument();
+		expect(screen.queryByText("routine two")).not.toBeInTheDocument();
+		expect(screen.getByText("2 automation messages hidden")).toBeInTheDocument();
+		for (const text of ["Human says AUTOMATION but is still human", "Assistant response stays", "uncertain report", "failed delivery report", "queued report", "sending report", "failed turn report", "Transport failed", "daemon notice stays", "provider notice stays", "streaming report stays"]) {
+			expect(screen.getByText(text)).toBeInTheDocument();
+		}
+		expect(screen.getByText("Delivery uncertain — not retried automatically")).toBeInTheDocument();
+		expect(screen.getByText("Not delivered")).toBeInTheDocument();
+		expect(screen.getByRole("button", { name: "Approve" })).toBeInTheDocument();
+		expect(snapshot).toEqual(original);
+		expect(onSend).not.toHaveBeenCalled();
+		view.rerender(<ChatWorkspace snapshot={{ ...snapshot, conversationId: "other-conversation", sessionId: "other-session" }} onSend={onSend} />);
+		expect(screen.getByRole("button", { name: "Hide automation messages" })).toHaveAttribute("aria-pressed", "true");
+		await user.click(screen.getByRole("button", { name: "Show" }));
+		expect(screen.getByText("routine one")).toBeInTheDocument();
+		expect(screen.getByText("routine two")).toBeInTheDocument();
+		expect(localStorage.getItem("ao.chat.hideAutomationMessages")).toBe("false");
+	});
+
+	it("updates the count as loaded history grows and has no card-sized blank gaps", async () => {
+		const user = userEvent.setup();
+		const snapshot: ConversationSnapshot = {
+			...idleSnapshot(), turns: [], latestSequence: 1,
+			items: [{ ...humanMessage("hidden-only-card"), id: "one", origin: "automation" }],
+		};
+		const view = render(<ChatWorkspace snapshot={snapshot} hasOlder onLoadOlder={vi.fn()} />);
+		await user.click(screen.getByRole("button", { name: "Hide automation messages" }));
+		expect(screen.getByText("1 automation message hidden")).toBeInTheDocument();
+		expect(view.container.querySelectorAll("[data-index]")).toHaveLength(0);
+		expect(screen.getByRole("button", { name: "Load earlier messages" })).toBeInTheDocument();
+		view.rerender(<ChatWorkspace snapshot={{ ...snapshot, latestSequence: 2, items: [...snapshot.items, { ...humanMessage("second-card"), id: "two", origin: "automation", sequence: 2 }] }} />);
+		expect(screen.getByText("2 automation messages hidden")).toBeInTheDocument();
+	});
+
+	it("allows keyboard hiding and revealing without losing warnings", async () => {
+		const user = userEvent.setup();
+		render(<ChatWorkspace snapshot={visibilitySnapshot()} />);
+		const toggle = screen.getByRole("button", { name: "Hide automation messages" });
+		toggle.focus();
+		await user.keyboard(" ");
+		expect(toggle).toHaveAttribute("aria-pressed", "true");
+		screen.getByRole("button", { name: "Show" }).focus();
+		await user.keyboard("{Enter}");
+		expect(screen.getByText("routine one")).toBeInTheDocument();
+	});
+
+	it("keeps errors and assistant replies in a virtualized history", async () => {
+		stubVirtualTimelineGeometry();
+		const user = userEvent.setup();
+		const snapshot: ConversationSnapshot = {
+			...idleSnapshot(),
+			turns: Array.from({ length: 25 }, (_, index) => ({
+				id: `history-${index}`, state: "completed" as const,
+				requestedAt: "2026-10-07T12:00:00Z", completedAt: "2026-10-07T12:00:01Z",
+			})),
+			items: Array.from({ length: 25 }, (_, index) => [
+				{ ...humanMessage(`report-${index}`), id: `report-${index}`, turnId: `history-${index}`, sequence: index * 3 + 1, origin: "automation" as const },
+				{ ...humanMessage(`reply-${index}`), id: `reply-${index}`, turnId: `history-${index}`, sequence: index * 3 + 2, role: "assistant" as const, origin: "provider" as const },
+				{ kind: "activity" as const, id: `warning-${index}`, turnId: `history-${index}`, sequence: index * 3 + 3, revision: 0, activityKind: "error" as const, status: "failed" as const, summary: `warning-${index}`, createdAt: "2026-10-07T12:00:00Z" },
+			]).flat(), latestSequence: 75,
+		};
+		render(<ChatWorkspace snapshot={snapshot} />);
+		await user.click(screen.getByRole("button", { name: "Hide automation messages" }));
+		expect(screen.getByText("25 automation messages hidden")).toBeInTheDocument();
+		expect(screen.queryByText("report-24")).not.toBeInTheDocument();
+		expect(screen.getByText("reply-24")).toBeInTheDocument();
+		expect(screen.getByText("warning-24")).toBeInTheDocument();
+	});
+
+	it.each(["queued", "failed", "interrupted", "cancelled"] as const)(
+		"keeps %s turn messages when delivery state is missing", async (state) => {
+			const user = userEvent.setup();
+			const snapshot: ConversationSnapshot = {
+				...idleSnapshot(), latestSequence: 1,
+				turns: [{ id: "protected", state, requestedAt: "2026-10-07T12:00:00Z" }],
+				items: [{ ...humanMessage("protected automation card"), id: "protected-card", turnId: "protected", origin: "automation" }],
+			};
+			render(<ChatWorkspace snapshot={snapshot} />);
+			await user.click(screen.getByRole("button", { name: "Hide automation messages" }));
+			expect(screen.getByText("protected automation card")).toBeInTheDocument();
+			expect(screen.queryByText(/automation message.*hidden/)).not.toBeInTheDocument();
+		},
+	);
+
+	it("keeps uncertain delivery visible for browser-feedback automation cards", async () => {
+		const user = userEvent.setup();
+		const snapshot: ConversationSnapshot = {
+			...idleSnapshot(), turns: [], latestSequence: 1,
+			items: [{
+				...humanMessage("<browser_annotations>\nBrowser feedback\nPage: Example\nURL: https://example.com/\nAnnotations: 1\n\nAnnotation 1 (comment):\nTarget: button\nComment: Keep the warning visible.\n\n</browser_annotations>"),
+				origin: "automation", delivery: "uncertain",
+			}],
+		};
+		render(<ChatWorkspace snapshot={snapshot} />);
+		await user.click(screen.getByRole("button", { name: "Hide automation messages" }));
+		expect(screen.getByText("Browser feedback")).toBeInTheDocument();
+		expect(screen.getByText("Delivery uncertain — not retried automatically")).toBeInTheDocument();
+	});
+
+	it("does not count cards inside a cancelled human queue group", async () => {
+		const user = userEvent.setup();
+		const snapshot: ConversationSnapshot = {
+			...idleSnapshot(), latestSequence: 3,
+			turns: [{ id: "queue-turn", state: "cancelled", requestedAt: "2026-10-07T12:00:00Z" }],
+			items: [
+				{ ...humanMessage("cancelled human prompt"), id: "old-human", turnId: "queue-turn" },
+				{ ...humanMessage("already-suppressed card"), id: "old-card", turnId: "queue-turn", origin: "automation", sequence: 2 },
+				{ ...humanMessage("current card"), id: "current-card", origin: "automation", sequence: 3 },
+			],
+		};
+		render(<ChatWorkspace snapshot={snapshot} />);
+		await user.click(screen.getByRole("button", { name: "Hide automation messages" }));
+		expect(screen.getByText("1 automation message hidden")).toBeInTheDocument();
+	});
+});
+
 describe("ChatWorkspace message actions", () => {
 	it("hides first-message editing until the conversation controller is ready", () => {
 		render(

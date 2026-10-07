@@ -687,6 +687,11 @@ export function OriginMessage({ message }: { message: ConversationMessage }) {
 					{expanded ? "Hide report" : "Show full report"}
 				</button>
 			) : null}
+			{message.delivery && message.delivery !== "accepted" ? (
+				<div className="mt-1.5">
+					<DeliveryNote state={message.delivery} />
+				</div>
+			) : null}
 		</div>
 	);
 }
@@ -732,6 +737,11 @@ function BrowserAnnotationOrigin({
 				<p className="mt-2 text-[11px] text-muted-foreground">
 					{annotations.screenshotCount} reference screenshot{annotations.screenshotCount === 1 ? "" : "s"}
 				</p>
+			) : null}
+			{message.delivery && message.delivery !== "accepted" ? (
+				<div className="mt-1.5">
+					<DeliveryNote state={message.delivery} />
+				</div>
 			) : null}
 		</div>
 	);

@@ -29,7 +29,7 @@ import {
 	type ReactNode,
 	type WheelEvent as ReactWheelEvent,
 } from "react";
-import { ArrowDown, Loader2, TriangleAlert, Undo2 } from "lucide-react";
+import { ArrowDown, EyeOff, Loader2, TriangleAlert, Undo2 } from "lucide-react";
 import { Reorder, useDragControls } from "motion/react";
 import { useTranslation } from "react-i18next";
 import { cn } from "../../lib/utils";
@@ -1675,6 +1675,32 @@ function readableItems(snapshot: ConversationSnapshot): ConversationItem[] {
 
 /* -------------------------------------------------------------------------- */
 
+function AutomationMessagesToggle() {
+	const { t } = useTranslation();
+	const hidden = useUiStore((state) => state.hideAutomationMessages);
+	const setHidden = useUiStore((state) => state.setHideAutomationMessages);
+	return (
+		<Button
+			type="button"
+			variant="ghost"
+			size="icon-sm"
+			aria-label={t("chat.automation.hide")}
+			aria-pressed={hidden}
+			title={t("chat.automation.hide")}
+			className="min-h-6 min-w-6 shrink-0"
+			onClick={() => setHidden(!hidden)}
+		>
+			<EyeOff aria-hidden="true" className="size-3.5" />
+		</Button>
+	);
+}
+
+function canHideAutomationMessage(item: ConversationItem, protectedTurns: ReadonlySet<string>): boolean {
+	return item.kind === "message" && item.role === "user" && item.origin === "automation" &&
+		!item.streaming && (item.delivery === undefined || item.delivery === "accepted") &&
+		(!item.turnId || !protectedTurns.has(item.turnId));
+}
+
 function ChatHeader({
 	snapshot,
 	sessionTitle,
@@ -1871,6 +1897,7 @@ function ChatHeader({
 					data-testid="session-action-region"
 				>
 					{tabStripAction ? <div data-testid="session-tab-strip-action">{tabStripAction}</div> : null}
+					{timelineActive ? <AutomationMessagesToggle /> : null}
 					{headerActions}
 				</div>
 			</div>
@@ -2646,12 +2673,28 @@ function Timeline({
 			}));
 	}, [items, localEchos, snapshot.latestSequence]);
 	const timelineItems = useStableList([...items, ...localItems], itemKey, sameContent);
-	const grouped = useMemo(() => {
+	const hideAutomationMessages = useUiStore((state) => state.hideAutomationMessages);
+	const setHideAutomationMessages = useUiStore((state) => state.setHideAutomationMessages);
+	const { grouped, hiddenAutomationCount } = useMemo(() => {
 		const hiddenTurns = hiddenTimelineTurnIds(snapshot);
-		return groupByTurn({ ...snapshot, items: timelineItems }).filter(
+		const originalGroups = groupByTurn({ ...snapshot, items: timelineItems }).filter(
 			(group) => !group.turnId || !hiddenTurns.has(group.turnId),
 		);
-	}, [snapshot, timelineItems]);
+		if (!hideAutomationMessages) return { grouped: originalGroups, hiddenAutomationCount: 0 };
+		const protectedTurns = new Set(snapshot.turns.filter((entry) =>
+			entry.state === "queued" || entry.state === "failed" || entry.state === "interrupted" || entry.state === "cancelled",
+		).map((entry) => entry.id));
+		let hiddenAutomationCount = 0;
+		const grouped = originalGroups.flatMap((group) => {
+			const visibleItems = group.items.filter((item) => !canHideAutomationMessage(item, protectedTurns));
+			hiddenAutomationCount += group.items.length - visibleItems.length;
+			if (visibleItems.length === group.items.length) return [group];
+			if (!visibleItems.length && !group.live && !group.blocked && !group.plan && !group.diff &&
+				group.outcome?.state !== "failed" && group.outcome?.state !== "interrupted") return [];
+			return [{ ...group, items: visibleItems }];
+		});
+		return { grouped, hiddenAutomationCount };
+	}, [hideAutomationMessages, snapshot, timelineItems]);
 	const groups = useStableList(grouped, groupKey, sameGroup);
 	const navigableGroups = useMemo(() => groups.filter(groupHasHumanPrompt), [groups]);
 	const previews = useMemo(() => navigableGroups.map(groupPreview), [navigableGroups]);
@@ -2914,17 +2957,32 @@ function Timeline({
 
 	return (
 		<div
-			className="relative min-h-0 flex-1"
+			className="relative flex min-h-0 flex-1 flex-col"
 			data-testid="chat-timeline"
 			// The timeline is a fixed-size flex item with its own scroll viewport.
 			// Isolating its layout and paint means Lexical selection/composer updates
 			// cannot invalidate the complete mounted conversation history or shell.
 			style={{ contain: "layout paint" }}
 		>
+			{hiddenAutomationCount > 0 ? (
+				<div className="shrink-0 px-4 py-1 text-xs text-muted-foreground">
+					<div className="mx-auto flex max-w-3xl items-center gap-1" title={t("chat.automation.scope")}>
+						<span>{t("chat.automation.hidden", { count: hiddenAutomationCount })}</span>
+						<span aria-hidden="true">·</span>
+						<button
+							type="button"
+							className="min-h-6 rounded px-1 text-markdown-link hover:underline focus-visible:outline-2 focus-visible:outline-ring"
+							onClick={() => setHideAutomationMessages(false)}
+						>
+							{t("chat.automation.show")}
+						</button>
+					</div>
+				</div>
+			) : null}
 			<div
 				ref={scroller}
 				onScroll={onScroll}
-				className="chat-scroll-viewport cursor-chat-timeline h-full min-w-0 select-text overflow-x-hidden overflow-y-auto px-4 pt-5 pb-0"
+				className="chat-scroll-viewport cursor-chat-timeline min-h-0 flex-1 min-w-0 select-text overflow-x-hidden overflow-y-auto px-4 pt-5 pb-0"
 				role="log"
 				aria-live="polite"
 				aria-label="Conversation"
