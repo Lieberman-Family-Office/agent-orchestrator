@@ -2327,6 +2327,17 @@ html.sidebar-reordering * {
 	box-shadow: none !important;
 }
 
+/* These display controls need a keyboard indicator despite global ring suppression. */
+button.automation-visibility-control:focus-visible {
+	outline: 2px solid var(--color-foreground) !important;
+	outline-offset: -2px !important;
+}
+@media (forced-colors: active) {
+	button.automation-visibility-control:focus-visible {
+		outline-color: Highlight !important;
+	}
+}
+
 /* Expanded-only sidebar chrome waits for the rail width transition to finish
  * before painting, so tap-to-expand does not flash labels inside the narrow
  * collapsed rail. */

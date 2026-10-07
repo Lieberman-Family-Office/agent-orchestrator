@@ -1687,7 +1687,7 @@ function AutomationMessagesToggle() {
 			aria-label={t("chat.automation.hide")}
 			aria-pressed={hidden}
 			title={t("chat.automation.hide")}
-			className="min-h-6 min-w-6 shrink-0"
+			className="automation-visibility-control min-h-6 min-w-6 shrink-0"
 			onClick={() => setHidden(!hidden)}
 		>
 			<EyeOff aria-hidden="true" className="size-3.5" />
@@ -2683,7 +2683,7 @@ function Timeline({
 		);
 		if (!hideAutomationMessages) return { grouped: originalGroups, hiddenAutomationCount: 0 };
 		const protectedTurns = new Set(snapshot.turns.filter((entry) =>
-			entry.state === "queued" || entry.state === "failed" || entry.state === "interrupted" || entry.state === "cancelled",
+			entry.state === "queued" || entry.state === "failed" || entry.state === "interrupted" || entry.state === "cancelled" || entry.state === "recovered",
 		).map((entry) => entry.id));
 		let hiddenAutomationCount = 0;
 		const grouped = originalGroups.flatMap((group) => {
@@ -2965,26 +2965,32 @@ function Timeline({
 			// cannot invalidate the complete mounted conversation history or shell.
 			style={{ contain: "layout paint" }}
 		>
-			{hiddenAutomationCount > 0 ? (
-				<div className="shrink-0 px-4 py-1 text-xs text-muted-foreground">
-					<div className="mx-auto flex max-w-3xl items-center gap-1" title={t("chat.automation.scope")}>
-						<span>{t("chat.automation.hidden", { count: hiddenAutomationCount })}</span>
-						<span aria-hidden="true">·</span>
-						<button
-							type="button"
-							className="min-h-6 rounded px-1 text-markdown-link hover:underline focus-visible:outline-2 focus-visible:outline-ring"
-							onClick={() => setHideAutomationMessages(false)}
-						>
-							{t("chat.automation.show")}
-						</button>
-					</div>
+			<div className={hiddenAutomationCount > 0 ? "shrink-0 px-4 py-1 text-xs text-muted-foreground" : "sr-only"}>
+				<div className="mx-auto flex max-w-3xl items-center gap-1" title={t("chat.automation.scope")}>
+					<span aria-live="polite" aria-atomic="true">{hiddenAutomationCount > 0 ? t("chat.automation.hidden", { count: hiddenAutomationCount }) : ""}</span>
+					{hiddenAutomationCount > 0 ? (
+						<>
+							<span aria-hidden="true">·</span>
+							<button
+								type="button"
+								className="automation-visibility-control min-h-6 min-w-6 rounded px-1 text-markdown-link hover:underline"
+								onClick={() => {
+									scroller.current?.focus({ preventScroll: true });
+									setHideAutomationMessages(false);
+								}}
+							>
+								{t("chat.automation.show")}
+							</button>
+						</>
+					) : null}
 				</div>
-			) : null}
+			</div>
 			<div
 				ref={scroller}
 				onScroll={onScroll}
 				className="chat-scroll-viewport cursor-chat-timeline min-h-0 flex-1 min-w-0 select-text overflow-x-hidden overflow-y-auto px-4 pt-5 pb-0"
 				role="log"
+				tabIndex={-1}
 				aria-live="polite"
 				aria-label="Conversation"
 			>
