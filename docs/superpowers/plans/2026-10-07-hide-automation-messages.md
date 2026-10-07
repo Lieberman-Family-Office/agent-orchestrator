@@ -143,7 +143,7 @@ describe("automation message visibility", () => {
 	});
 
 	it("fails open to showing messages when storage cannot be read", async () => {
-		const read = vi.spyOn(Storage.prototype, "getItem").mockImplementation((key) => {
+		const read = vi.spyOn(window.localStorage, "getItem").mockImplementation((key) => {
 			if (key === visibilityKey) throw new DOMException("blocked", "SecurityError");
 			return null;
 		});
@@ -155,7 +155,7 @@ describe("automation message visibility", () => {
 	});
 
 	it("keeps the current choice usable and reports a failed write", () => {
-		const write = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+		const write = vi.spyOn(window.localStorage, "setItem").mockImplementation(() => {
 			throw new DOMException("full", "QuotaExceededError");
 		});
 		try {
@@ -386,13 +386,13 @@ describe("automation visibility in chat", () => {
 		}
 		expect(screen.getByText("Delivery uncertain — not retried automatically")).toBeInTheDocument();
 		expect(screen.getByText("Not delivered")).toBeInTheDocument();
-		expect(screen.getByRole("button", { name: "Approve", exact: true })).toBeInTheDocument();
+		expect(screen.getByRole("button", { name: "Approve" })).toBeInTheDocument();
 		expect(snapshot).toEqual(original);
 		expect(onSend).not.toHaveBeenCalled();
 
 		view.rerender(<ChatWorkspace snapshot={{ ...snapshot, conversationId: "other-conversation", sessionId: "other-session" }} onSend={onSend} />);
 		expect(screen.getByRole("button", { name: "Hide automation messages" })).toHaveAttribute("aria-pressed", "true");
-		await user.click(screen.getByRole("button", { name: "Show", exact: true }));
+		await user.click(screen.getByRole("button", { name: "Show" }));
 		expect(screen.getByText("routine one")).toBeInTheDocument();
 		expect(screen.getByText("routine two")).toBeInTheDocument();
 		expect(localStorage.getItem("ao.chat.hideAutomationMessages")).toBe("false");
@@ -542,7 +542,7 @@ it("allows keyboard hiding and revealing without losing warnings", async () => {
 	toggle.focus();
 	await user.keyboard(" ");
 	expect(toggle).toHaveAttribute("aria-pressed", "true");
-	const show = screen.getByRole("button", { name: "Show", exact: true });
+	const show = screen.getByRole("button", { name: "Show" });
 	show.focus();
 	await user.keyboard("{Enter}");
 	expect(screen.getByText("routine one")).toBeInTheDocument();
@@ -676,7 +676,16 @@ cd "$HOME/dev/worktrees/ao_hide_automation_plan/frontend"
 npm run package -- --platform=darwin --arch=arm64
 ```
 
-Expected: the candidate is `frontend/out/agent-orchestrator-darwin-arm64/Agent Orchestrator.app` relative to the worktree. Check the actual Forge output before using this path. This command builds a bundled daemon/runtime as part of packaging even though the feature diff is frontend-only. An unsigned output is a lab artifact, not an approved production installation.
+Observed during execution: Node 26's Electron installer/package process returned without producing expected artifacts. AO's bundled Node runtime successfully provisioned Electron and completed packaging. If this recurs, use the existing bundled runtime after `build:acp-runtime`; do not install a new dependency or label exit 0 as artifact proof.
+
+```bash
+"$HOME/dev/worktrees/ao_hide_automation_plan/frontend/resources/acp-runtime/node/bin/node" node_modules/electron/install.js
+PATH="$HOME/dev/worktrees/ao_hide_automation_plan/frontend/resources/acp-runtime/node/bin:$PATH" npm run package -- --platform=darwin --arch=arm64
+```
+
+Do not run packaging concurrently with Node unit tests: Forge rebuilds `better-sqlite3` for Electron. After packaging, run `npm --prefix frontend rebuild better-sqlite3` from the repository root before Node test suites.
+
+Expected: the candidate is `frontend/out/Agent Orchestrator-darwin-arm64/Agent Orchestrator.app` relative to the worktree. Check the actual Forge output before using this path. This command builds a bundled daemon/runtime as part of packaging even though the feature diff is frontend-only. An unsigned output is a lab artifact, not an approved production installation.
 
 - [ ] **Step 4: Resolve the installed-base and signing gates before production.**
 
@@ -691,7 +700,7 @@ A production app must pass AO's existing signature/Gatekeeper/notarization verif
 
 ```bash
 cd "$HOME/dev/worktrees/ao_hide_automation_plan"
-bash frontend/scripts/verify-mac-artifact.sh 'frontend/out/agent-orchestrator-darwin-arm64/Agent Orchestrator.app'
+bash frontend/scripts/verify-mac-artifact.sh 'frontend/out/Agent Orchestrator-darwin-arm64/Agent Orchestrator.app'
 ```
 
 If signing/notarization is unavailable, stop production deployment. Use the unsigned build only in the isolated lab. Do not remove quarantine, bypass Gatekeeper, ad-hoc sign the installed app, or patch its `app.asar`. Canonical signed distribution must go through `frontend/docs/desktop-release.md` and the designated private conductor. No `npm run publish`, release tag, substitute updater feed, or borrowed credentials.
@@ -718,7 +727,7 @@ Before the copies, verify AO and its ShipIt are no longer running. Read the repo
 - [ ] **Step 7: Replace the approved stopped app without deleting the original.** After verified backups and Jason's current-turn replacement approval, use a unique staged app directory. Do not run if the candidate or backup identity differs from Step 4.
 
 ```bash
-CANDIDATE="$HOME/dev/worktrees/ao_hide_automation_plan/frontend/out/agent-orchestrator-darwin-arm64/Agent Orchestrator.app"
+CANDIDATE="$HOME/dev/worktrees/ao_hide_automation_plan/frontend/out/Agent Orchestrator-darwin-arm64/Agent Orchestrator.app"
 STAGED="/Applications/Agent Orchestrator-hide-automation-$(date -u +%Y%m%dT%H%M%SZ).app"
 /usr/bin/ditto "$CANDIDATE" "$STAGED"
 bash "$HOME/dev/worktrees/ao_hide_automation_plan/frontend/scripts/verify-mac-artifact.sh" "$STAGED"
