@@ -1,0 +1,91 @@
+import { expect, test } from "@playwright/test";
+import { agentReadiness } from "../src/renderer/test/agent-readiness-fixtures";
+import { installFakeAgent } from "./support/fake-bridge";
+
+// Renderer acceptance only: mocked APIs prove display behavior, not real agent delivery.
+test("automation visibility is reversible and persistent without suppressing warnings @T0", async ({ page }) => {
+	const projectId = "automation-visibility";
+	const sessions = ["visibility-one", "visibility-two"];
+	const at = "2026-10-07T12:00:00Z";
+	const writes: string[] = [];
+	await page.emulateMedia({ reducedMotion: "reduce" });
+	await installFakeAgent(page, {
+		projectId,
+		projectName: projectId,
+		workers: sessions.map((id) => ({ id, provider: "codex", title: id, mode: "chat" })),
+	});
+	const message = (id: string, sequence: number, origin: string, text: string, role = "user", turnId?: string) => ({
+		kind: "message", id, sequence, revision: 0, role, origin, text, turnId, streaming: false, createdAt: at,
+	});
+	const messages = [
+		message("human", 1, "human", "Human prompt stays", "user", "active-turn"),
+		...Array.from({ length: 12 }, (_, index) => message(`routine-${index}`, index + 2, "automation", `Routine automation report ${index}`)),
+		message("reply", 14, "provider", "Assistant response stays", "assistant"),
+		message("failure", 15, "automation", "Failed delivery turn stays", "user", "failed-turn"),
+		message("daemon", 16, "daemon", "Daemon notice stays"),
+	];
+	await page.route("http://127.0.0.1:8080/api/v1/**", async (route) => {
+		const pathname = new URL(route.request().url()).pathname;
+		if (route.request().method() !== "GET") writes.push(pathname);
+		if (pathname.startsWith("/api/v1/agents/readiness")) {
+			await route.fulfill({ json: { agents: [agentReadiness("codex", "Codex")] } });
+		} else if (pathname === `/api/v1/projects/${projectId}`) {
+			await route.fulfill({ json: { status: "ok", project: { id: projectId, agent: "codex", config: { worker: { agent: "codex" } } } } });
+		} else if (sessions.some((id) => pathname === `/api/v1/sessions/${id}/conversation`)) {
+			await route.fulfill({ json: {
+				conversationId: `conversation-${pathname.split("/")[4]}`, sessionId: pathname.split("/")[4], harness: "codex", mode: "chat",
+				controller: "busy", latestSequence: 18, oldestSequence: 1, hasMoreBefore: false, settings: {}, capabilities: ["approvals"],
+				turns: [
+					{ id: "active-turn", state: "running", requestedAt: at },
+					{ id: "failed-turn", state: "failed", requestedAt: at, completedAt: at, errorMessage: "Delivery failed" },
+				],
+				messages,
+				activities: [
+					{ kind: "activity", id: "approval", turnId: "active-turn", sequence: 17, revision: 0, activityKind: "approval", status: "pending", summary: "Explicit approval stays", requestId: "approval-one", detail: { decisions: [{ id: "accept", label: "Approve", kind: "allow_once" }, { id: "cancel", label: "Cancel", kind: "reject_once" }] }, createdAt: at },
+					{ kind: "activity", id: "error", sequence: 18, revision: 0, activityKind: "error", status: "failed", summary: "Structured error stays", createdAt: at },
+				],
+			} });
+		} else if (pathname.endsWith("/conversation/models")) {
+			await route.fulfill({ json: { models: [], selected: {} } });
+		} else if (pathname.endsWith("/conversation/skills")) {
+			await route.fulfill({ json: { skills: [] } });
+		} else if (pathname.endsWith("/workspace/files")) {
+			await route.fulfill({ json: { files: [], truncated: false } });
+		} else if (pathname.endsWith("/interface-transition")) {
+			await route.fulfill({ json: { supported: true, targetMode: "tui" } });
+		} else {
+			await route.fulfill({ json: { status: "ok" } });
+		}
+	});
+
+	await page.goto(`/#/projects/${projectId}/sessions/${sessions[0]}`);
+	const toggle = page.getByRole("button", { name: "Hide automation messages" });
+	await expect(toggle).toHaveAttribute("aria-pressed", "false");
+	await expect(page.getByText("Routine automation report 0", { exact: true })).toBeVisible();
+	const beforeToggleWrites = writes.length;
+	await toggle.focus();
+	await page.keyboard.press("Space");
+	await expect(toggle).toHaveAttribute("aria-pressed", "true");
+	await expect(page.getByText("12 automation messages hidden", { exact: true })).toBeVisible();
+	await expect(page.getByText(/^Routine automation report /)).toHaveCount(0);
+	for (const text of ["Human prompt stays", "Assistant response stays", "Failed delivery turn stays", "Daemon notice stays", "Structured error stays"]) {
+		await expect(page.getByText(text, { exact: true })).toBeVisible();
+	}
+	await expect(page.getByRole("button", { name: /^Allow once/ })).toBeVisible();
+	expect(writes.slice(beforeToggleWrites)).toEqual([]);
+	expect(messages.filter((item) => item.origin === "automation")).toHaveLength(13);
+
+	await page.goto(`/#/projects/${projectId}/sessions/${sessions[1]}`);
+	await expect(toggle).toHaveAttribute("aria-pressed", "true");
+	await expect(page.getByText("12 automation messages hidden", { exact: true })).toBeVisible();
+	await page.reload();
+	await expect(toggle).toHaveAttribute("aria-pressed", "true");
+	await expect(page.getByText(/^Routine automation report /)).toHaveCount(0);
+	const show = page.getByRole("button", { name: "Show", exact: true });
+	await show.focus();
+	await page.keyboard.press("Enter");
+	await expect(page.getByText("Routine automation report 0", { exact: true })).toBeVisible();
+	await expect(page.getByText(/^Routine automation report /)).toHaveCount(12);
+	await expect(toggle).toHaveAttribute("aria-pressed", "false");
+	expect(await page.evaluate(() => localStorage.getItem("ao.chat.hideAutomationMessages"))).toBe("false");
+});
