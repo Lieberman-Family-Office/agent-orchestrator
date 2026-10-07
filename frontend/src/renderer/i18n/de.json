@@ -1,4 +1,11 @@
 {
+	"chat.automation.hide": "Automatisierungsnachrichten ausblenden",
+	"chat.automation.show": "Anzeigen",
+	"chat.automation.hidden_one": "{{count}} Automatisierungsnachricht ausgeblendet",
+	"chat.automation.hidden_other": "{{count}} Automatisierungsnachrichten ausgeblendet",
+	"chat.automation.scope": "Die Anzahl umfasst nur den geladenen Gesprächsverlauf.",
+	"chat.automation.storageTitle": "Anzeigeeinstellung wurde nicht gespeichert",
+	"chat.automation.storageBody": "Die Auswahl gilt für dieses Fenster, kann aber nach einem Neustart zurückgesetzt werden.",
 	"chat.startup.queuePlaceholder": "{{agent}} startet. Nachrichten werden der Reihe nach gesendet",
 	"settings.coder11x.navLabel": "Coder",
 	"settings.coder11x.templatesListLabel": "Templates on your Coder",

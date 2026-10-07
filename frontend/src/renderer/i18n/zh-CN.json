@@ -1,4 +1,11 @@
 {
+	"chat.automation.hide": "隐藏自动化消息",
+	"chat.automation.show": "显示",
+	"chat.automation.hidden_one": "已隐藏 {{count}} 条自动化消息",
+	"chat.automation.hidden_other": "已隐藏 {{count}} 条自动化消息",
+	"chat.automation.scope": "数量仅包含已加载的对话历史。",
+	"chat.automation.storageTitle": "显示偏好未保存",
+	"chat.automation.storageBody": "此选择在当前窗口中有效，但重启后可能重置。",
 	"chat.startup.queuePlaceholder": "{{agent}} 正在启动. 消息将按顺序发送",
 	"settings.coder11x.navLabel": "Coder",
 	"settings.coder11x.templatesListLabel": "Templates on your Coder",

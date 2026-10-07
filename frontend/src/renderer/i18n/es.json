@@ -1,4 +1,12 @@
 {
+	"chat.automation.hide": "Ocultar mensajes de automatización",
+	"chat.automation.show": "Mostrar",
+	"chat.automation.hidden_one": "{{count}} mensaje de automatización oculto",
+	"chat.automation.hidden_many": "{{count}} mensajes de automatización ocultos",
+	"chat.automation.hidden_other": "{{count}} mensajes de automatización ocultos",
+	"chat.automation.scope": "El recuento incluye solo el historial de conversación cargado.",
+	"chat.automation.storageTitle": "No se guardó la preferencia de visualización",
+	"chat.automation.storageBody": "La elección funciona en esta ventana, pero puede restablecerse al reiniciar.",
 	"chat.startup.queuePlaceholder": "{{agent}} se está iniciando. Los mensajes se envían en orden",
 	"settings.coder11x.navLabel": "Coder",
 	"settings.coder11x.templatesListLabel": "Templates on your Coder",
