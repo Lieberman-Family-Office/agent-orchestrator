@@ -172,12 +172,14 @@ const (
 	ChatCapabilityTools     ChatCapability = "tools"
 	ChatCapabilityApprovals ChatCapability = "approvals"
 	ChatCapabilityInterrupt ChatCapability = "interrupt"
-	ChatCapabilitySteer     ChatCapability = "steer"
-	ChatCapabilityResume    ChatCapability = "resume"
-	ChatCapabilityHistory   ChatCapability = "history"
-	ChatCapabilityUsage     ChatCapability = "usage"
-	ChatCapabilityDiffs     ChatCapability = "diffs"
-	ChatCapabilityPlans     ChatCapability = "plans"
+	// ChatCapabilityInterruptAndSend is added by AO when durable queue-preserving interrupt intake is available.
+	ChatCapabilityInterruptAndSend ChatCapability = "interrupt_send"
+	ChatCapabilitySteer            ChatCapability = "steer"
+	ChatCapabilityResume           ChatCapability = "resume"
+	ChatCapabilityHistory          ChatCapability = "history"
+	ChatCapabilityUsage            ChatCapability = "usage"
+	ChatCapabilityDiffs            ChatCapability = "diffs"
+	ChatCapabilityPlans            ChatCapability = "plans"
 	// ChatCapabilityModels means the provider can enumerate the models it offers
 	// and accept one per turn.
 	ChatCapabilityModels ChatCapability = "models"

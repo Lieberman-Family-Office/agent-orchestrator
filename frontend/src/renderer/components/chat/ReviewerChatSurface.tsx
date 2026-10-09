@@ -50,7 +50,7 @@ export function ReviewerChatSurface({ reviewId, workerSessionId, hostId, hideHea
 			loadingOlder={isLoadingOlder}
 			onLoadOlder={loadOlder}
 			onSend={(text, attachments, clientMessageId) => commands.send({ text, attachments, clientMessageId })}
-			onInterruptSend={can(snapshot, "interrupt") ? (text, attachments, clientMessageId) =>
+			onInterruptSend={can(snapshot, "interrupt_send") ? (text, attachments, clientMessageId) =>
 				commands.send({ text, attachments, clientMessageId, interruptAndSend: true }) : undefined}
 			onDecide={commands.resolve}
 			onResolveInput={commands.resolveInput}

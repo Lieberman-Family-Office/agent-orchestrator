@@ -21,7 +21,7 @@ test("one Enter follows the persistent Steer/Interrupt choice @T0", async ({ pag
 		} else if (path === `/api/v1/sessions/${sessionId}/conversation`) {
 			await route.fulfill({ json: {
 				conversationId: "send-mode-conversation", sessionId, harness: "codex", mode: "chat", controller: "busy", latestSequence: 1, oldestSequence: 1, hasMoreBefore: false,
-				settings: {}, capabilities: ["steer", "interrupt"],
+				settings: {}, capabilities: ["steer", "interrupt", "interrupt_send"],
 				turns: [{ id: "active", state: "running", requestedAt: at }],
 				messages: [{ kind: "message", id: "opening", turnId: "active", sequence: 1, revision: 0, role: "user", origin: "human", text: "Opening prompt", streaming: false, createdAt: at }], activities: [],
 			} });

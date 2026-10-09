@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -1355,7 +1356,11 @@ func (c *Controller) State() ports.ChatControllerState {
 // Capabilities reports what this session's provider can do, so a client can gate
 // a control before drawing it rather than discovering the answer from a refusal.
 func (c *Controller) Capabilities() ports.ChatCapabilities {
-	return c.conv.Capabilities()
+	caps := maps.Clone(c.conv.Capabilities())
+	if caps.Has(ports.ChatCapabilityInterrupt) {
+		caps[ports.ChatCapabilityInterruptAndSend] = true
+	}
+	return caps
 }
 
 // Send records a message and dispatches it, or queues it if the agent is busy.
