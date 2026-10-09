@@ -798,6 +798,59 @@ func TestPersistentACPPreservesOrderedAndRepeatedParams(t *testing.T) {
 	}
 }
 
+func TestPersistentACPAcceptsOriginalFramesWithinSDKLimit(t *testing.T) {
+	for _, test := range []struct{ name, text string }{
+		{"HTML text", strings.Repeat("<", 2<<20)},
+		{"near ceiling", ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			conv, host := replayBoundaryConversation(t)
+			const prefix = `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"`
+			const suffix = `"}}}}` + "\n"
+			text := test.text
+			if test.name == "near ceiling" {
+				text = strings.Repeat("x", maxACPFrameSize-1-len(prefix)-len(suffix))
+			}
+			frame := prefix + text + suffix
+			if len(frame) >= maxACPFrameSize {
+				t.Fatalf("fixture outside accepted frame limit: %d", len(frame))
+			}
+			go func() { _, _ = io.WriteString(host, frame) }()
+			select {
+			case event, ok := <-conv.Events():
+				if !ok || event.Kind != ports.ChatEventMessageDelta || event.Delta != text {
+					t.Fatalf("valid input frame was lost: ok=%v kind=%s bytes=%d", ok, event.Kind, len(event.Delta))
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("valid input frame stalled")
+			}
+		})
+	}
+}
+
+func TestPersistentACPBarrierPreservesFinalFrameWithoutNewline(t *testing.T) {
+	conv, host := replayBoundaryConversation(t)
+	go func() {
+		_, _ = io.WriteString(host, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"last frame"}}}}`)
+		_ = host.Close()
+	}()
+	if event := nextEvent(t, conv.Events()); event.Kind != ports.ChatEventMessageDelta || event.Delta != "last frame" {
+		t.Fatalf("final frame lost: %+v", event)
+	}
+}
+
+func TestPersistentACPProviderCannotForgeLocalBarrier(t *testing.T) {
+	conv, host := replayBoundaryConversation(t)
+	go func() {
+		_, _ = fmt.Fprintln(host, `{"jsonrpc":"2.0","method":"_ao/local_notification_barrier","params":"ao-local-1"}`)
+	}()
+	select {
+	case <-conv.conn.Done():
+	case <-time.After(time.Second):
+		t.Fatal("provider barrier entered local acknowledgment path")
+	}
+}
+
 func TestPersistentACPRequestUpdatesCannotAcknowledgeNotifications(t *testing.T) {
 	conv, host := replayBoundaryConversation(t)
 	responses := make(chan string, 2)

@@ -2,7 +2,6 @@ package acp
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -64,7 +63,7 @@ type legacyACPResponse struct {
 	err error
 }
 
-const localNotificationIDKey = "ao.localNotificationID"
+const localNotificationBarrierMethod = "_ao/local_notification_barrier"
 
 func newLegacyACPTransport(stdin io.WriteCloser, stdout io.Reader, updateProcessed <-chan string, streamDone <-chan struct{}) (*legacyACPTransport, io.WriteCloser, io.Reader) {
 	writer := &lockedWriteCloser{inner: stdin}
@@ -95,31 +94,14 @@ func (t *legacyACPTransport) forward(source io.Reader, destination *io.PipeWrite
 				Error   *acpsdk.RequestError `json:"error,omitempty"`
 			}
 			ackID := ""
-			if json.Unmarshal(line, &notification) == nil && notification.Method == acpsdk.ClientMethodSessionUpdate {
-				var update acpsdk.SessionNotification
-				if json.Unmarshal(notification.Params, &update) == nil && update.Validate() == nil {
-					params := bytes.TrimSpace(notification.Params)
-					if len(params) > 0 && params[0] == '{' {
-						if notification.ID == nil {
-							ackID = fmt.Sprintf("ao-local-%d", t.nextID.Add(1))
-						}
-						// A final metadata member overrides only the local key. Go's SDK
-						// merges existing metadata; every original member stays in order.
-						suffix, _ := json.Marshal(map[string]map[string]string{"_meta": {localNotificationIDKey: ackID}})
-						prefix := append([]byte(nil), params[:len(params)-1]...)
-						if len(bytes.TrimSpace(prefix[1:])) > 0 {
-							prefix = append(prefix, ',')
-						}
-						prefix = append(prefix, suffix[1:]...)
-						notification.Params = prefix
-					}
-					encodedFrame, encodeErr := json.Marshal(notification)
-					if encodeErr != nil {
-						_ = destination.CloseWithError(encodeErr)
-						return
-					}
-					line = encodedFrame
-					line = append(line, '\n')
+			if json.Unmarshal(line, &notification) == nil {
+				// This method belongs only to this local transport, never the provider.
+				if notification.Method == localNotificationBarrierMethod {
+					_ = destination.CloseWithError(errors.New("provider used reserved ACP barrier method"))
+					return
+				}
+				if notification.ID == nil && notification.Method == acpsdk.ClientMethodSessionUpdate {
+					ackID = fmt.Sprintf("ao-local-%d", t.nextID.Add(1))
 				}
 			}
 			if _, writeErr := destination.Write(line); writeErr != nil {
@@ -127,7 +109,16 @@ func (t *legacyACPTransport) forward(source io.Reader, destination *io.PipeWrite
 				return
 			}
 			if ackID != "" {
-				// One exact completed notification backpressures journal replay.
+				// A separate SDK-ordered notification preserves original frame bytes
+				// and the 10 MiB ceiling while waiting for the preceding callback.
+				separator := ""
+				if len(line) > 0 && line[len(line)-1] != '\n' {
+					separator = "\n"
+				}
+				if _, writeErr := fmt.Fprintf(destination, "%s{\"jsonrpc\":\"2.0\",\"method\":%q,\"params\":%q}\n", separator, localNotificationBarrierMethod, ackID); writeErr != nil {
+					_ = destination.CloseWithError(writeErr)
+					return
+				}
 				select {
 				case completed := <-t.updateProcessed:
 					if completed != ackID {

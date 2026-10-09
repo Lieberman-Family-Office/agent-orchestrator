@@ -88,6 +88,19 @@ func (c *conversation) HandleExtensionMethod(
 	method string,
 	params json.RawMessage,
 ) (any, error) {
+	if method == localNotificationBarrierMethod {
+		var ackID string
+		if err := json.Unmarshal(params, &ackID); err != nil {
+			return nil, err
+		}
+		select {
+		case c.updateProcessed <- ackID:
+		case <-c.streamDone:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return nil, nil
+	}
 	if method == persistenthost.ACPInteractionCommandMethod {
 		var command persistentInteractionCommand
 		if err := json.Unmarshal(params, &command); err != nil {

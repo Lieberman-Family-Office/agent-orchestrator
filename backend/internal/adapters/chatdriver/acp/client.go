@@ -543,16 +543,6 @@ func (c *conversation) discardPermission(requestID string) {
 }
 
 func (c *conversation) SessionUpdate(_ context.Context, params acpsdk.SessionNotification) error {
-	ackID, _ := params.Meta[localNotificationIDKey].(string)
-	delete(params.Meta, localNotificationIDKey)
-	if ackID != "" && c.updateProcessed != nil {
-		defer func() {
-			select {
-			case c.updateProcessed <- ackID:
-			case <-c.streamDone:
-			}
-		}()
-	}
 	// Keep replay normalization off the SDK's bounded notification queue.
 	if c.captureReplayUpdate(params) {
 		return nil
