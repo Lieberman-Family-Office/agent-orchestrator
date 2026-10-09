@@ -12,7 +12,6 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	chatsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/chat"
-	reportsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/report"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 )
@@ -128,7 +127,7 @@ func TestSendWhileProvisioningQueuesInOrder(t *testing.T) {
 	}
 }
 
-func TestProvisioningSendPiggybacksReportsOnlyOnRecordedTurn(t *testing.T) {
+func TestProvisioningSendPreservesHumanTextAndPendingReports(t *testing.T) {
 	st, workerID := openProvisioningStore(t, domain.SessionProvisionReady)
 	ctx := context.Background()
 	now := time.Now().UTC()
@@ -154,9 +153,6 @@ func TestProvisioningSendPiggybacksReportsOnlyOnRecordedTurn(t *testing.T) {
 	}
 	createReport("first-report")
 	svc := provisioningService(t, st)
-	svc.SetReportCoordinator(reportsvc.NewCoordinator(reportsvc.CoordinatorDeps{
-		Store: st, Now: func() time.Time { return now }, NewToken: func() string { return "report-claim" },
-	}))
 	message := ports.ChatUserMessage{Text: "start", Origin: domain.MessageOriginHuman, ClientMessageID: "client-1"}
 	turn, err := svc.Send(ctx, orchestrator.ID, message)
 	if err != nil || turn.State != domain.TurnStateQueued {
@@ -166,12 +162,11 @@ func TestProvisioningSendPiggybacksReportsOnlyOnRecordedTurn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(snapshot.Messages) != 1 || !strings.Contains(snapshot.Messages[0].Text, "<ao-worker-reports>") ||
-		!strings.Contains(snapshot.Messages[0].Text, "first-report") {
-		t.Fatalf("queued message missing piggyback: %+v", snapshot.Messages)
+	if len(snapshot.Messages) != 1 || snapshot.Messages[0].Text != message.Text {
+		t.Fatalf("queued message changed human text: %+v", snapshot.Messages)
 	}
 	first, found, err := st.GetReport(ctx, "first-report")
-	if err != nil || !found || first.DeliveryState != domain.ReportAcknowledged {
+	if err != nil || !found || first.DeliveryState != domain.ReportPending || first.ClaimToken != "" {
 		t.Fatalf("first report = %+v, found = %v, err = %v", first, found, err)
 	}
 

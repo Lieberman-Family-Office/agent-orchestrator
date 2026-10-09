@@ -2724,6 +2724,35 @@ describe("automation visibility in chat", () => {
 	});
 	afterEach(() => useUiStore.setState({ hideAutomationMessages: false }));
 
+	it("changes the eye icon and hides queued automation without hiding queued human messages", async () => {
+		const user = userEvent.setup();
+		const snapshot: ConversationSnapshot = {
+			...idleSnapshot(), controller: { state: "busy" }, latestSequence: 3,
+			turns: [
+				{ id: "routine-queue", state: "queued", requestedAt: "2026-10-07T12:00:00Z" },
+				{ id: "human-queue", state: "queued", requestedAt: "2026-10-07T12:00:00Z" },
+			],
+			items: [
+				{ ...humanMessage("Queued automation report"), id: "routine", turnId: "routine-queue", origin: "automation" },
+				{ ...humanMessage("My queued message"), id: "human", turnId: "human-queue", sequence: 2 },
+			],
+		};
+		render(<ChatWorkspace snapshot={snapshot} />);
+		const toggle = screen.getByRole("button", { name: "Hide automation messages" });
+		expect(toggle.querySelector("svg")).toHaveClass("lucide-eye");
+		expect(toggle.querySelector("svg")).not.toHaveClass("lucide-eye-off");
+		await user.click(toggle);
+		expect(toggle).toHaveAttribute("aria-pressed", "true");
+		expect(toggle.querySelector("svg")).toHaveClass("lucide-eye-off");
+		expect(screen.queryByText("Queued automation report")).not.toBeInTheDocument();
+		expect(screen.getByText("My queued message")).toBeInTheDocument();
+		expect(screen.getByText("1 automation message hidden")).toBeInTheDocument();
+		await user.click(toggle);
+		expect(toggle).toHaveAttribute("aria-pressed", "false");
+		expect(toggle.querySelector("svg")).toHaveClass("lucide-eye");
+		expect(screen.getByText("Queued automation report")).toBeInTheDocument();
+	});
+
 	it("hides routine cards only, reports the exact count, and restores original content", async () => {
 		const user = userEvent.setup();
 		const snapshot = visibilitySnapshot();
@@ -2804,7 +2833,7 @@ describe("automation visibility in chat", () => {
 		expect(screen.getByText("warning-24")).toBeInTheDocument();
 	});
 
-	it.each(["queued", "failed", "interrupted", "cancelled"] as const)(
+	it.each(["failed", "interrupted", "cancelled"] as const)(
 		"keeps %s turn messages when delivery state is missing", async (state) => {
 			const user = userEvent.setup();
 			const snapshot: ConversationSnapshot = {

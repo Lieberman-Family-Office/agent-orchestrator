@@ -14,7 +14,6 @@ import (
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
-	reportsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/report"
 )
 
 // ErrNoController reports a command for a session with no live Chat controller.
@@ -51,8 +50,6 @@ type Service struct {
 	// session metadata before the next prompt routes or a later TUI rebuild.
 	onModelChanged   func(domain.SessionID, string)
 	stopProviderHost func(context.Context, domain.SessionID) error
-	reports          *reportsvc.Coordinator
-
 	mu               sync.RWMutex
 	controllers      map[domain.SessionID]*Controller
 	ownerControllers map[domain.ConversationOwner]*Controller
@@ -61,12 +58,6 @@ type Service struct {
 	gates            map[domain.ConversationOwner]controllerGate
 	probeMu          sync.Mutex
 	probed           map[domain.AgentHarness]ports.ChatCapabilities
-}
-
-// SetReportCoordinator installs the report piggyback hook after daemon wiring
-// has constructed both services.
-func (s *Service) SetReportCoordinator(coordinator *reportsvc.Coordinator) {
-	s.reports = coordinator
 }
 
 // controllerGate serializes start/stop for one session without making provider
@@ -1102,15 +1093,6 @@ func (s *Service) Send(
 	if err != nil {
 		return domain.ConversationTurn{}, err
 	}
-	var reports reportsvc.PreparedBatch
-	if s.reports != nil && msg.Origin != domain.MessageOriginAutomation {
-		var err error
-		reports, err = s.reports.PreparePiggyback(ctx, id)
-		if err != nil {
-			return domain.ConversationTurn{}, fmt.Errorf("prepare worker reports: %w", err)
-		}
-		msg.Text = reports.AppendToUserMessage(msg.Text)
-	}
 	var turn domain.ConversationTurn
 	if record.ProvisionState.IsProvisioning() {
 		// Keep messages on the durable queue until provisioning finishes so a
@@ -1133,23 +1115,7 @@ func (s *Service) Send(
 			turn, err = controller.Send(ctx, msg)
 		}
 	}
-	if err != nil {
-		if s.reports != nil {
-			_ = s.reports.ReleasePiggyback(ctx, reports, err)
-		}
-		return turn, err
-	}
-	if s.reports != nil {
-		if turn.ID == "" {
-			// A retried client message did not record the newly claimed reports.
-			_ = s.reports.ReleasePiggyback(ctx, reports, errors.New("duplicate chat message"))
-			return turn, nil
-		}
-		if err := s.reports.AcceptPiggyback(ctx, reports); err != nil {
-			return domain.ConversationTurn{}, fmt.Errorf("acknowledge worker reports: %w", err)
-		}
-	}
-	return turn, nil
+	return turn, err
 }
 
 // SendForOwner sends a user message to an owner-specific chat controller.

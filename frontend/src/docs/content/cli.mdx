@@ -175,9 +175,9 @@ ao send --session <session-id> --steer --recover-only --client-message-id <handl
 
 Lists orchestrator sessions. Add `--json` for structured output.
 
-Inside a worker, `ao report "Progress summary"` sends a report to its existing orchestrator. Reporting requires `AO_SESSION_ID`; it does not create an orchestrator or claim a PR.
+Inside a worker, `ao report "Progress summary"` stores a report for its project. Reporting requires `AO_SESSION_ID`; it does not create an orchestrator or claim a PR.
 
-Needs-input reports are sent immediately. Stuck reports may interrupt or combine with other reports. Done reports wait five minutes before delivery; ordinary checkpoints can wait up to one hour.
+This build keeps worker reports manual-only. Reports do not send or interrupt orchestrator turns automatically, and AO does not append them to human messages. Retrieve stored reports with `GET /api/v1/reports?projectId=<project-id>`.
 
 For a structured report, choose one state flag: `--checkpoint`, `--needs-input`, `--stuck`, or `--done`. Include `--note` with it. Attach reviewable deliverables with `--artifact`, `--pr-created`, or `--pr-reviewed`; pull-request flags require full URLs. Do not combine free-form text with structured state or output flags.
 

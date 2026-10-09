@@ -43,6 +43,12 @@ func TestFakeApprovalACP(t *testing.T) {
 		var frame struct {
 			ID     json.RawMessage `json:"id"`
 			Method string          `json:"method"`
+			Params struct {
+				Prompt []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"prompt"`
+			} `json:"params"`
 		}
 		if json.Unmarshal(scanner.Bytes(), &frame) != nil {
 			continue
@@ -60,6 +66,14 @@ func TestFakeApprovalACP(t *testing.T) {
 		case "session/new", "session/load", "session/resume":
 			_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"fake-provider-session"}}`+"\n", frame.ID)
 		case "session/prompt":
+			var text strings.Builder
+			for _, block := range frame.Params.Prompt {
+				if block.Type == "text" {
+					text.WriteString(block.Text)
+				}
+			}
+			encoded, _ := json.Marshal(text.String())
+			record("prompt-text:" + string(encoded))
 			promptID = append(promptID[:0], frame.ID...)
 			record("session/request_permission")
 			_, _ = fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","id":"permission-1","method":"session/request_permission","params":{"sessionId":"fake-provider-session","toolCall":{"toolCallId":"tool-1","title":"Approve restart","kind":"edit"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"reject","name":"Reject","kind":"reject_once"}]}}`)
@@ -70,6 +84,94 @@ func TestFakeApprovalACP(t *testing.T) {
 		}
 	}
 	os.Exit(0)
+}
+
+func TestOrchestratorSendsOnlyTypedTextAndKeepsReportsManual(t *testing.T) {
+	binDir := t.TempDir()
+	testBinary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	shim := "#!/bin/sh\ncase \"$1\" in\n  acp) exec \"$AO_E2E_TEST_BINARY\" -test.run='^TestFakeApprovalACP$' ;;\n  auth) printf '0 credentials\\n' ;;\n  --version) printf '1.0.0\\n' ;;\n  *) exit 2 ;;\nesac\n"
+	if err := os.WriteFile(filepath.Join(binDir, "opencode"), []byte(shim), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("OPENCODE_DATA_DIR", t.TempDir())
+	t.Setenv("OPENCODE_CONFIG_CONTENT", "")
+	t.Setenv("AO_E2E_TEST_BINARY", testBinary)
+	t.Setenv("AO_E2E_FAKE_APPROVAL_ACP", "1")
+	callsPath := filepath.Join(t.TempDir(), "provider-calls.log")
+	t.Setenv("AO_E2E_ACP_CALLS", callsPath)
+	d := startDaemon(t, t.TempDir())
+	project := seedProject(t, d, "manual-reports")
+	setPermissions(t, d, project, "default")
+	worker := spawn(t, d, map[string]any{
+		"projectId": project, "kind": "worker", "harness": "opencode", "mode": "chat",
+		"prompt": "Worker opening prompt",
+	}).Session.ID
+	orchestrator := spawn(t, d, map[string]any{
+		"projectId": project, "kind": "orchestrator", "harness": "opencode", "mode": "chat",
+		"prompt": "Orchestrator opening prompt",
+	}).Session.ID
+	d.awaitConversation(orchestrator, 30*time.Second, "orchestrator approval", func(s snapshot) bool {
+		_, ok := s.pendingApproval()
+		return ok
+	})
+	for _, state := range []string{"checkpoint", "needs_input"} {
+		d.mustCall("POST", "/reports", http.StatusCreated, map[string]any{
+			"sessionId": worker, "state": state, "note": "Stored report " + state,
+		}, nil)
+	}
+	typed := "Only my typed words\n\n  Preserve this spacing."
+	send(t, d, orchestrator, typed, "verbatim-human")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		snap := d.conversation(orchestrator)
+		var userMessages []string
+		for _, message := range snap.Messages {
+			if message.Role == "user" {
+				userMessages = append(userMessages, message.Text)
+			}
+		}
+		if len(userMessages) != 2 || userMessages[0] != "Orchestrator opening prompt" || userMessages[1] != typed {
+			t.Fatalf("human send or automatic report delivery changed conversation: %q", userMessages)
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var reports struct {
+		Reports []struct {
+			Note string `json:"note"`
+		} `json:"reports"`
+	}
+	d.mustCall("GET", "/reports?projectId="+project, http.StatusOK, nil, &reports)
+	if len(reports.Reports) != 2 {
+		t.Fatalf("manual report retrieval returned %d reports", len(reports.Reports))
+	}
+	for index := 0; index < 2; index++ {
+		ready := d.awaitConversation(orchestrator, 30*time.Second, "approval before next turn", func(s snapshot) bool {
+			_, ok := s.pendingApproval()
+			return ok
+		})
+		approval, _ := ready.pendingApproval()
+		d.mustCall("POST", "/sessions/"+orchestrator+"/conversation/approvals/"+approval.RequestID+"/resolve",
+			http.StatusNoContent, map[string]any{"decisionId": "allow"}, nil)
+		if index == 0 {
+			d.awaitConversation(orchestrator, 30*time.Second, "typed prompt dispatch", func(s snapshot) bool {
+				return len(s.Turns) == 2 && terminal(s.Turns[0].State) && s.Turns[1].State == "running"
+			})
+		}
+	}
+	encoded, _ := json.Marshal(typed)
+	calls, err := os.ReadFile(callsPath)
+	if err != nil || strings.Count(string(calls), "prompt-text:"+string(encoded)) != 1 {
+		t.Fatalf("provider did not receive exact typed text once: err=%v\n%s", err, calls)
+	}
+	d.mustCall("POST", "/sessions/"+orchestrator+"/kill", http.StatusOK, nil, nil)
+	d.mustCall("POST", "/sessions/"+worker+"/kill", http.StatusOK, nil, nil)
 }
 
 func TestPendingACPApprovalSurvivesDaemonSIGKILL(t *testing.T) {

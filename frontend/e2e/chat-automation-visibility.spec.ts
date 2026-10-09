@@ -24,6 +24,7 @@ test("automation visibility is reversible and persistent without suppressing war
 		message("failure", 15, "automation", "Failed delivery turn stays", "user", "failed-turn"),
 		message("daemon", 16, "daemon", "Daemon notice stays"),
 		message("recovered", 19, "automation", "Recovered automation card stays", "user", "recovered-turn"),
+		message("queued-routine", 20, "automation", "Queued automation report", "user", "queued-routine-turn"),
 	];
 	await page.route("http://127.0.0.1:8080/api/v1/**", async (route) => {
 		const pathname = new URL(route.request().url()).pathname;
@@ -35,9 +36,10 @@ test("automation visibility is reversible and persistent without suppressing war
 		} else if (sessions.some((id) => pathname === `/api/v1/sessions/${id}/conversation`)) {
 			await route.fulfill({ json: {
 				conversationId: `conversation-${pathname.split("/")[4]}`, sessionId: pathname.split("/")[4], harness: "codex", mode: "chat",
-				controller: "busy", latestSequence: 19, oldestSequence: 1, hasMoreBefore: false, settings: {}, capabilities: ["approvals"],
+				controller: "busy", latestSequence: 20, oldestSequence: 1, hasMoreBefore: false, settings: {}, capabilities: ["approvals"],
 				turns: [
 					{ id: "active-turn", state: "running", requestedAt: at },
+					{ id: "queued-routine-turn", state: "queued", requestedAt: at },
 					{ id: "failed-turn", state: "failed", requestedAt: at, completedAt: at, errorMessage: "Delivery failed" },
 					{ id: "recovered-turn", state: "recovered", requestedAt: at, completedAt: at },
 				],
@@ -63,7 +65,9 @@ test("automation visibility is reversible and persistent without suppressing war
 	await page.goto(`/#/projects/${projectId}/sessions/${sessions[0]}`);
 	const toggle = page.getByRole("button", { name: "Hide automation messages" });
 	await expect(toggle).toHaveAttribute("aria-pressed", "false");
+	await expect(toggle.locator("svg")).toHaveClass(/lucide-eye(?:\s|$)/);
 	await expect(page.getByText("Routine automation report 0", { exact: true })).toBeVisible();
+	await expect(page.getByText("Queued automation report", { exact: true })).toBeVisible();
 	const beforeToggleWrites = writes.length;
 	await toggle.focus();
 	await page.keyboard.press("Shift+Tab");
@@ -78,8 +82,10 @@ test("automation visibility is reversible and persistent without suppressing war
 	expect(toggleFocus.color).not.toBe("rgba(0, 0, 0, 0)");
 	await page.keyboard.press("Space");
 	await expect(toggle).toHaveAttribute("aria-pressed", "true");
-	await expect(page.getByText("12 automation messages hidden", { exact: true })).toBeVisible();
+	await expect(toggle.locator("svg")).toHaveClass(/lucide-eye-off(?:\s|$)/);
+	await expect(page.getByText("13 automation messages hidden", { exact: true })).toBeVisible();
 	await expect(page.getByText(/^Routine automation report /)).toHaveCount(0);
+	await expect(page.getByText("Queued automation report", { exact: true })).toHaveCount(0);
 	for (const text of ["Human prompt stays", "Assistant response stays", "Failed delivery turn stays", "Daemon notice stays", "Structured error stays"]) {
 		await expect(page.getByText(text, { exact: true })).toBeVisible();
 	}
@@ -87,11 +93,11 @@ test("automation visibility is reversible and persistent without suppressing war
 	await expect(page.getByText("This turn was recovered from an earlier session", { exact: true })).toBeVisible();
 	await expect(page.getByText("Recovered automation card stays", { exact: true })).toBeVisible();
 	expect(writes.slice(beforeToggleWrites)).toEqual([]);
-	expect(messages.filter((item) => item.origin === "automation")).toHaveLength(14);
+	expect(messages.filter((item) => item.origin === "automation")).toHaveLength(15);
 
 	await page.goto(`/#/projects/${projectId}/sessions/${sessions[1]}`);
 	await expect(toggle).toHaveAttribute("aria-pressed", "true");
-	await expect(page.getByText("12 automation messages hidden", { exact: true })).toBeVisible();
+	await expect(page.getByText("13 automation messages hidden", { exact: true })).toBeVisible();
 	await page.reload();
 	await expect(toggle).toHaveAttribute("aria-pressed", "true");
 	await expect(page.getByText(/^Routine automation report /)).toHaveCount(0);
@@ -111,6 +117,8 @@ test("automation visibility is reversible and persistent without suppressing war
 	await expect(page.getByText("Routine automation report 0", { exact: true })).toBeVisible();
 	await expect(page.getByText(/^Routine automation report /)).toHaveCount(12);
 	await expect(toggle).toHaveAttribute("aria-pressed", "false");
+	await expect(toggle.locator("svg")).toHaveClass(/lucide-eye(?:\s|$)/);
+	await expect(page.getByText("Queued automation report", { exact: true })).toBeVisible();
 	await expect(page.getByRole("log", { name: "Conversation" })).toBeFocused();
 	expect(await page.evaluate(() => localStorage.getItem("ao.chat.hideAutomationMessages"))).toBe("false");
 });

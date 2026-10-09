@@ -31,7 +31,7 @@ import {
 	type ReactNode,
 	type WheelEvent as ReactWheelEvent,
 } from "react";
-import { ArrowDown, ChevronRight, EyeOff, Loader2, TriangleAlert, Undo2 } from "lucide-react";
+import { ArrowDown, ChevronRight, Eye, EyeOff, Loader2, TriangleAlert, Undo2 } from "lucide-react";
 import { Reorder, useDragControls } from "motion/react";
 import { useTranslation } from "react-i18next";
 import { useScrollFollow } from "../../hooks/useScrollFollow";
@@ -1785,7 +1785,7 @@ function AutomationMessagesToggle() {
 			className="automation-visibility-control min-h-6 min-w-6 shrink-0"
 			onClick={() => setHidden(!hidden)}
 		>
-			<EyeOff aria-hidden="true" className="size-3.5" />
+			{hidden ? <EyeOff aria-hidden="true" className="size-3.5" /> : <Eye aria-hidden="true" className="size-3.5" />}
 		</Button>
 	);
 }
@@ -2832,7 +2832,7 @@ function Timeline({
 		);
 		if (!hideAutomationMessages) return { grouped: originalGroups, hiddenAutomationCount: 0 };
 		const protectedTurns = new Set(snapshot.turns.filter((entry) =>
-			entry.state === "queued" || entry.state === "failed" || entry.state === "interrupted" || entry.state === "cancelled" || entry.state === "recovered",
+			entry.state === "failed" || entry.state === "interrupted" || entry.state === "cancelled" || entry.state === "recovered",
 		).map((entry) => entry.id));
 		let hiddenAutomationCount = 0;
 		const grouped = originalGroups.flatMap((group) => {

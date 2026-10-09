@@ -607,26 +607,9 @@ func Run() error {
 	lcStack.LCM.SetSessionOperationGate(sessMgr)
 	termMgr.SetSessionInputLease(sessMgr)
 	projectSvc := projectsvc.NewWithDeps(projectsvc.Deps{Store: store, Sessions: sessionSvc, DefaultHarness: domain.AgentHarness(cfg.Agent), Telemetry: telemetrySink, Logger: log, OnModelScopeChanged: agentSvc.InvalidateProjectModelCatalogs})
-	reportSessions, ok := sessMgr.(reportSemanticSession)
-	if !ok {
-		return errors.New("wire report delivery: session manager lacks semantic send support")
-	}
-	var reportCoordinator *reportsvc.Coordinator
-	reportSvc := reportsvc.New(reportsvc.Deps{Store: store, OnCreated: func(domain.ReportRecord) {
-		if reportCoordinator != nil {
-			reportCoordinator.Wake()
-		}
-	}})
-	reportCoordinator = reportsvc.NewCoordinator(reportsvc.CoordinatorDeps{
-		Store:    store,
-		Delivery: reportSemanticDelivery{chat: chatSvc, sessions: reportSessions, store: store},
-	})
-	chatSvc.SetReportCoordinator(reportCoordinator)
-	reportDeliveryDone := reportCoordinator.Start(ctx)
-	defer func() {
-		stop()
-		<-reportDeliveryDone
-	}()
+	// ponytail: Reports are manual-only through GET /reports in this build.
+	// Restore delivery only on explicit opt-in; keep human prompts verbatim.
+	reportSvc := reportsvc.New(reportsvc.Deps{Store: store})
 	lcStack.trackerDone = startTrackerIntake(ctx, cfg, store, sessionSvc, tracker, log)
 
 	hostCommands := systemexec.New(cfg.DataDir)
