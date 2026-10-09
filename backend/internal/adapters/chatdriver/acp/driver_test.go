@@ -583,6 +583,41 @@ func TestPersistentACPResumeAdoptsLivePromptWithoutSecondSetup(t *testing.T) {
 	}
 }
 
+func TestPersistentACPReconnectRefusesActiveHostWithoutDurableRunningTurn(t *testing.T) {
+	initialize, err := json.Marshal(acpsdk.InitializeResponse{ProtocolVersion: acpsdk.ProtocolVersionNumber})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := json.Marshal(acpsdk.NewSessionResponse{SessionId: "retained-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemon, host := net.Pipe()
+	t.Cleanup(func() { _ = host.Close(); _ = daemon.Close() })
+	driver := New(Config{Harness: domain.HarnessClaudeCode}, slog.New(slog.DiscardHandler))
+	driver.connectHost = func(context.Context, persistenthost.Config) (*persistenthost.Transport, error) {
+		return &persistenthost.Transport{Stdin: daemon, Stdout: daemon, Reconnected: true, ACPState: &persistenthost.ACPState{InitializeResult: initialize, SessionResult: session, SessionID: "retained-session", ActivePrompt: true}}, nil
+	}
+	opened, err := driver.Reconnect(context.Background(), ports.ChatResumeConfig{SessionID: "retained", DataDir: t.TempDir(), WorkspacePath: t.TempDir(), ProviderConversationID: "retained-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv := opened.(*conversation)
+	t.Cleanup(func() { _ = conv.Close() })
+	err = conv.ActivateLiveReconnect(context.Background(), "")
+	if !errors.Is(err, ports.ErrChatRecoveryInconclusive) || !strings.Contains(err.Error(), "active prompt but no durable running turn") {
+		t.Fatalf("missing durable target guard: %v", err)
+	}
+	if err := conv.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-conv.conn.Done():
+	case <-time.After(time.Second):
+		t.Fatal("refused activation retained connection")
+	}
+}
+
 func TestPersistentACPReconnectBackpressuresBurstWithoutLosingEvents(t *testing.T) {
 	initialize, err := json.Marshal(acpsdk.InitializeResponse{ProtocolVersion: acpsdk.ProtocolVersionNumber})
 	if err != nil {
