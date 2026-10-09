@@ -461,7 +461,7 @@ describe("send keys", () => {
 		fireEvent.keyDown(field, { key: "Enter" });
 		await waitFor(() => expect(onInterruptSend).toHaveBeenCalledTimes(1));
 		await waitFor(() => expect(readChatSessionDraft(sessionId).composer.delivery).toBeUndefined());
-		expect(field).toHaveAttribute("contenteditable", "true");
+		await waitFor(() => expect(field).toHaveAttribute("contenteditable", "true"));
 		expect(field).toHaveTextContent("keep my rejected text");
 		expect(screen.getByLabelText("Send while agent is working")).toBeEnabled();
 		view.unmount();
