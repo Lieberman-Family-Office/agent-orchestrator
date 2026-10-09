@@ -27,7 +27,7 @@ type legacyACPTransport struct {
 	pending         map[string]chan legacyACPResponse
 	models          *legacySessionModelState
 	reader          *io.PipeReader
-	updateProcessed <-chan struct{}
+	updateProcessed <-chan string
 	streamDone      <-chan struct{}
 }
 
@@ -63,7 +63,9 @@ type legacyACPResponse struct {
 	err error
 }
 
-func newLegacyACPTransport(stdin io.WriteCloser, stdout io.Reader, updateProcessed, streamDone <-chan struct{}) (*legacyACPTransport, io.WriteCloser, io.Reader) {
+const localNotificationIDKey = "ao.localNotificationID"
+
+func newLegacyACPTransport(stdin io.WriteCloser, stdout io.Reader, updateProcessed <-chan string, streamDone <-chan struct{}) (*legacyACPTransport, io.WriteCloser, io.Reader) {
 	writer := &lockedWriteCloser{inner: stdin}
 	transport := &legacyACPTransport{
 		writer:          writer,
@@ -82,25 +84,57 @@ func (t *legacyACPTransport) forward(source io.Reader, destination *io.PipeWrite
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 && !t.intercept(line) {
+			// Match the SDK's complete envelope decode before expecting its callback.
+			var notification struct {
+				JSONRPC string               `json:"jsonrpc"`
+				ID      *json.RawMessage     `json:"id,omitempty"`
+				Method  string               `json:"method,omitempty"`
+				Params  json.RawMessage      `json:"params,omitempty"`
+				Result  json.RawMessage      `json:"result,omitempty"`
+				Error   *acpsdk.RequestError `json:"error,omitempty"`
+			}
+			ackID := ""
+			if json.Unmarshal(line, &notification) == nil && notification.Method == acpsdk.ClientMethodSessionUpdate {
+				var update acpsdk.SessionNotification
+				if json.Unmarshal(notification.Params, &update) == nil && update.Validate() == nil {
+					if update.Meta == nil {
+						update.Meta = make(map[string]any)
+					}
+					// Provider metadata cannot claim a local completion token.
+					delete(update.Meta, localNotificationIDKey)
+					if notification.ID == nil {
+						ackID = fmt.Sprintf("ao-local-%d", t.nextID.Add(1))
+						update.Meta[localNotificationIDKey] = ackID
+					}
+					encodedParams, encodeErr := json.Marshal(update)
+					if encodeErr != nil {
+						_ = destination.CloseWithError(encodeErr)
+						return
+					}
+					notification.Params = encodedParams
+					encodedFrame, encodeErr := json.Marshal(notification)
+					if encodeErr != nil {
+						_ = destination.CloseWithError(encodeErr)
+						return
+					}
+					line = encodedFrame
+					line = append(line, '\n')
+				}
+			}
 			if _, writeErr := destination.Write(line); writeErr != nil {
 				_ = destination.CloseWithError(writeErr)
 				return
 			}
-			var notification struct {
-				Method string
-				ID     *json.RawMessage
-				Params json.RawMessage
-			}
-			if json.Unmarshal(line, &notification) == nil && notification.Method == acpsdk.ClientMethodSessionUpdate && notification.ID == nil {
-				var update acpsdk.SessionNotification
-				if json.Unmarshal(notification.Params, &update) == nil && update.Validate() == nil {
-					// The SDK still validates and dispatches. One completed update at a
-					// time backpressures journal replay instead of overflowing its queue.
-					select {
-					case <-t.updateProcessed:
-					case <-t.streamDone:
+			if ackID != "" {
+				// One exact completed notification backpressures journal replay.
+				select {
+				case completed := <-t.updateProcessed:
+					if completed != ackID {
+						_ = destination.CloseWithError(errors.New("ACP notification acknowledgment mismatch"))
 						return
 					}
+				case <-t.streamDone:
+					return
 				}
 			}
 		}

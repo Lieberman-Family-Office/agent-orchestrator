@@ -700,6 +700,99 @@ func TestPersistentACPConnectionFailureDetachesTransportWithoutTerminatingProvid
 	}
 }
 
+func replayBoundaryConversation(t *testing.T) (*conversation, net.Conn) {
+	t.Helper()
+	daemon, host := net.Pipe()
+	gate := newGatedReader(daemon, true)
+	proc := &process{stdin: daemon, stdout: gate, gate: gate}
+	proc.stop = persistentStop(gate, daemon)
+	proc.terminate = func() error { t.Error("replay boundary terminated provider"); return nil }
+	conv := newConversation(proc, slog.New(slog.DiscardHandler), "", nil, nil)
+	conv.mu.Lock()
+	conv.sessionID, conv.activeTurn = "review-session", "review-turn"
+	conv.mu.Unlock()
+	t.Cleanup(func() { _ = conv.legacyWire.reader.Close(); _ = host.Close(); _ = conv.Close() })
+	return conv, host
+}
+
+func TestPersistentACPCloseUnblocksBackpressuredReplay(t *testing.T) {
+	conv, host := replayBoundaryConversation(t)
+	go func() {
+		for range eventBuffer + 2 {
+			if _, err := fmt.Fprintln(host, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"burst"}}}}`); err != nil {
+				return
+			}
+		}
+	}()
+	deadline := time.After(3 * time.Second)
+	for len(conv.events) < cap(conv.events) {
+		select {
+		case <-deadline:
+			t.Fatal("replay did not fill output buffer")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if err := conv.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-conv.conn.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Close retained blocked SDK reader")
+	}
+}
+
+func TestPersistentACPRejectsMalformedEnvelopeWithoutBlockingNextNotification(t *testing.T) {
+	for _, field := range []string{`"jsonrpc":7`, `"jsonrpc":"2.0","error":7`} {
+		t.Run(field, func(t *testing.T) {
+			conv, host := replayBoundaryConversation(t)
+			go func() {
+				_, _ = fmt.Fprintf(host, `{%s,"method":"session/update","params":{"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"rejected"}}}}`+"\n", field)
+				_, _ = fmt.Fprintln(host, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"after malformed"}}}}`)
+			}()
+			event := nextEvent(t, conv.Events())
+			if event.Kind != ports.ChatEventMessageDelta || event.Delta != "after malformed" {
+				t.Fatalf("malformed frame blocked valid notification: %+v", event)
+			}
+		})
+	}
+}
+
+func TestPersistentACPRequestUpdatesCannotAcknowledgeNotifications(t *testing.T) {
+	conv, host := replayBoundaryConversation(t)
+	responses := make(chan string, 2)
+	go func() {
+		reader := bufio.NewReader(host)
+		for range 2 {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			responses <- line
+		}
+	}()
+	go func() {
+		for _, id := range []int{1, 2} {
+			_, _ = fmt.Fprintf(host, `{"jsonrpc":"2.0","id":%d,"method":"session/update","params":{"_meta":{"ao.localNotificationID":"untrusted"},"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"request"}}}}`+"\n", id)
+		}
+	}()
+	for range 2 {
+		select {
+		case <-responses:
+		case <-time.After(time.Second):
+			t.Fatal("request callback deposited an unpaired acknowledgment")
+		}
+	}
+	go func() {
+		_, _ = fmt.Fprintln(host, `{"jsonrpc":"2.0","id":null,"method":"session/update","params":{"_meta":{"ao.localNotificationID":"untrusted"},"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"notification"}}}}`)
+	}()
+	for range 3 {
+		if event := nextEvent(t, conv.Events()); event.Kind != ports.ChatEventMessageDelta {
+			t.Fatalf("update lost: %+v", event)
+		}
+	}
+}
+
 func TestPersistentACPReplayAppliesAcceptedPermissionCommand(t *testing.T) {
 	initialize, err := json.Marshal(acpsdk.InitializeResponse{
 		ProtocolVersion: acpsdk.ProtocolVersionNumber,

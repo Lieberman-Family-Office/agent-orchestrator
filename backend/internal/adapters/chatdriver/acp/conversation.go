@@ -84,7 +84,7 @@ type nestedMessageState struct {
 type conversation struct {
 	conn            *acpsdk.ClientSideConnection
 	legacyWire      *legacyACPTransport
-	updateProcessed chan struct{}
+	updateProcessed chan string
 	streamDone      chan struct{}
 	proc            *process
 	log             *slog.Logger
@@ -197,7 +197,7 @@ func newConversation(
 		nestedMessages:   make(map[string]nestedMessageState),
 		tools:            make(map[string]*toolState),
 		events:           make(chan ports.ChatEvent, eventBuffer),
-		updateProcessed:  make(chan struct{}, 1),
+		updateProcessed:  make(chan string, 1),
 		streamDone:       make(chan struct{}),
 		extensionFor:     extensionFor,
 		extensionMethods: reverseAliases,
@@ -967,6 +967,7 @@ func (c *conversation) closeProvider(terminate bool) error {
 		sessionID := c.sessionID
 		c.mu.Unlock()
 		if persistent && !terminate {
+			_ = c.legacyWire.reader.Close()
 			closeErr = c.proc.stop()
 			return
 		}
