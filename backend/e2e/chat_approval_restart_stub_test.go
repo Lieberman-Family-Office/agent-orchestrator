@@ -65,6 +65,8 @@ func TestFakeApprovalACP(t *testing.T) {
 			_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":{}}},"authMethods":[]}}`+"\n", frame.ID)
 		case "session/new", "session/load", "session/resume":
 			_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"fake-provider-session"}}`+"\n", frame.ID)
+		case "session/cancel":
+			_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"cancelled"}}`+"\n", promptID)
 		case "session/prompt":
 			var text strings.Builder
 			for _, block := range frame.Params.Prompt {
@@ -84,6 +86,55 @@ func TestFakeApprovalACP(t *testing.T) {
 		}
 	}
 	os.Exit(0)
+}
+
+func TestInterruptSendReachesACPAndKeepsOlderQueue(t *testing.T) {
+	binDir := t.TempDir()
+	testBinary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	shim := "#!/bin/sh\ncase \"$1\" in\n  acp) exec \"$AO_E2E_TEST_BINARY\" -test.run='^TestFakeApprovalACP$' ;;\n  auth) printf '0 credentials\\n' ;;\n  --version) printf '1.0.0\\n' ;;\n  *) exit 2 ;;\nesac\n"
+	if err := os.WriteFile(filepath.Join(binDir, "opencode"), []byte(shim), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("OPENCODE_DATA_DIR", t.TempDir())
+	t.Setenv("OPENCODE_CONFIG_CONTENT", "")
+	t.Setenv("AO_E2E_TEST_BINARY", testBinary)
+	t.Setenv("AO_E2E_FAKE_APPROVAL_ACP", "1")
+	callsPath := filepath.Join(t.TempDir(), "provider-calls.log")
+	t.Setenv("AO_E2E_ACP_CALLS", callsPath)
+	d := startDaemon(t, t.TempDir())
+	project := seedProject(t, d, "interrupt-send")
+	setPermissions(t, d, project, "default")
+	session := spawn(t, d, map[string]any{"projectId": project, "kind": "worker", "harness": "opencode", "mode": "chat", "prompt": "running"}).Session.ID
+	d.awaitConversation(session, 30*time.Second, "running approval", func(s snapshot) bool { _, ok := s.pendingApproval(); return ok })
+	send(t, d, session, "older queued", "older")
+	var accepted struct {
+		TurnID string `json:"turnId"`
+	}
+	d.mustCall("POST", "/sessions/"+session+"/conversation/messages", http.StatusAccepted,
+		map[string]any{"text": "new prompt", "clientMessageId": "interrupt-next", "interruptAndSend": true}, &accepted)
+	d.awaitConversation(session, 30*time.Second, "priority prompt without losing queue", func(s snapshot) bool {
+		states := s.userTurnStates()
+		return states["running"] == "interrupted" && states["new prompt"] == "running" && states["older queued"] == "queued"
+	})
+	before, err := os.ReadFile(callsPath)
+	if err != nil || strings.Count(string(before), "session/cancel") != 1 {
+		t.Fatalf("cancellation calls: %v\n%s", err, before)
+	}
+	d.mustCall("POST", "/sessions/"+session+"/conversation/messages", http.StatusAccepted,
+		map[string]any{"text": "new prompt", "clientMessageId": "interrupt-next", "interruptAndSend": true}, nil)
+	after, err := os.ReadFile(callsPath)
+	if err != nil || strings.Count(string(after), "session/cancel") != 1 {
+		t.Fatalf("duplicate cancelled new turn: %v\n%s", err, after)
+	}
+	ready := d.awaitConversation(session, 30*time.Second, "new prompt approval", func(s snapshot) bool { _, ok := s.pendingApproval(); return ok })
+	approval, _ := ready.pendingApproval()
+	d.mustCall("POST", "/sessions/"+session+"/conversation/approvals/"+approval.RequestID+"/resolve", http.StatusNoContent, map[string]any{"decisionId": "allow"}, nil)
+	d.awaitConversation(session, 30*time.Second, "retained older queue", func(s snapshot) bool { return s.userTurnStates()["older queued"] == "running" })
+	d.mustCall("POST", "/sessions/"+session+"/kill", http.StatusOK, nil, nil)
 }
 
 func TestOrchestratorSendsOnlyTypedTextAndKeepsReportsManual(t *testing.T) {
