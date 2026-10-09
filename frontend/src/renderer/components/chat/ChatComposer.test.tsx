@@ -213,6 +213,18 @@ describe("send keys", () => {
 		expect(screen.getByRole("button", { name: "Queue message" })).toBeEnabled();
 	});
 
+	it.each([false, true])("sends leading spaces and trailing newlines unchanged (durable=%s)", async (durable) => {
+		const onSend = vi.fn().mockResolvedValue(undefined);
+		const text = "  keep this indentation\n\n";
+		const sessionId = durable ? "verbatim-composer-draft" : undefined;
+		render(<ChatComposer onSend={onSend} draftSessionId={sessionId} draftSeed={{ id: "verbatim-seed", text }} />);
+		const field = screen.getByLabelText("Message the agent");
+		await waitFor(() => expect(composerWireText(field)).toBe(text));
+		await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+		await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+		expect(onSend.mock.calls[0][0]).toBe(text);
+	});
+
 	it("sends on Enter", async () => {
 		const { onSend, field } = renderComposer();
 		await typeInComposer(field, "hello");
@@ -790,13 +802,13 @@ describe("steering", () => {
 		};
 	}
 
-	it("steers on Cmd+Enter rather than queueing, and trims the body first", async () => {
+	it("steers on Cmd+Enter rather than queueing, preserving the typed body", async () => {
 		const { onSend, onSteer, field } = renderSteerable();
 
 		await typeInComposer(field, "  change course  ");
 		await userEvent.keyboard("{Meta>}{Enter}{/Meta}");
 
-		await waitFor(() => expect(onSteer).toHaveBeenCalledWith("change course"));
+		await waitFor(() => expect(onSteer).toHaveBeenCalledWith("  change course  "));
 		expect(onSend).not.toHaveBeenCalled();
 	});
 
@@ -1294,7 +1306,7 @@ describe("slash commands", () => {
 		await typeInComposer(field, "/rev");
 		await userEvent.keyboard("{Enter}{Enter}");
 
-		expect(onSend).toHaveBeenCalledWith("/review");
+		expect(onSend).toHaveBeenCalledWith("/review ");
 	});
 
 	it("inserts on Tab as well", async () => {
@@ -1387,7 +1399,7 @@ describe("file mentions", () => {
 		await typeInComposer(field, "@chat.go");
 		await userEvent.keyboard("{Enter}");
 		await userEvent.keyboard("{Enter}");
-		expect(onSend).toHaveBeenCalledWith("backend/internal/ports/chat.go");
+		expect(onSend).toHaveBeenCalledWith("backend/internal/ports/chat.go ");
 	});
 
 	it("quotes a completed path containing spaces in the agent-facing text", async () => {
@@ -1396,7 +1408,7 @@ describe("file mentions", () => {
 		await userEvent.keyboard("{Enter}{Enter}");
 
 		expect(field.querySelector('[data-composer-token="file"]')).not.toBeInTheDocument();
-		expect(onSend).toHaveBeenCalledWith('read "docs/product notes.md"');
+		expect(onSend).toHaveBeenCalledWith('read "docs/product notes.md" ');
 	});
 
 	it("leaves the at-sign ordinary when there are no paths", async () => {
@@ -1507,7 +1519,7 @@ describe("attachments", () => {
 		await userEvent.keyboard("{Enter}");
 
 		await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
-		expect(onSend.mock.calls[0]?.[0]).toBe("look");
+		expect(onSend.mock.calls[0]?.[0]).toBe("look ");
 	});
 
 	it("ignores a paste that carries no file", async () => {

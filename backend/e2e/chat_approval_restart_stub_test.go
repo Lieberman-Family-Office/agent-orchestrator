@@ -103,7 +103,8 @@ func TestOrchestratorSendsOnlyTypedTextAndKeepsReportsManual(t *testing.T) {
 	t.Setenv("AO_E2E_FAKE_APPROVAL_ACP", "1")
 	callsPath := filepath.Join(t.TempDir(), "provider-calls.log")
 	t.Setenv("AO_E2E_ACP_CALLS", callsPath)
-	d := startDaemon(t, t.TempDir())
+	dataDir := t.TempDir()
+	d := startDaemon(t, dataDir)
 	project := seedProject(t, d, "manual-reports")
 	setPermissions(t, d, project, "default")
 	worker := spawn(t, d, map[string]any{
@@ -123,8 +124,48 @@ func TestOrchestratorSendsOnlyTypedTextAndKeepsReportsManual(t *testing.T) {
 			"sessionId": worker, "state": state, "note": "Stored report " + state,
 		}, nil)
 	}
-	typed := "Only my typed words\n\n  Preserve this spacing."
+	// Recreate one accepted report turn left queued by the prior build.
+	st, err := sqlite.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	batch, err := st.ClaimPendingReportBatch(ctx, domain.ProjectID(project), "legacy-claim", time.Now())
+	if err != nil || len(batch) != 2 || batch[0].DeliveryBatchID == "" {
+		t.Fatalf("claim legacy report: %+v, err=%v", batch, err)
+	}
+	rec, found, err := st.GetSession(ctx, domain.SessionID(orchestrator))
+	if err != nil || !found {
+		t.Fatalf("read orchestrator: found=%v err=%v", found, err)
+	}
+	conversation, err := st.ConversationForSession(ctx, rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := st.AppendUserMessage(ctx, conversation.ID, rec.ID, rec.Metadata.ControllerGeneration,
+		domain.ConversationMessage{ID: "legacy-report-message", Text: "Legacy automatic worker report",
+			Origin: domain.MessageOriginAutomation, ClientMessageID: batch[0].DeliveryBatchID},
+		"legacy-report-turn", time.Now())
+	if err != nil || !created {
+		t.Fatalf("seed legacy queue: created=%v err=%v", created, err)
+	}
+	if _, err := st.AcknowledgeReportBatch(ctx, domain.ProjectID(project), "legacy-claim", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	typed := "  Only my typed words\n\n  Preserve this spacing.\n\n"
 	send(t, d, orchestrator, typed, "verbatim-human")
+	// Restart only the daemon; the fake provider host survives like production ACP.
+	if err := d.cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = d.cmd.Process.Wait()
+	d.cmd = nil
+	d.waitPortFree()
+	d = startDaemon(t, dataDir)
+	d.awaitLiveController(orchestrator, 30*time.Second)
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		snap := d.conversation(orchestrator)
@@ -134,7 +175,7 @@ func TestOrchestratorSendsOnlyTypedTextAndKeepsReportsManual(t *testing.T) {
 				userMessages = append(userMessages, message.Text)
 			}
 		}
-		if len(userMessages) != 2 || userMessages[0] != "Orchestrator opening prompt" || userMessages[1] != typed {
+		if len(userMessages) != 3 || userMessages[0] != "Orchestrator opening prompt" || userMessages[1] != "Legacy automatic worker report" || userMessages[2] != typed {
 			t.Fatalf("human send or automatic report delivery changed conversation: %q", userMessages)
 		}
 		if time.Now().After(deadline) {
@@ -161,13 +202,14 @@ func TestOrchestratorSendsOnlyTypedTextAndKeepsReportsManual(t *testing.T) {
 			http.StatusNoContent, map[string]any{"decisionId": "allow"}, nil)
 		if index == 0 {
 			d.awaitConversation(orchestrator, 30*time.Second, "typed prompt dispatch", func(s snapshot) bool {
-				return len(s.Turns) == 2 && terminal(s.Turns[0].State) && s.Turns[1].State == "running"
+				states := s.userTurnStates()
+				return len(s.Turns) == 3 && states["Orchestrator opening prompt"] == "completed" && states["Legacy automatic worker report"] == "queued" && states[typed] == "running"
 			})
 		}
 	}
 	encoded, _ := json.Marshal(typed)
 	calls, err := os.ReadFile(callsPath)
-	if err != nil || strings.Count(string(calls), "prompt-text:"+string(encoded)) != 1 {
+	if err != nil || strings.Count(string(calls), "prompt-text:"+string(encoded)) != 1 || strings.Contains(string(calls), "Legacy automatic worker report") {
 		t.Fatalf("provider did not receive exact typed text once: err=%v\n%s", err, calls)
 	}
 	d.mustCall("POST", "/sessions/"+orchestrator+"/kill", http.StatusOK, nil, nil)

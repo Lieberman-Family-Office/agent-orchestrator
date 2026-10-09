@@ -1023,13 +1023,13 @@ export const ChatComposer = memo(function ChatComposer({
 
 	async function performClaimedSubmit(forceSteer?: boolean, mutationToken?: ChatDraftMutationToken) {
 		let currentText = textRef.current;
-		let body = currentText.trim();
+		let body = currentText;
 		const recoveringDelivery = durableDelivery;
 		const sendNativeImages = recoveringDelivery?.nativeImages ?? Boolean(nativeImages);
 		setSendError(null);
 		setSteerOutcomeNotice(null);
 
-		if (!recoveringDelivery && !savingQueuedEdit && body === "/compact" && onCompact) {
+		if (!recoveringDelivery && !savingQueuedEdit && body.trim() === "/compact" && onCompact) {
 			if (draftScope && !mutationToken) return;
 			let mutationFinished = false;
 			setSubmitting(true);
@@ -1077,10 +1077,10 @@ export const ChatComposer = memo(function ChatComposer({
 		// one); typed paths are the user's text and stay.
 		editor.current?.pruneImages(attachedPaths);
 		currentText = textRef.current;
-		body = proseBesideImages(currentText.trim(), attachedPaths);
+		body = proseBesideImages(currentText, attachedPaths);
 		const hasAttachments = settledAttachments.length > 0 || visibleRetainedAttachments.length > 0;
 		const canSubmitNow =
-			(body.length > 0 || hasAttachments || Boolean(recoveringDelivery)) &&
+			(body.trim().length > 0 || hasAttachments || Boolean(recoveringDelivery)) &&
 			(!busy || savingQueuedEdit || recoveringDelivery?.state === "accepted") &&
 			!disabled && !steerPending && !savingQueuedEditPending &&
 			!composerMutation.pending &&

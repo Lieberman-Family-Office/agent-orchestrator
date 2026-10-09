@@ -239,7 +239,7 @@ describe("ChatComposer steering", () => {
 		await waitFor(() => expect(stage).toHaveBeenCalledOnce());
 		await waitFor(() =>
 			expect(onSteer).toHaveBeenCalledWith(
-				"inspect this\n\nAttached files (read these files in the workspace):\n- .ao/attachments/slow.png",
+				"inspect this \n\nAttached files (read these files in the workspace):\n- .ao/attachments/slow.png",
 				[{ mimeType: "image/png", data: "iVBORw==" }],
 			),
 		);

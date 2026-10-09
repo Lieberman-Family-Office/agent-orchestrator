@@ -652,6 +652,54 @@ func TestProjectConversationFreshContextRebindWritesResetBoundaryAtomically(t *t
 	}
 }
 
+func TestLegacyWorkerReportQueueDoesNotDrainAheadOfHumanMessages(t *testing.T) {
+	s, session, conversation := conversationFixture(t)
+	ctx := context.Background()
+	if _, err := s.CreateReport(ctx, domain.ReportRecord{
+		ID: "legacy-report", SessionID: session, ProjectID: "hist", State: domain.ReportCheckpoint,
+		Note: "retain for manual retrieval", CreatedAt: histClock, AvailableAt: histClock,
+		DeliveryState: domain.ReportPending, RepeatCount: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	batch, err := s.ClaimPendingReportBatch(ctx, "hist", "legacy-claim", histClock)
+	if err != nil || len(batch) != 1 || batch[0].DeliveryBatchID == "" {
+		t.Fatalf("claim legacy batch: %+v, err=%v", batch, err)
+	}
+	for index, message := range []domain.ConversationMessage{
+		{ID: "legacy-message", Text: "Stored worker report", Origin: domain.MessageOriginAutomation, ClientMessageID: batch[0].DeliveryBatchID},
+		{ID: "human-message", Text: "  exact human message\n\n", Origin: domain.MessageOriginHuman, ClientMessageID: batch[0].DeliveryBatchID + "-human"},
+		{ID: "other-automation", Text: "Not a worker report", Origin: domain.MessageOriginAutomation, ClientMessageID: "ordinary-automation"},
+	} {
+		created, err := s.AppendUserMessage(ctx, conversation, session, "gen-1", message, message.ID+"-turn", histClock.Add(time.Duration(index)*time.Second))
+		if err != nil || !created {
+			t.Fatalf("append queue: created=%v err=%v", created, err)
+		}
+	}
+	next, err := s.NextQueuedTurn(ctx, conversation)
+	if err != nil || next.Text != "  exact human message\n\n" {
+		t.Fatalf("queue selected legacy report instead of human prompt: %+v, err=%v", next, err)
+	}
+	if err := s.SettleTurnByID(ctx, next.TurnID, domain.TurnStateCompleted, "", histClock); err != nil {
+		t.Fatal(err)
+	}
+	next, err = s.NextQueuedTurn(ctx, conversation)
+	if err != nil || next.Text != "Not a worker report" {
+		t.Fatalf("unrelated automation changed: %+v, err=%v", next, err)
+	}
+	reports, err := s.ListReportsByProject(ctx, "hist")
+	if err != nil || len(reports) != 1 || reports[0].Note != "retain for manual retrieval" {
+		t.Fatalf("stored report lost: %+v, err=%v", reports, err)
+	}
+	turn, err := s.TurnByID(ctx, "legacy-message-turn")
+	if err != nil || turn.State != domain.TurnStateQueued {
+		t.Fatalf("held legacy turn was rewritten: %+v, err=%v", turn, err)
+	}
+	if err := s.CancelQueuedTurnByID(ctx, conversation, turn.ID, histClock); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestQueuedTurnPromotionReservationPreservesTheOtherQueueOrder(t *testing.T) {
 	s, session, conversation := conversationFixture(t)
 	ctx := context.Background()

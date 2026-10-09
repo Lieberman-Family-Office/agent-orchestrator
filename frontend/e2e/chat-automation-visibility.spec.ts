@@ -8,6 +8,8 @@ test("automation visibility is reversible and persistent without suppressing war
 	const sessions = ["visibility-one", "visibility-two"];
 	const at = "2026-10-07T12:00:00Z";
 	const writes: string[] = [];
+	const sentTexts: string[] = [];
+	let showApprovals = true;
 	await page.emulateMedia({ reducedMotion: "reduce" });
 	await installFakeAgent(page, {
 		projectId,
@@ -29,7 +31,10 @@ test("automation visibility is reversible and persistent without suppressing war
 	await page.route("http://127.0.0.1:8080/api/v1/**", async (route) => {
 		const pathname = new URL(route.request().url()).pathname;
 		if (route.request().method() !== "GET") writes.push(pathname);
-		if (pathname.startsWith("/api/v1/agents/readiness")) {
+		if (pathname.endsWith("/conversation/messages") && route.request().method() === "POST") {
+			sentTexts.push(route.request().postDataJSON().text);
+			await route.fulfill({ status: 202, json: { turnId: "typed-queue", state: "queued", duplicate: false } });
+		} else if (pathname.startsWith("/api/v1/agents/readiness")) {
 			await route.fulfill({ json: { agents: [agentReadiness("codex", "Codex")] } });
 		} else if (pathname === `/api/v1/projects/${projectId}`) {
 			await route.fulfill({ json: { status: "ok", project: { id: projectId, agent: "codex", config: { worker: { agent: "codex" } } } } });
@@ -44,10 +49,10 @@ test("automation visibility is reversible and persistent without suppressing war
 					{ id: "recovered-turn", state: "recovered", requestedAt: at, completedAt: at },
 				],
 				messages,
-				activities: [
+				activities: (showApprovals ? [
 					{ kind: "activity", id: "approval", turnId: "active-turn", sequence: 17, revision: 0, activityKind: "approval", status: "pending", summary: "Explicit approval stays", requestId: "approval-one", detail: { decisions: [{ id: "accept", label: "Approve", kind: "allow_once" }, { id: "cancel", label: "Cancel", kind: "reject_once" }] }, createdAt: at },
 					{ kind: "activity", id: "error", sequence: 18, revision: 0, activityKind: "error", status: "failed", summary: "Structured error stays", createdAt: at },
-				],
+				] : []),
 			} });
 		} else if (pathname.endsWith("/conversation/models")) {
 			await route.fulfill({ json: { models: [], selected: {} } });
@@ -121,4 +126,11 @@ test("automation visibility is reversible and persistent without suppressing war
 	await expect(page.getByText("Queued automation report", { exact: true })).toBeVisible();
 	await expect(page.getByRole("log", { name: "Conversation" })).toBeFocused();
 	expect(await page.evaluate(() => localStorage.getItem("ao.chat.hideAutomationMessages"))).toBe("false");
+	showApprovals = false;
+	await page.reload();
+	const typed = "  Only my typed words\n\n  Preserve this spacing.\n\n";
+	const composer = page.getByRole("combobox", { name: "Message the agent" });
+	await composer.fill(typed);
+	await page.getByRole("button", { name: "Queue message", exact: true }).click();
+	await expect.poll(() => sentTexts).toEqual([typed]);
 });

@@ -10,7 +10,7 @@ import (
 )
 
 // clientPayloadHash binds a client message ID to the request as received,
-// before AO may append worker reports or edit a queued message.
+// before any explicit queued-message edit.
 func clientPayloadHash(msg ports.ChatUserMessage) (string, error) {
 	if msg.ClientMessageID == "" {
 		return "", nil

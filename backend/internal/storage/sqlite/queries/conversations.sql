@@ -848,6 +848,15 @@ JOIN conversation_messages
 WHERE conversation_turns.conversation_id = ?
   AND conversation_turns.state = 'queued'
   AND conversation_turns.promotion_started_at IS NULL
+  -- Manual-only worker reports must not drain automatically after an upgrade.
+  -- Match persisted batch identity and project, never human text or all automation.
+  AND NOT (conversation_messages.origin = 'automation' AND EXISTS (
+      SELECT 1 FROM reports
+      JOIN conversations ON conversations.project_id = reports.project_id
+      WHERE conversations.id = conversation_turns.conversation_id
+        AND reports.delivery_batch_id <> ''
+        AND reports.delivery_batch_id = conversation_messages.client_message_id
+  ))
 ORDER BY conversation_turns.requested_at, conversation_turns.rowid
 LIMIT 1;
 

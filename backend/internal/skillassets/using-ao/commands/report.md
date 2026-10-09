@@ -1,7 +1,7 @@
 # ao report
 
-Persist a meaningful worker report for durable delivery to the active project
-orchestrator.
+Persist a meaningful worker report for manual retrieval from its project.
+This build does not deliver reports to the orchestrator automatically.
 
 ## Syntax
 
@@ -44,10 +44,10 @@ user-authorized scope.
 
 `--pr-created` and `--pr-reviewed` accept complete GitHub PR or GitLab MR URLs.
 
-`--needs-input` requests immediate non-interrupting delivery. `--stuck`
-requests immediate delivery plus a rate-limited interrupt. Informational work
-batches for up to one hour, while the first done report opens a fixed five
-minute settlement window.
+Reports remain stored for manual retrieval, including `--needs-input`,
+`--stuck`, `--done`, and checkpoints. They do not interrupt the orchestrator
+or append context to human messages. Read stored reports with
+`GET /api/v1/reports?projectId=<project-id>`.
 
 **Examples:**
 
