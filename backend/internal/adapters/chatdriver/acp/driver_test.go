@@ -583,6 +583,123 @@ func TestPersistentACPResumeAdoptsLivePromptWithoutSecondSetup(t *testing.T) {
 	}
 }
 
+func TestPersistentACPReconnectBackpressuresBurstWithoutLosingEvents(t *testing.T) {
+	initialize, err := json.Marshal(acpsdk.InitializeResponse{ProtocolVersion: acpsdk.ProtocolVersionNumber})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := json.Marshal(acpsdk.NewSessionResponse{SessionId: "burst-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemon, host := net.Pipe()
+	t.Cleanup(func() { _ = host.Close(); _ = daemon.Close() })
+	var logs bytes.Buffer
+	driver := New(Config{Harness: domain.HarnessClaudeCode, Capabilities: ports.ChatCapabilities{ports.ChatCapabilityStreaming: true}}, slog.New(slog.NewTextHandler(&logs, nil)))
+	driver.connectHost = func(context.Context, persistenthost.Config) (*persistenthost.Transport, error) {
+		return &persistenthost.Transport{Stdin: daemon, Stdout: daemon, Reconnected: true, ACPState: &persistenthost.ACPState{InitializeResult: initialize, SessionResult: session, SessionID: "burst-session", ActivePrompt: true}}, nil
+	}
+	opened, err := driver.Reconnect(context.Background(), ports.ChatResumeConfig{SessionID: "burst", DataDir: t.TempDir(), WorkspacePath: t.TempDir(), ProviderConversationID: "burst-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv := opened.(*conversation)
+	t.Cleanup(func() { _ = conv.Close() })
+	const count = 30000
+	written := make(chan error, 1)
+	go func() {
+		for i := range count {
+			if _, err := fmt.Fprintf(host, `{"jsonrpc":"2.0","method":"session/update","params":{"_meta":{"ao.persistentEventId":"burst:%d"},"sessionId":"burst-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%d"}}}}`+"\n", i, i); err != nil {
+				written <- err
+				return
+			}
+		}
+		_, err := fmt.Fprintln(host, `{"jsonrpc":"2.0","method":"_ao/persistent_prompt_result","params":{"eventId":"burst:terminal","result":{"stopReason":"end_turn"}}}`)
+		written <- err
+	}()
+	if err := conv.ActivateLiveReconnect(context.Background(), "durable-burst-turn"); err != nil {
+		t.Fatal(err)
+	}
+	// No projector can drain before activation returns. A full output buffer must
+	// backpressure the journal, not overflow the SDK notification queue.
+	deadline := time.After(3 * time.Second)
+	for len(conv.events) < cap(conv.events) {
+		select {
+		case <-conv.conn.Done():
+			t.Fatal("burst closed before projector started")
+		case <-deadline:
+			t.Fatal("burst never filled event buffer")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	select {
+	case <-conv.conn.Done():
+		t.Fatal("burst overflowed SDK queue")
+	case <-time.After(100 * time.Millisecond):
+	}
+	for i := 0; i < count; {
+		event := nextEvent(t, conv.Events())
+		if event.Kind == ports.ChatEventControllerState && event.ControllerState == ports.ChatControllerStopped {
+			t.Fatal("burst stopped controller")
+		}
+		if event.Kind != ports.ChatEventMessageDelta {
+			continue
+		}
+		if event.Delta != fmt.Sprint(i) || event.ProviderEventID != fmt.Sprintf("burst:%d:0", i) || event.ProviderTurnID != "durable-burst-turn" {
+			t.Fatalf("lost or reordered frame %d: %+v", i, event)
+		}
+		i++
+	}
+	for {
+		event := nextEvent(t, conv.Events())
+		if event.Kind == ports.ChatEventTurnCompleted {
+			if event.ProviderEventID != "burst:terminal" || event.TurnState != domain.TurnStateCompleted {
+				t.Fatalf("wrong terminal: %+v", event)
+			}
+			break
+		}
+		if event.Kind == ports.ChatEventControllerState && event.ControllerState == ports.ChatControllerStopped {
+			t.Fatal("burst ended before terminal")
+		}
+	}
+	if err := <-written; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPersistentACPConnectionFailureDetachesTransportWithoutTerminatingProvider(t *testing.T) {
+	daemon, host := net.Pipe()
+	t.Cleanup(func() { _ = host.Close(); _ = daemon.Close() })
+	gate := newGatedReader(daemon, true)
+	proc := &process{stdin: daemon, stdout: gate, gate: gate}
+	proc.stop = persistentStop(gate, daemon)
+	proc.terminate = func() error { t.Error("connection failure terminated provider"); return nil }
+	conv := newConversation(proc, slog.New(slog.DiscardHandler), "", nil, nil)
+	t.Cleanup(func() { _ = conv.Close() })
+	written := make(chan error, 1)
+	go func() { _, err := io.WriteString(host, strings.Repeat("x", maxACPFrameSize+1)+"\n"); written <- err }()
+	select {
+	case <-conv.conn.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("oversized frame did not end SDK connection")
+	}
+	closed := make(chan error, 1)
+	go func() { _, err := host.Read(make([]byte, 1)); closed <- err }()
+	select {
+	case err := <-closed:
+		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("host detach: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("failed SDK retained host socket")
+	}
+	select {
+	case <-written:
+	case <-time.After(time.Second):
+		t.Fatal("detached host writer is still blocked")
+	}
+}
+
 func TestPersistentACPReplayAppliesAcceptedPermissionCommand(t *testing.T) {
 	initialize, err := json.Marshal(acpsdk.InitializeResponse{
 		ProtocolVersion: acpsdk.ProtocolVersionNumber,

@@ -84,6 +84,8 @@ type nestedMessageState struct {
 type conversation struct {
 	conn            *acpsdk.ClientSideConnection
 	legacyWire      *legacyACPTransport
+	updateProcessed chan struct{}
+	streamDone      chan struct{}
 	proc            *process
 	log             *slog.Logger
 	providerScopeID string
@@ -195,10 +197,12 @@ func newConversation(
 		nestedMessages:   make(map[string]nestedMessageState),
 		tools:            make(map[string]*toolState),
 		events:           make(chan ports.ChatEvent, eventBuffer),
+		updateProcessed:  make(chan struct{}, 1),
+		streamDone:       make(chan struct{}),
 		extensionFor:     extensionFor,
 		extensionMethods: reverseAliases,
 	}
-	legacyWire, sdkWriter, sdkReader := newLegacyACPTransport(proc.stdin, proc.stdout)
+	legacyWire, sdkWriter, sdkReader := newLegacyACPTransport(proc.stdin, proc.stdout, c.updateProcessed, c.streamDone)
 	c.legacyWire = legacyWire
 	c.conn = acpsdk.NewClientSideConnection(
 		c, sdkWriter, newExtensionMethodReader(sdkReader, extensionAliases),
@@ -1001,6 +1005,12 @@ func (c *conversation) AcknowledgeProviderEvent(ctx context.Context, providerEve
 
 func (c *conversation) watchConnection() {
 	<-c.conn.Done()
+	close(c.streamDone)
+	_ = c.legacyWire.reader.Close()
+	if c.proc.terminate != nil {
+		// Detach a dead SDK transport; never terminate its durable provider host.
+		_ = c.proc.stop()
+	}
 	c.mu.Lock()
 	detaching := c.detaching
 	c.mu.Unlock()

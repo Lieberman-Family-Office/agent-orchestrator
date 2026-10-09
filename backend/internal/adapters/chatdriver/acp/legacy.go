@@ -23,9 +23,12 @@ type legacyACPTransport struct {
 	writer *lockedWriteCloser
 	nextID atomic.Uint64
 
-	mu      sync.Mutex
-	pending map[string]chan legacyACPResponse
-	models  *legacySessionModelState
+	mu              sync.Mutex
+	pending         map[string]chan legacyACPResponse
+	models          *legacySessionModelState
+	reader          *io.PipeReader
+	updateProcessed <-chan struct{}
+	streamDone      <-chan struct{}
 }
 
 type lockedWriteCloser struct {
@@ -60,13 +63,16 @@ type legacyACPResponse struct {
 	err error
 }
 
-func newLegacyACPTransport(stdin io.WriteCloser, stdout io.Reader) (*legacyACPTransport, io.WriteCloser, io.Reader) {
+func newLegacyACPTransport(stdin io.WriteCloser, stdout io.Reader, updateProcessed, streamDone <-chan struct{}) (*legacyACPTransport, io.WriteCloser, io.Reader) {
 	writer := &lockedWriteCloser{inner: stdin}
 	transport := &legacyACPTransport{
-		writer:  writer,
-		pending: make(map[string]chan legacyACPResponse),
+		writer:          writer,
+		pending:         make(map[string]chan legacyACPResponse),
+		updateProcessed: updateProcessed,
+		streamDone:      streamDone,
 	}
 	sdkReader, sdkWriter := io.Pipe()
+	transport.reader = sdkReader
 	go transport.forward(stdout, sdkWriter)
 	return transport, writer, sdkReader
 }
@@ -79,6 +85,23 @@ func (t *legacyACPTransport) forward(source io.Reader, destination *io.PipeWrite
 			if _, writeErr := destination.Write(line); writeErr != nil {
 				_ = destination.CloseWithError(writeErr)
 				return
+			}
+			var notification struct {
+				Method string
+				ID     *json.RawMessage
+				Params json.RawMessage
+			}
+			if json.Unmarshal(line, &notification) == nil && notification.Method == acpsdk.ClientMethodSessionUpdate && notification.ID == nil {
+				var update acpsdk.SessionNotification
+				if json.Unmarshal(notification.Params, &update) == nil && update.Validate() == nil {
+					// The SDK still validates and dispatches. One completed update at a
+					// time backpressures journal replay instead of overflowing its queue.
+					select {
+					case <-t.updateProcessed:
+					case <-t.streamDone:
+						return
+					}
+				}
 			}
 		}
 		if err != nil {
