@@ -1791,9 +1791,14 @@ function AutomationMessagesToggle() {
 }
 
 function canHideAutomationMessage(item: ConversationItem, protectedTurns: ReadonlySet<string>): boolean {
-	return item.kind === "message" && item.role === "user" && item.origin === "automation" &&
-		!item.streaming && (item.delivery === undefined || item.delivery === "accepted") &&
-		(!item.turnId || !protectedTurns.has(item.turnId));
+	if (item.turnId && protectedTurns.has(item.turnId)) return false;
+	if (item.kind === "activity") {
+		return item.activityKind === "system" && isSteer(item) && item.detail?.origin === "automation" &&
+			item.status === "completed" && item.detail.severity === undefined && !item.detail.error &&
+			item.detail.success !== false && !item.requestId;
+	}
+	return item.role === "user" && item.origin === "automation" &&
+		!item.streaming && (item.delivery === undefined || item.delivery === "accepted");
 }
 
 function ChatHeader({

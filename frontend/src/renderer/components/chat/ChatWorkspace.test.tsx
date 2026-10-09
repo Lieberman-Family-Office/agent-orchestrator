@@ -15,7 +15,7 @@ import {
 	chatFixtureThreadError,
 } from "../../lib/chat-fixture";
 import { appI18n } from "../../i18n";
-import type { ConversationMessage, ConversationSnapshot } from "../../types/conversation";
+import type { ConversationActivity, ConversationMessage, ConversationSnapshot } from "../../types/conversation";
 import { setApiBaseUrl } from "../../lib/api-client";
 import { useUiStore } from "../../stores/ui-store";
 import type { WorkspaceSession } from "../../types/workspace";
@@ -2723,6 +2723,81 @@ describe("automation visibility in chat", () => {
 		localStorage.removeItem("ao.chat.hideAutomationMessages");
 	});
 	afterEach(() => useUiStore.setState({ hideAutomationMessages: false }));
+
+	it("hides completed worker steers and counts them without hiding human steers or warnings", async () => {
+		const user = userEvent.setup();
+		const at = "2026-10-07T12:00:00Z";
+		const workerSteer: ConversationActivity = {
+			kind: "activity", id: "worker-steer", turnId: "active-turn", sequence: 2, revision: 0,
+			activityKind: "system", status: "completed", summary: "Routine worker checkpoint",
+			detail: { event: "steer", text: "Routine worker checkpoint", origin: "automation", senderSessionId: "worker-one", senderProjectId: "project", senderDisplayName: "Worker One" },
+			createdAt: at,
+		};
+		const snapshot: ConversationSnapshot = {
+			...idleSnapshot(), controller: { state: "busy" }, latestSequence: 5,
+			turns: [{ id: "active-turn", state: "running", requestedAt: at }],
+			items: [
+				{ ...humanMessage("Routine automation card"), id: "routine-card", origin: "automation", sequence: 1 },
+				workerSteer,
+				{ ...workerSteer, id: "human-steer", sequence: 3, detail: { event: "steer", text: "My mid-turn words", origin: "human" } },
+				{ ...workerSteer, id: "worker-warning", sequence: 4, detail: { ...workerSteer.detail, text: "Worker warning stays", severity: "warning" } },
+				{ kind: "activity", id: "error", sequence: 5, revision: 0, activityKind: "error", status: "failed", summary: "Structured error stays", createdAt: at },
+			],
+		};
+		const original = structuredClone(snapshot);
+		render(<ChatWorkspace snapshot={snapshot} />);
+		await user.click(screen.getByRole("button", { name: "Hide automation messages" }));
+		expect(screen.queryByText("Routine worker checkpoint")).not.toBeInTheDocument();
+		expect(screen.queryByText("Routine automation card")).not.toBeInTheDocument();
+		expect(screen.getByText("2 automation messages hidden")).toBeInTheDocument();
+		for (const text of ["My mid-turn words", "Worker warning stays", "Structured error stays"]) {
+			expect(screen.getByText(text)).toBeInTheDocument();
+		}
+		expect(snapshot).toEqual(original);
+		await user.click(screen.getByRole("button", { name: "Show" }));
+		expect(screen.getByText("Routine worker checkpoint")).toBeInTheDocument();
+		expect(screen.getByText("Routine automation card")).toBeInTheDocument();
+	});
+
+	it.each<{
+		status?: ConversationActivity["status"];
+		severity?: string;
+		error?: string;
+		success?: boolean;
+		requestId?: string;
+		state?: ConversationSnapshot["turns"][number]["state"];
+		origin?: string | null;
+	}>([
+		{ status: "failed" },
+		{ status: "running" as const },
+		{ severity: "error" },
+		{ severity: "unrecognized" },
+		{ error: "Delivery failed" },
+		{ success: false },
+		{ requestId: "approval-request" },
+		{ state: "failed" as const },
+		{ state: "interrupted" as const },
+		{ state: "cancelled" as const },
+		{ state: "recovered" as const },
+		{ origin: "human" },
+		{ origin: null },
+	])("keeps worker-steer safety evidence visible: %j", async ({ status, severity, error, success, requestId, state, origin }) => {
+		const user = userEvent.setup();
+		const at = "2026-10-07T12:00:00Z";
+		render(<ChatWorkspace snapshot={{
+			...idleSnapshot(), latestSequence: 1,
+			turns: [{ id: "steer-turn", state: state ?? "running", requestedAt: at }],
+			items: [{
+				kind: "activity", id: "protected-steer", turnId: "steer-turn", sequence: 1, revision: 0,
+				activityKind: "system", status: status ?? "completed", summary: "Protected worker steer", requestId,
+				detail: { event: "steer", origin: origin === null ? undefined : origin ?? "automation", text: "Protected worker steer", senderSessionId: "worker", severity, error, success },
+				createdAt: at,
+			}],
+		}} />);
+		await user.click(screen.getByRole("button", { name: "Hide automation messages" }));
+		expect(screen.getByText("Protected worker steer")).toBeInTheDocument();
+		expect(screen.queryByText(/automation message.*hidden/)).not.toBeInTheDocument();
+	});
 
 	it("changes the eye icon and hides queued automation without hiding queued human messages", async () => {
 		const user = userEvent.setup();

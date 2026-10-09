@@ -41,7 +41,7 @@ test("automation visibility is reversible and persistent without suppressing war
 		} else if (sessions.some((id) => pathname === `/api/v1/sessions/${id}/conversation`)) {
 			await route.fulfill({ json: {
 				conversationId: `conversation-${pathname.split("/")[4]}`, sessionId: pathname.split("/")[4], harness: "codex", mode: "chat",
-				controller: "busy", latestSequence: 20, oldestSequence: 1, hasMoreBefore: false, settings: {}, capabilities: ["approvals"],
+				controller: "busy", latestSequence: 23, oldestSequence: 1, hasMoreBefore: false, settings: {}, capabilities: ["approvals"],
 				turns: [
 					{ id: "active-turn", state: "running", requestedAt: at },
 					{ id: "queued-routine-turn", state: "queued", requestedAt: at },
@@ -52,6 +52,9 @@ test("automation visibility is reversible and persistent without suppressing war
 				activities: (showApprovals ? [
 					{ kind: "activity", id: "approval", turnId: "active-turn", sequence: 17, revision: 0, activityKind: "approval", status: "pending", summary: "Explicit approval stays", requestId: "approval-one", detail: { decisions: [{ id: "accept", label: "Approve", kind: "allow_once" }, { id: "cancel", label: "Cancel", kind: "reject_once" }] }, createdAt: at },
 					{ kind: "activity", id: "error", sequence: 18, revision: 0, activityKind: "error", status: "failed", summary: "Structured error stays", createdAt: at },
+					{ kind: "activity", id: "worker-steer", turnId: "active-turn", sequence: 21, revision: 0, activityKind: "system", status: "completed", summary: "Routine worker steer", detail: { event: "steer", origin: "automation", text: "Routine worker steer", senderSessionId: "worker", senderProjectId: projectId, senderDisplayName: "Worker" }, createdAt: at },
+					{ kind: "activity", id: "human-steer", turnId: "active-turn", sequence: 22, revision: 0, activityKind: "system", status: "completed", summary: "Human steer stays", detail: { event: "steer", origin: "human", text: "Human steer stays" }, createdAt: at },
+					{ kind: "activity", id: "worker-warning", turnId: "active-turn", sequence: 23, revision: 0, activityKind: "system", status: "completed", summary: "Worker warning stays", detail: { event: "steer", origin: "automation", text: "Worker warning stays", senderSessionId: "worker", severity: "warning" }, createdAt: at },
 				] : []),
 			} });
 		} else if (pathname.endsWith("/conversation/models")) {
@@ -88,9 +91,12 @@ test("automation visibility is reversible and persistent without suppressing war
 	await page.keyboard.press("Space");
 	await expect(toggle).toHaveAttribute("aria-pressed", "true");
 	await expect(toggle.locator("svg")).toHaveClass(/lucide-eye-off(?:\s|$)/);
-	await expect(page.getByText("13 automation messages hidden", { exact: true })).toBeVisible();
+	await expect(page.getByText("14 automation messages hidden", { exact: true })).toBeVisible();
 	await expect(page.getByText(/^Routine automation report /)).toHaveCount(0);
 	await expect(page.getByText("Queued automation report", { exact: true })).toHaveCount(0);
+	await expect(page.getByText("Routine worker steer", { exact: true })).toHaveCount(0);
+	await expect(page.getByText("Human steer stays", { exact: true })).toBeVisible();
+	await expect(page.getByText("Worker warning stays", { exact: true })).toBeVisible();
 	for (const text of ["Human prompt stays", "Assistant response stays", "Failed delivery turn stays", "Daemon notice stays", "Structured error stays"]) {
 		await expect(page.getByText(text, { exact: true })).toBeVisible();
 	}
@@ -102,7 +108,7 @@ test("automation visibility is reversible and persistent without suppressing war
 
 	await page.goto(`/#/projects/${projectId}/sessions/${sessions[1]}`);
 	await expect(toggle).toHaveAttribute("aria-pressed", "true");
-	await expect(page.getByText("13 automation messages hidden", { exact: true })).toBeVisible();
+	await expect(page.getByText("14 automation messages hidden", { exact: true })).toBeVisible();
 	await page.reload();
 	await expect(toggle).toHaveAttribute("aria-pressed", "true");
 	await expect(page.getByText(/^Routine automation report /)).toHaveCount(0);
@@ -124,6 +130,7 @@ test("automation visibility is reversible and persistent without suppressing war
 	await expect(toggle).toHaveAttribute("aria-pressed", "false");
 	await expect(toggle.locator("svg")).toHaveClass(/lucide-eye(?:\s|$)/);
 	await expect(page.getByText("Queued automation report", { exact: true })).toBeVisible();
+	await expect(page.getByText("Routine worker steer", { exact: true })).toBeVisible();
 	await expect(page.getByRole("log", { name: "Conversation" })).toBeFocused();
 	expect(await page.evaluate(() => localStorage.getItem("ao.chat.hideAutomationMessages"))).toBe("false");
 	showApprovals = false;
