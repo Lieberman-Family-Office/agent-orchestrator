@@ -3304,6 +3304,10 @@ FROM conversation_turns
 JOIN conversation_messages
     ON conversation_messages.turn_id = conversation_turns.id
     AND conversation_messages.role = 'user'
+LEFT JOIN conversation_turns interrupt_target
+    ON conversation_turns.interrupt_target_provider_turn_id <> ''
+    AND interrupt_target.conversation_id = conversation_turns.conversation_id
+    AND interrupt_target.provider_turn_id = conversation_turns.interrupt_target_provider_turn_id
 WHERE conversation_turns.conversation_id = ?
   AND conversation_turns.state = 'queued'
   AND conversation_turns.promotion_started_at IS NULL
@@ -3316,7 +3320,14 @@ WHERE conversation_turns.conversation_id = ?
         AND reports.delivery_batch_id <> ''
         AND reports.delivery_batch_id = conversation_messages.client_message_id
   ))
-ORDER BY (conversation_turns.interrupt_target_provider_turn_id <> '') DESC,
+ORDER BY CASE
+             WHEN interrupt_target.state IN ('completed', 'interrupted') AND interrupt_target.rolled_back_at IS NULL THEN 0
+             WHEN conversation_turns.interrupt_target_provider_turn_id = '' THEN 1
+             ELSE 2
+         END,
+         CASE WHEN interrupt_target.state IN ('completed', 'interrupted') AND interrupt_target.rolled_back_at IS NULL THEN interrupt_target.completed_at END DESC,
+         CASE WHEN interrupt_target.state IN ('completed', 'interrupted') AND interrupt_target.rolled_back_at IS NULL THEN interrupt_target.started_at END DESC,
+         CASE WHEN interrupt_target.state IN ('completed', 'interrupted') AND interrupt_target.rolled_back_at IS NULL THEN interrupt_target.rowid END DESC,
          conversation_turns.requested_at, conversation_turns.rowid
 LIMIT 1
 `
@@ -3336,6 +3347,8 @@ type SelectNextQueuedConversationTurnRow struct {
 // what was never sent.
 // NOTE: keep these comments ASCII. sqlc locates its star-expansion edits by byte
 // offset, so a multi-byte character here silently corrupts later queries.
+// Safely settled target batches lead held batches and ordinary FIFO work.
+// A newer interrupted target wins over an older batch; its members stay FIFO.
 func (q *Queries) SelectNextQueuedConversationTurn(ctx context.Context, conversationID string) (SelectNextQueuedConversationTurnRow, error) {
 	row := q.db.QueryRowContext(ctx, selectNextQueuedConversationTurn, conversationID)
 	var i SelectNextQueuedConversationTurnRow

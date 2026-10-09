@@ -700,6 +700,75 @@ func TestLegacyWorkerReportQueueDoesNotDrainAheadOfHumanMessages(t *testing.T) {
 	}
 }
 
+func TestInterruptBatchPrioritySurvivesDatabaseReopen(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s, err := sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	seedProject(t, s, "batch-reopen")
+	record := sampleRecord("batch-reopen")
+	record.Mode = domain.SessionModeChat
+	session, err := s.CreateSession(ctx, record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversation, err := s.CreateConversation(ctx, "batch-conversation", domain.ConversationScopeSession, "batch-reopen", session.ID, histClock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimChatControllerGeneration(ctx, session.ID, "batch-generation"); err != nil {
+		t.Fatal(err)
+	}
+	// Queued prompts can start after rows inserted later. Settlement order wins.
+	for index, id := range []string{"failed-target", "newer-target", "older-target"} {
+		if err := s.AdoptProviderTurn(ctx, conversation.ID, session.ID, "batch-generation", id, id+"-provider", histClock.Add(time.Duration(index)*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		state := domain.TurnStateInterrupted
+		if index == 0 {
+			state = domain.TurnStateFailed
+		}
+		completedAt := histClock
+		if id == "newer-target" {
+			completedAt = completedAt.Add(time.Minute)
+		}
+		if err := s.SettleTurnByID(ctx, id, state, "", completedAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for index, entry := range []struct{ id, target string }{
+		{"held", "failed-target-provider"}, {"ordinary", ""}, {"older-1", "older-target-provider"}, {"older-2", "older-target-provider"}, {"newer-1", "newer-target-provider"}, {"newer-2", "newer-target-provider"},
+	} {
+		created, err := s.AppendUserMessage(ctx, conversation.ID, session.ID, "batch-generation", domain.ConversationMessage{ID: entry.id + "-message", Text: entry.id, Origin: domain.MessageOriginHuman, ClientMessageID: entry.id, InterruptTargetProviderTurnID: entry.target}, entry.id, histClock.Add(time.Duration(index)*time.Second))
+		if err != nil || !created {
+			t.Fatalf("append %s: created=%v err=%v", entry.id, created, err)
+		}
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = sqlite.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"newer-1", "newer-2", "older-1", "older-2", "ordinary"} {
+		next, err := s.NextQueuedTurn(ctx, conversation.ID)
+		if err != nil || next.TurnID != want {
+			t.Fatalf("queue after reopen: got=%+v err=%v want=%s", next, err, want)
+		}
+		if err := s.SettleTurnByID(ctx, next.TurnID, domain.TurnStateCompleted, "", histClock); err != nil {
+			t.Fatal(err)
+		}
+	}
+	held, err := s.TurnByID(ctx, "held")
+	if err != nil || held.State != domain.TurnStateQueued {
+		t.Fatalf("held failed target changed: %+v err=%v", held, err)
+	}
+}
+
 func TestQueuedTurnPromotionReservationPreservesTheOtherQueueOrder(t *testing.T) {
 	s, session, conversation := conversationFixture(t)
 	ctx := context.Background()

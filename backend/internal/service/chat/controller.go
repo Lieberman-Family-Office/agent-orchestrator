@@ -416,22 +416,24 @@ func (c *Controller) restoreLiveTurnOwnership(turns []domain.ConversationTurn) s
 // notification from racing ahead of the older turns it follows.
 func (c *Controller) start() {
 	go c.project()
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		turns, err := c.store.PendingInterruptTurns(ctx, c.conversation.ID)
-		if err != nil {
-			c.log.Error("pending interrupt-send recovery could not read its intents", "session", c.sessionID, "error", err)
-			return
-		}
-		for _, turn := range turns {
-			if err := c.finishInterruptSend(ctx, turn.ID); err != nil {
-				c.log.Error("pending interrupt-send recovery did not complete; prompt remains durable", "session", c.sessionID, "error", err)
-			}
-		}
-	}()
+	go c.recoverPendingInterrupts()
 	if c.harness != domain.HarnessCodex {
 		go c.readRateLimits()
+	}
+}
+
+func (c *Controller) recoverPendingInterrupts() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	turns, err := c.store.PendingInterruptTurns(ctx, c.conversation.ID)
+	if err != nil {
+		c.log.Error("pending interrupt-send recovery could not read its intents", "session", c.sessionID, "error", err)
+		return
+	}
+	for _, turn := range turns {
+		if err := c.finishInterruptSend(ctx, turn.ID); err != nil {
+			c.log.Error("pending interrupt-send recovery did not complete; prompt remains durable", "session", c.sessionID, "error", err)
+		}
 	}
 }
 
@@ -2006,6 +2008,8 @@ func (c *Controller) ArmHandoff(
 	ctx context.Context,
 	policy domain.SessionInterfaceTransitionPolicy,
 ) error {
+	c.interruptSendMu.Lock()
+	defer c.interruptSendMu.Unlock()
 	if !policy.Valid() {
 		return fmt.Errorf("invalid interface handoff policy %q", policy)
 	}
@@ -2150,7 +2154,7 @@ func (c *Controller) BeginIdleBranchHandoff(ctx context.Context) error {
 }
 
 // AbortHandoff reopens source intake when a drain is cancelled before the source
-// controller is stopped. Any queued work resumes through the ordinary drain.
+// controller is stopped. Pending interrupts recover before queued work drains.
 func (c *Controller) AbortHandoff() {
 	c.mu.Lock()
 	resumeDispatch := c.handoff == controllerHandoffInterfaceDrain ||
@@ -2164,6 +2168,7 @@ func (c *Controller) AbortHandoff() {
 	}
 	if resumeDispatch {
 		go func() {
+			c.recoverPendingInterrupts()
 			_ = c.drain(context.Background()) // drain logs failures; no caller waits on abort.
 		}()
 	}

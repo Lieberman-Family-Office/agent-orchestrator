@@ -5861,6 +5861,62 @@ func (c *blockingInterruptAcceptance) Interrupt(ctx context.Context, target stri
 	}
 }
 
+func TestHandoffFenceWaitsForInFlightInterruptAcceptance(t *testing.T) {
+	conv := &blockingInterruptAcceptance{fakeConversation: newFakeConversation(), started: make(chan string, 4), release: make(chan struct{})}
+	h := newHarnessWithConversation(t, conv)
+	ctx := context.Background()
+	first, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "running", ClientMessageID: "fence-running", Origin: domain.MessageOriginHuman})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: first.ProviderTurnID})
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "priority", ClientMessageID: "fence-priority", Origin: domain.MessageOriginHuman, InterruptAndSend: true})
+		done <- err
+	}()
+	select {
+	case target := <-conv.started:
+		if target != first.ProviderTurnID {
+			t.Fatal("wrong cancellation target")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no cancellation attempt")
+	}
+	armed := make(chan error, 1)
+	go func() { armed <- h.ctrl.ArmHandoff(ctx, domain.SessionInterfaceTransitionDrain) }()
+	select {
+	case err := <-armed:
+		close(conv.release)
+		<-done
+		t.Fatalf("handoff crossed pending cancellation acceptance: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	// Provider projection remains free while cancellation and handoff are serialized.
+	conv.emit(ports.ChatEvent{Kind: ports.ChatEventMessageDelta, ProviderTurnID: first.ProviderTurnID, ProviderItemID: "fence-stream", Delta: "still projecting"})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		for _, message := range s.Messages {
+			if message.Text == "still projecting" {
+				return true
+			}
+		}
+		return false
+	})
+	close(conv.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-armed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("handoff did not resume after cancellation acceptance")
+	}
+	h.ctrl.AbortHandoff()
+}
+
 func TestConcurrentInterruptSendsCaptureOriginalTargetBeforeCancellationFinishes(t *testing.T) {
 	conv := &blockingInterruptAcceptance{fakeConversation: newFakeConversation(), started: make(chan string, 4), release: make(chan struct{})}
 	h := newHarnessWithConversation(t, conv)
@@ -5914,6 +5970,73 @@ func TestConcurrentInterruptSendsCaptureOriginalTargetBeforeCancellationFinishes
 	})
 	if !reflect.DeepEqual(conv.sentTexts(), []string{"running", "first priority"}) {
 		t.Fatalf("wrong concurrent order: %v", conv.sentTexts())
+	}
+}
+
+func TestSuccessiveInterruptBatchesRunNewestTargetFirst(t *testing.T) {
+	for _, failedHead := range []bool{false, true} {
+		t.Run(fmt.Sprintf("older-failed-target=%v", failedHead), func(t *testing.T) {
+			conv := newInterruptRecorder()
+			h := newHarnessWithConversation(t, conv)
+			ctx := context.Background()
+			send := func(text string, interrupt bool) domain.ConversationTurn {
+				t.Helper()
+				turn, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: text, ClientMessageID: text, Origin: domain.MessageOriginHuman, InterruptAndSend: interrupt})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return turn
+			}
+			if failedHead {
+				failed := send("failed target", false)
+				conv.markActive(failed.ProviderTurnID)
+				conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: failed.ProviderTurnID})
+				send("held failed batch", true)
+				conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: failed.ProviderTurnID, TurnState: domain.TurnStateFailed, Err: errors.New("outage")})
+				h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+					turn, _ := turnByID(s, failed.ID)
+					return turn.State == domain.TurnStateFailed
+				})
+			}
+			a := send("A", false)
+			conv.markActive(a.ProviderTurnID)
+			conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: a.ProviderTurnID})
+			p1 := send("P1", true)
+			p2 := send("P2", true)
+			conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: a.ProviderTurnID, TurnState: domain.TurnStateInterrupted})
+			snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				turn, _ := turnByID(s, p1.ID)
+				return turn.State == domain.TurnStateRunning
+			})
+			active, _ := turnByID(snapshot, p1.ID)
+			conv.markActive(active.ProviderTurnID)
+			conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: active.ProviderTurnID})
+			p3 := send("P3", true)
+			conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: active.ProviderTurnID, TurnState: domain.TurnStateInterrupted})
+			snapshot = h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				turn, _ := turnByID(s, p3.ID)
+				return turn.State == domain.TurnStateRunning
+			})
+			waiting, _ := turnByID(snapshot, p2.ID)
+			if waiting.State != domain.TurnStateQueued {
+				t.Fatalf("older batch changed: %+v", waiting)
+			}
+			current, _ := turnByID(snapshot, p3.ID)
+			conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: current.ProviderTurnID, TurnState: domain.TurnStateCompleted})
+			h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				turn, _ := turnByID(s, p2.ID)
+				return turn.State == domain.TurnStateRunning
+			})
+			if failedHead {
+				last, err := h.st.LoadConversationSnapshot(ctx, h.ctrl.ConversationID())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if turnStateByText(t, last)["held failed batch"] != domain.TurnStateQueued {
+					t.Fatal("failed batch was released")
+				}
+			}
+		})
 	}
 }
 
@@ -6005,6 +6128,94 @@ func TestInterruptAndSendNoActiveDoesNotInventSuccessfulCancellation(t *testing.
 	if retained.State != domain.TurnStateQueued || next.State != domain.TurnStateQueued || !reflect.DeepEqual(conv.sentTexts(), []string{"gone"}) {
 		t.Fatalf("delayed failure released work: retained=%+v next=%+v sent=%v", retained, next, conv.sentTexts())
 	}
+}
+
+type gatedInterruptRecoveryStore struct {
+	chatsvc.Store
+	started     chan struct{}
+	release     chan struct{}
+	inspected   chan struct{}
+	once        sync.Once
+	inspectOnce sync.Once
+}
+
+func (s *gatedInterruptRecoveryStore) PendingInterruptTurns(ctx context.Context, conversationID string) ([]domain.ConversationTurn, error) {
+	s.once.Do(func() { close(s.started) })
+	select {
+	case <-s.release:
+		return s.Store.PendingInterruptTurns(ctx, conversationID)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *gatedInterruptRecoveryStore) TurnByProviderID(ctx context.Context, conversationID, providerTurnID string) (domain.ConversationTurn, error) {
+	turn, err := s.Store.TurnByProviderID(ctx, conversationID, providerTurnID)
+	s.inspectOnce.Do(func() { close(s.inspected) })
+	return turn, err
+}
+
+func TestAbortedHandoffRestartsPendingInterruptRecoveryWithoutClientSend(t *testing.T) {
+	st := openStore(t)
+	ctx := context.Background()
+	var ids atomic.Int32
+	newID := func() string { return fmt.Sprintf("handoff-recovery-%d", ids.Add(1)) }
+	firstProvider := &terminatingConversation{fakeConversation: newFakeConversation()}
+	first := chatsvc.New(chatsvc.Options{Store: st, Reader: fullSnapshotReader(st), Sessions: st, Drivers: fakeRegistry{driver: fakeDriver{conv: firstProvider}}, Log: slog.New(slog.DiscardHandler), NewID: newID})
+	cfg := chatsvc.StartConfig{SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex, WorkspacePath: t.TempDir()}
+	ctrl, err := first.Start(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, err := ctrl.Send(ctx, ports.ChatUserMessage{Text: "running", ClientMessageID: "handoff-running", Origin: domain.MessageOriginHuman})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstProvider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: running.ProviderTurnID})
+	created, err := st.AppendUserMessage(ctx, ctrl.ConversationID(), testSession, ctrl.Generation(), domain.ConversationMessage{ID: "handoff-prompt", Text: "priority", Origin: domain.MessageOriginHuman, ClientMessageID: "handoff-priority", InterruptTargetProviderTurnID: running.ProviderTurnID}, "handoff-intent", time.Now())
+	if err != nil || !created {
+		t.Fatalf("intake: created=%v err=%v", created, err)
+	}
+	first.StopAll(ctx)
+	reconnected := &reconnectInterruptRecorder{liveReconnectedConversation: &liveReconnectedConversation{nativeHistoryConversation: &nativeHistoryConversation{fakeConversation: newFakeConversation()}}, attempts: make(chan string, 4)}
+	reconnected.turnSeq = firstProvider.turnSeq
+	gate := &gatedInterruptRecoveryStore{Store: st, started: make(chan struct{}), release: make(chan struct{}), inspected: make(chan struct{})}
+	second := chatsvc.New(chatsvc.Options{Store: gate, Reader: fullSnapshotReader(st), Sessions: st, Drivers: fakeRegistry{driver: fakeDriver{conv: reconnected}}, Log: slog.New(slog.DiscardHandler), NewID: newID})
+	t.Cleanup(func() { second.StopAll(ctx) })
+	cfg.ProviderConversationID = firstProvider.ProviderConversationID()
+	current, err := second.Start(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-gate.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("startup recovery did not start")
+	}
+	if err := current.ArmHandoff(ctx, domain.SessionInterfaceTransitionDrain); err != nil {
+		t.Fatal(err)
+	}
+	close(gate.release)
+	select {
+	case <-gate.inspected:
+	case <-time.After(3 * time.Second):
+		t.Fatal("recovery did not reach handoff fence")
+	}
+	current.AbortHandoff()
+	select {
+	case target := <-reconnected.attempts:
+		if target != running.ProviderTurnID {
+			t.Fatalf("recovery retargeted %q", target)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("aborted handoff lost pending cancellation recovery")
+	}
+	reconnected.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: running.ProviderTurnID, TurnState: domain.TurnStateInterrupted})
+	h := &harness{st: st, ctrl: current}
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		turn, _ := turnByID(s, "handoff-intent")
+		return turn.State == domain.TurnStateRunning
+	})
 }
 
 type reconnectInterruptRecorder struct {
