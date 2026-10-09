@@ -97,16 +97,42 @@ func (t *legacyACPTransport) forward(source io.Reader, destination *io.PipeWrite
 			if json.Unmarshal(line, &notification) == nil && notification.Method == acpsdk.ClientMethodSessionUpdate {
 				var update acpsdk.SessionNotification
 				if json.Unmarshal(notification.Params, &update) == nil && update.Validate() == nil {
-					if update.Meta == nil {
-						update.Meta = make(map[string]any)
+					var params map[string]json.RawMessage
+					var metadata struct {
+						Meta map[string]json.RawMessage `json:"_meta"`
+					}
+					if decodeErr := json.Unmarshal(notification.Params, &params); decodeErr != nil {
+						_ = destination.CloseWithError(decodeErr)
+						return
+					}
+					if params == nil { // SDK accepts null params; no local token can be attached.
+						if _, writeErr := destination.Write(line); writeErr != nil {
+							_ = destination.CloseWithError(writeErr)
+							return
+						}
+						continue
+					}
+					if decodeErr := json.Unmarshal(notification.Params, &metadata); decodeErr != nil {
+						_ = destination.CloseWithError(decodeErr)
+						return
+					}
+					if metadata.Meta == nil {
+						metadata.Meta = make(map[string]json.RawMessage)
 					}
 					// Provider metadata cannot claim a local completion token.
-					delete(update.Meta, localNotificationIDKey)
+					delete(metadata.Meta, localNotificationIDKey)
 					if notification.ID == nil {
 						ackID = fmt.Sprintf("ao-local-%d", t.nextID.Add(1))
-						update.Meta[localNotificationIDKey] = ackID
+						metadata.Meta[localNotificationIDKey], _ = json.Marshal(ackID)
 					}
-					encodedParams, encodeErr := json.Marshal(update)
+					for key := range params {
+						if strings.EqualFold(key, "_meta") {
+							delete(params, key)
+						}
+					}
+					params["_meta"], _ = json.Marshal(metadata.Meta)
+					// Preserve raw update and extension fields; SDK unions need not round-trip.
+					encodedParams, encodeErr := json.Marshal(params)
 					if encodeErr != nil {
 						_ = destination.CloseWithError(encodeErr)
 						return

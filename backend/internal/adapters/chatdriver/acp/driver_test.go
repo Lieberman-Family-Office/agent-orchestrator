@@ -758,6 +758,27 @@ func TestPersistentACPRejectsMalformedEnvelopeWithoutBlockingNextNotification(t 
 	}
 }
 
+func TestPersistentACPPreservesSDKAcceptedEmptyUpdatePayloads(t *testing.T) {
+	for _, update := range []string{"", `,"update":null`, `,"update":{"sessionUpdate":"future_update","opaque":{"value":9007199254740993}}`, `,"_META":{"providerOpaque":{"value":9007199254740993},"ao.localNotificationID":"untrusted"}`} {
+		for _, id := range []string{"", `"id":1,`, `"id":null,`} {
+			t.Run(id+update, func(t *testing.T) {
+				conv, host := replayBoundaryConversation(t)
+				if id != "" {
+					go func() { _, _ = bufio.NewReader(host).ReadBytes('\n') }()
+				}
+				go func() {
+					_, _ = fmt.Fprintf(host, `{"jsonrpc":"2.0",%s"method":"session/update","params":{"sessionId":"review-session"%s}}`+"\n", id, update)
+					_, _ = fmt.Fprintln(host, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"after empty update"}}}}`)
+				}()
+				event := nextEvent(t, conv.Events())
+				if event.Kind != ports.ChatEventMessageDelta || event.Delta != "after empty update" {
+					t.Fatalf("SDK-accepted payload stopped stream: %+v", event)
+				}
+			})
+		}
+	}
+}
+
 func TestPersistentACPRequestUpdatesCannotAcknowledgeNotifications(t *testing.T) {
 	conv, host := replayBoundaryConversation(t)
 	responses := make(chan string, 2)
