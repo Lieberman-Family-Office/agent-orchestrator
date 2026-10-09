@@ -779,6 +779,25 @@ func TestPersistentACPPreservesSDKAcceptedEmptyUpdatePayloads(t *testing.T) {
 	}
 }
 
+func TestPersistentACPPreservesOrderedAndRepeatedParams(t *testing.T) {
+	for _, params := range []string{
+		`"sessionId":"wrong-session","SessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ordered"}}`,
+		`"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ordered"}},"update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"other"}}`,
+		`"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"wrong"}},"Update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ordered"}}`,
+	} {
+		t.Run(params, func(t *testing.T) {
+			conv, host := replayBoundaryConversation(t)
+			go func() {
+				_, _ = fmt.Fprintf(host, `{"jsonrpc":"2.0","method":"session/update","params":{%s}}`+"\n", params)
+			}()
+			event := nextEvent(t, conv.Events())
+			if event.Kind != ports.ChatEventMessageDelta || event.Delta != "ordered" {
+				t.Fatalf("member order or repetition changed: %+v", event)
+			}
+		})
+	}
+}
+
 func TestPersistentACPRequestUpdatesCannotAcknowledgeNotifications(t *testing.T) {
 	conv, host := replayBoundaryConversation(t)
 	responses := make(chan string, 2)

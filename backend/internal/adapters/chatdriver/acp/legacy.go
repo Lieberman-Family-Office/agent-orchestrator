@@ -2,6 +2,7 @@ package acp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -97,47 +98,21 @@ func (t *legacyACPTransport) forward(source io.Reader, destination *io.PipeWrite
 			if json.Unmarshal(line, &notification) == nil && notification.Method == acpsdk.ClientMethodSessionUpdate {
 				var update acpsdk.SessionNotification
 				if json.Unmarshal(notification.Params, &update) == nil && update.Validate() == nil {
-					var params map[string]json.RawMessage
-					var metadata struct {
-						Meta map[string]json.RawMessage `json:"_meta"`
-					}
-					if decodeErr := json.Unmarshal(notification.Params, &params); decodeErr != nil {
-						_ = destination.CloseWithError(decodeErr)
-						return
-					}
-					if params == nil { // SDK accepts null params; no local token can be attached.
-						if _, writeErr := destination.Write(line); writeErr != nil {
-							_ = destination.CloseWithError(writeErr)
-							return
+					params := bytes.TrimSpace(notification.Params)
+					if len(params) > 0 && params[0] == '{' {
+						if notification.ID == nil {
+							ackID = fmt.Sprintf("ao-local-%d", t.nextID.Add(1))
 						}
-						continue
-					}
-					if decodeErr := json.Unmarshal(notification.Params, &metadata); decodeErr != nil {
-						_ = destination.CloseWithError(decodeErr)
-						return
-					}
-					if metadata.Meta == nil {
-						metadata.Meta = make(map[string]json.RawMessage)
-					}
-					// Provider metadata cannot claim a local completion token.
-					delete(metadata.Meta, localNotificationIDKey)
-					if notification.ID == nil {
-						ackID = fmt.Sprintf("ao-local-%d", t.nextID.Add(1))
-						metadata.Meta[localNotificationIDKey], _ = json.Marshal(ackID)
-					}
-					for key := range params {
-						if strings.EqualFold(key, "_meta") {
-							delete(params, key)
+						// A final metadata member overrides only the local key. Go's SDK
+						// merges existing metadata; every original member stays in order.
+						suffix, _ := json.Marshal(map[string]map[string]string{"_meta": {localNotificationIDKey: ackID}})
+						prefix := append([]byte(nil), params[:len(params)-1]...)
+						if len(bytes.TrimSpace(prefix[1:])) > 0 {
+							prefix = append(prefix, ',')
 						}
+						prefix = append(prefix, suffix[1:]...)
+						notification.Params = prefix
 					}
-					params["_meta"], _ = json.Marshal(metadata.Meta)
-					// Preserve raw update and extension fields; SDK unions need not round-trip.
-					encodedParams, encodeErr := json.Marshal(params)
-					if encodeErr != nil {
-						_ = destination.CloseWithError(encodeErr)
-						return
-					}
-					notification.Params = encodedParams
 					encodedFrame, encodeErr := json.Marshal(notification)
 					if encodeErr != nil {
 						_ = destination.CloseWithError(encodeErr)
