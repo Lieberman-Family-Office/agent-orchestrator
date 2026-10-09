@@ -1400,8 +1400,16 @@ func (c *Controller) interruptAndSend(ctx context.Context, msg ports.ChatUserMes
 		}
 	}
 	c.sendMu.Unlock()
-	if err != nil || turn.State != domain.TurnStateQueued || turn.InterruptTargetProviderTurnID == "" || turn.InterruptDelivered {
+	if err != nil || turn.State != domain.TurnStateQueued || turn.InterruptTargetProviderTurnID == "" {
 		return turn, err
+	}
+	if turn.InterruptDelivered {
+		c.mu.Lock()
+		targetActive := c.pendingTurnID == turn.InterruptTargetProviderTurnID
+		c.mu.Unlock()
+		if targetActive {
+			return turn, nil
+		}
 	}
 	if !c.awaitTurnAcknowledged(ctx, turn.InterruptTargetProviderTurnID) {
 		c.sendMu.Lock()

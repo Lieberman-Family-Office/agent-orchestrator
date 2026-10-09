@@ -5925,55 +5925,71 @@ func TestInterruptAndSendReconcilesAnExactTargetAlreadyGone(t *testing.T) {
 }
 
 func TestInterruptAndSendRecoversAcceptedPromptAcrossControllerRestart(t *testing.T) {
-	st := openStore(t)
-	ctx := context.Background()
-	var ids atomic.Int32
-	newID := func() string { return fmt.Sprintf("interrupt-restart-%d", ids.Add(1)) }
-	firstProvider := &terminatingConversation{fakeConversation: newFakeConversation()}
-	first := chatsvc.New(chatsvc.Options{
-		Store: st, Reader: fullSnapshotReader(st), Sessions: st,
-		Drivers: fakeRegistry{driver: fakeDriver{conv: firstProvider}},
-		Log:     slog.New(slog.DiscardHandler), NewID: newID,
-	})
-	cfg := chatsvc.StartConfig{SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex, WorkspacePath: t.TempDir()}
-	ctrl, err := first.Start(ctx, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	running, err := ctrl.Send(ctx, ports.ChatUserMessage{Text: "running", ClientMessageID: "restart-running", Origin: domain.MessageOriginHuman})
-	if err != nil {
-		t.Fatal(err)
-	}
-	firstProvider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: running.ProviderTurnID})
-	if _, err := ctrl.Send(ctx, ports.ChatUserMessage{Text: "older", ClientMessageID: "restart-older", Origin: domain.MessageOriginHuman}); err != nil {
-		t.Fatal(err)
-	}
-	pending, err := ctrl.Send(ctx, ports.ChatUserMessage{Text: "priority", ClientMessageID: "restart-priority", Origin: domain.MessageOriginHuman, InterruptAndSend: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	first.StopAll(ctx)
-	secondProvider := &liveReconnectedConversation{nativeHistoryConversation: &nativeHistoryConversation{fakeConversation: newFakeConversation()}}
-	second := chatsvc.New(chatsvc.Options{
-		Store: st, Reader: fullSnapshotReader(st), Sessions: st,
-		Drivers: fakeRegistry{driver: fakeDriver{conv: secondProvider}},
-		Log:     slog.New(slog.DiscardHandler), NewID: newID,
-	})
-	t.Cleanup(func() { second.StopAll(ctx) })
-	cfg.ProviderConversationID = firstProvider.ProviderConversationID()
-	secondController, err := second.Start(ctx, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondProvider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: running.ProviderTurnID, TurnState: domain.TurnStateInterrupted})
-	h := &harness{st: st, ctrl: secondController}
-	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
-		turn, _ := turnByID(s, pending.ID)
-		return turn.State == domain.TurnStateRunning
-	})
-	states := turnStateByText(t, snapshot)
-	if states["older"] != domain.TurnStateQueued || !reflect.DeepEqual(secondProvider.sentTexts(), []string{"priority"}) {
-		t.Fatalf("restart lost priority or older queue: states=%v sent=%v", states, secondProvider.sentTexts())
+	for _, targetSettled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("target-settled=%v", targetSettled), func(t *testing.T) {
+			st := openStore(t)
+			ctx := context.Background()
+			var ids atomic.Int32
+			newID := func() string { return fmt.Sprintf("interrupt-restart-%d", ids.Add(1)) }
+			firstProvider := &terminatingConversation{fakeConversation: newFakeConversation()}
+			first := chatsvc.New(chatsvc.Options{
+				Store: st, Reader: fullSnapshotReader(st), Sessions: st,
+				Drivers: fakeRegistry{driver: fakeDriver{conv: firstProvider}},
+				Log:     slog.New(slog.DiscardHandler), NewID: newID,
+			})
+			cfg := chatsvc.StartConfig{SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex, WorkspacePath: t.TempDir()}
+			ctrl, err := first.Start(ctx, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			running, err := ctrl.Send(ctx, ports.ChatUserMessage{Text: "running", ClientMessageID: "restart-running", Origin: domain.MessageOriginHuman})
+			if err != nil {
+				t.Fatal(err)
+			}
+			firstProvider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: running.ProviderTurnID})
+			if _, err := ctrl.Send(ctx, ports.ChatUserMessage{Text: "older", ClientMessageID: "restart-older", Origin: domain.MessageOriginHuman}); err != nil {
+				t.Fatal(err)
+			}
+			pending, err := ctrl.Send(ctx, ports.ChatUserMessage{Text: "priority", ClientMessageID: "restart-priority", Origin: domain.MessageOriginHuman, InterruptAndSend: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			first.StopAll(ctx)
+			if targetSettled {
+				if err := st.SettleTurnByID(ctx, running.ID, domain.TurnStateInterrupted, "", time.Now()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			secondProvider := &liveReconnectedConversation{nativeHistoryConversation: &nativeHistoryConversation{fakeConversation: newFakeConversation()}}
+			secondProvider.turnSeq = firstProvider.turnSeq
+			second := chatsvc.New(chatsvc.Options{
+				Store: st, Reader: fullSnapshotReader(st), Sessions: st,
+				Drivers: fakeRegistry{driver: fakeDriver{conv: secondProvider}},
+				Log:     slog.New(slog.DiscardHandler), NewID: newID,
+			})
+			t.Cleanup(func() { second.StopAll(ctx) })
+			cfg.ProviderConversationID = firstProvider.ProviderConversationID()
+			secondController, err := second.Start(ctx, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if targetSettled {
+				if _, err := secondController.Send(ctx, ports.ChatUserMessage{Text: "priority", ClientMessageID: "restart-priority", Origin: domain.MessageOriginHuman, InterruptAndSend: true}); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				secondProvider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: running.ProviderTurnID, TurnState: domain.TurnStateInterrupted})
+			}
+			h := &harness{st: st, ctrl: secondController}
+			snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				turn, _ := turnByID(s, pending.ID)
+				return turn.State == domain.TurnStateRunning
+			})
+			states := turnStateByText(t, snapshot)
+			if states["older"] != domain.TurnStateQueued || !reflect.DeepEqual(secondProvider.sentTexts(), []string{"priority"}) {
+				t.Fatalf("restart lost priority or older queue: states=%v sent=%v", states, secondProvider.sentTexts())
+			}
+		})
 	}
 }
 
