@@ -64,6 +64,7 @@ type WireResourceContent = components["schemas"]["ConversationResourceContentReq
 
 export interface ConversationSendInput {
 	text: string;
+	interruptAndSend?: boolean;
 	attachments?: WireImageContent[];
 	resources?: WireResourceContent[];
 	/** Caller-owned durable idempotency key used for crash-safe retries. */

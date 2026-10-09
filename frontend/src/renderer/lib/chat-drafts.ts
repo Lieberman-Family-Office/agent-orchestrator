@@ -87,7 +87,7 @@ export type ChatDraftDeliveryState = "dispatching" | "accepted";
 export interface ChatComposerDelivery {
 	/** Original request mode, kept across capability changes during recovery. */
 	nativeImages?: boolean;
-	kind: "send" | "steer";
+	kind: "send" | "steer" | "interrupt";
 	state: ChatDraftDeliveryState;
 	/** Exact composer revision this delivery was created from. */
 	revision: number;
@@ -713,7 +713,7 @@ function isComposerDelivery(value: unknown): value is ChatComposerDelivery {
 	if (!value || typeof value !== "object") return false;
 	const delivery = value as Partial<ChatComposerDelivery>;
 	return (
-		(delivery.kind === "send" || delivery.kind === "steer") &&
+		(delivery.kind === "send" || delivery.kind === "steer" || delivery.kind === "interrupt") &&
 		isDeliveryState(delivery.state) &&
 		typeof delivery.revision === "number" &&
 		Number.isInteger(delivery.revision) &&

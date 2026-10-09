@@ -208,7 +208,7 @@ func (c *ConversationsController) reviewSend(w http.ResponseWriter, r *http.Requ
 	if text == "" {
 		text = fmt.Sprintf("Attached %d item(s) for context", len(content))
 	}
-	turn, err := svc.SendForOwner(r.Context(), domain.ReviewConversationOwner(chi.URLParam(r, "reviewId")), ports.ChatUserMessage{Text: text, Content: content, ClientMessageID: req.ClientMessageID, Origin: domain.MessageOriginHuman})
+	turn, err := svc.SendForOwner(r.Context(), domain.ReviewConversationOwner(chi.URLParam(r, "reviewId")), ports.ChatUserMessage{Text: text, Content: content, ClientMessageID: req.ClientMessageID, Origin: domain.MessageOriginHuman, InterruptAndSend: req.InterruptAndSend})
 	if err != nil {
 		writeConversationError(w, r, err)
 		return
@@ -769,10 +769,11 @@ func (c *ConversationsController) send(w http.ResponseWriter, r *http.Request) {
 		text = fmt.Sprintf("Attached %d item(s) for context", len(content))
 	}
 	turn, err := c.Svc.Send(r.Context(), domain.SessionID(chi.URLParam(r, "sessionId")), ports.ChatUserMessage{
-		Text:            text,
-		Content:         content,
-		ClientMessageID: req.ClientMessageID,
-		Origin:          domain.MessageOriginHuman,
+		Text:             text,
+		InterruptAndSend: req.InterruptAndSend,
+		Content:          content,
+		ClientMessageID:  req.ClientMessageID,
+		Origin:           domain.MessageOriginHuman,
 	})
 	if err != nil {
 		writeConversationError(w, r, err)

@@ -4753,6 +4753,7 @@ export interface components {
         SendConversationMessageRequest: {
             attachments?: components["schemas"]["ConversationImageContentRequest"][];
             clientMessageId?: string;
+            interruptAndSend?: boolean;
             resources?: components["schemas"]["ConversationResourceContentRequest"][];
             text: string;
         };

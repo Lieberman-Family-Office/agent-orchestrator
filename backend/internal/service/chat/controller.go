@@ -73,6 +73,8 @@ type Store interface {
 	AppendRetryUserMessage(ctx context.Context, conversationID string, session domain.SessionID, generation string, msg domain.ConversationMessage, turnID, retryOfTurnID string, now time.Time) (bool, error)
 	AppendReviewRetryUserMessage(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation string, msg domain.ConversationMessage, turnID, retryOfTurnID string, now time.Time) (bool, error)
 	MarkTurnDispatching(ctx context.Context, turnID string) error
+	MarkTurnInterruptDelivered(ctx context.Context, turnID string) error
+	TurnByProviderID(ctx context.Context, conversationID, providerTurnID string) (domain.ConversationTurn, error)
 	BindTurnToProvider(ctx context.Context, turnID, providerTurnID string, now time.Time) error
 	SettleTurn(ctx context.Context, conversationID, providerTurnID string, state domain.TurnState, errMessage string, now time.Time) error
 	SettleTurnByID(ctx context.Context, turnID string, state domain.TurnState, errMessage string, now time.Time) error
@@ -214,6 +216,8 @@ type Controller struct {
 	// the complete option catalog and updates durable next-turn settings, so
 	// concurrent writes could otherwise persist an older catalog last.
 	configMu sync.Mutex
+	// interruptSendMu joins duplicate cancellation attempts without blocking provider projection.
+	interruptSendMu sync.Mutex
 
 	mu sync.Mutex
 	// suppressStoppedActivity marks a deliberate branch-controller retirement.
@@ -1366,9 +1370,71 @@ func (c *Controller) Capabilities() ports.ChatCapabilities {
 // concurrent turn is not a thing it can run, and a queued row is a promise AO can
 // keep across a restart, which a message dropped into a busy provider is not.
 func (c *Controller) Send(ctx context.Context, msg ports.ChatUserMessage) (domain.ConversationTurn, error) {
+	if msg.InterruptAndSend {
+		return c.interruptAndSend(ctx, msg)
+	}
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 	return c.sendLocked(ctx, msg, true)
+}
+
+func (c *Controller) interruptAndSend(ctx context.Context, msg ports.ChatUserMessage) (domain.ConversationTurn, error) {
+	c.interruptSendMu.Lock()
+	defer c.interruptSendMu.Unlock()
+	if !c.Capabilities().Has(ports.ChatCapabilityInterrupt) {
+		return domain.ConversationTurn{}, ports.ErrChatUnsupported
+	}
+	c.sendMu.Lock()
+	turn, err := c.sendLocked(ctx, msg, true)
+	if err == nil && turn.ID == "" && msg.ClientMessageID != "" {
+		stored, found, readErr := c.store.ConversationMessageByClientID(ctx, c.conversation.ID, msg.ClientMessageID)
+		if readErr != nil {
+			err = readErr
+		} else if found {
+			turn, err = c.store.TurnByID(ctx, stored.TurnID)
+		}
+	}
+	c.sendMu.Unlock()
+	if err != nil || turn.State != domain.TurnStateQueued || turn.InterruptTargetProviderTurnID == "" || turn.InterruptDelivered {
+		return turn, err
+	}
+	if !c.awaitTurnAcknowledged(ctx, turn.InterruptTargetProviderTurnID) {
+		c.sendMu.Lock()
+		defer c.sendMu.Unlock()
+		target, err := c.store.TurnByProviderID(ctx, c.conversation.ID, turn.InterruptTargetProviderTurnID)
+		if err != nil {
+			return turn, err
+		}
+		return turn, c.drainLocked(ctx, target.State == domain.TurnStateCompleted || target.State == domain.TurnStateInterrupted)
+	}
+	if err := c.conv.Interrupt(ctx, turn.InterruptTargetProviderTurnID); err != nil {
+		if !errors.Is(err, ports.ErrChatNoActiveTurn) {
+			return turn, fmt.Errorf("interrupt accepted prompt target: %w", err)
+		}
+		c.sendMu.Lock()
+		defer c.sendMu.Unlock()
+		c.mu.Lock()
+		stillTarget := c.pendingTurnID == turn.InterruptTargetProviderTurnID
+		c.mu.Unlock()
+		if stillTarget {
+			if err := ctx.Err(); err != nil {
+				return turn, err
+			}
+			if err := c.store.SettleTurn(ctx, c.conversation.ID, turn.InterruptTargetProviderTurnID, domain.TurnStateInterrupted, "", c.now()); err != nil {
+				return turn, err
+			}
+			c.mu.Lock()
+			c.pendingTurnID, c.ackedTurnID = "", ""
+			c.state = ports.ChatControllerReady
+			c.mu.Unlock()
+			return turn, c.drainLocked(ctx, true)
+		}
+		return turn, nil
+	}
+	if err := c.store.MarkTurnInterruptDelivered(context.WithoutCancel(ctx), turn.ID); err != nil {
+		return turn, fmt.Errorf("record interrupt acceptance: %w", err)
+	}
+	return turn, nil
 }
 
 func (c *Controller) sendLocked(
@@ -1413,6 +1479,11 @@ func (c *Controller) sendLocked(
 		AuthoredByUser:      msg.AuthoredByUser,
 		InteractionAt:       msg.InteractionAt,
 	}
+	if msg.InterruptAndSend {
+		c.mu.Lock()
+		record.InterruptTargetProviderTurnID = c.pendingTurnID
+		c.mu.Unlock()
+	}
 
 	var (
 		created bool
@@ -1438,12 +1509,13 @@ func (c *Controller) sendLocked(
 		// AppendUserMessage wrote it as queued, which is exactly where it belongs
 		// until the running turn ends. drain picks it up from there.
 		return domain.ConversationTurn{
-			ID:                 turnID,
-			ConversationID:     c.conversation.ID,
-			HandledBySessionID: c.sessionID,
-			HandledByReviewID:  c.reviewID,
-			State:              domain.TurnStateQueued,
-			RequestedAt:        now,
+			ID:                            turnID,
+			ConversationID:                c.conversation.ID,
+			HandledBySessionID:            c.sessionID,
+			HandledByReviewID:             c.reviewID,
+			InterruptTargetProviderTurnID: record.InterruptTargetProviderTurnID,
+			State:                         domain.TurnStateQueued,
+			RequestedAt:                   now,
 		}, nil
 	}
 
@@ -1822,7 +1894,6 @@ func (c *Controller) drainLocked(ctx context.Context, allowDispatch bool) error 
 	if !allowDispatch {
 		return nil
 	}
-
 	queued, err := c.store.NextQueuedTurn(ctx, c.conversation.ID)
 	if errors.Is(err, domain.ErrNoQueuedTurn) {
 		return nil
@@ -3170,9 +3241,15 @@ func (c *Controller) afterProject(ctx context.Context, event ports.ChatEvent, pr
 			activityEvent = "chat.account.reauth"
 		}
 		c.reportActivity(ctx, activityState, activityEvent, now)
-		// Only a completed turn releases queued work; a failed or recovered one holds
-		// the queue so it cannot cascade through the same outage (issue #4861).
-		_ = c.drainLocked(ctx, settledTurnState(event) == domain.TurnStateCompleted) // drain logs failures.
+		// Failed/recovered turns hold the queue. An explicit interrupt-send target
+		// may release its priority prompt when that exact turn was interrupted.
+		allowDispatch := settledTurnState(event) == domain.TurnStateCompleted
+		if settledTurnState(event) == domain.TurnStateInterrupted {
+			if next, err := c.store.NextQueuedTurn(ctx, c.conversation.ID); err == nil {
+				allowDispatch = next.InterruptTargetProviderTurnID == event.ProviderTurnID && event.ProviderTurnID != ""
+			}
+		}
+		_ = c.drainLocked(ctx, allowDispatch) // drain logs failures.
 	case ports.ChatEventApprovalRequested:
 		c.reportActivity(ctx, domain.ActivityWaitingInput, "chat.approval.requested", now)
 	case ports.ChatEventApprovalResolved:

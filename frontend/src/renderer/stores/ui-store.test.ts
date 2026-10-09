@@ -2,6 +2,25 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { rememberedFileDisplayMode, sidebarIsVisible, sidebarOccupiesLayout, useUiStore } from "./ui-store";
 import { sessionUiKey } from "../lib/hosts";
 
+describe("active-turn send mode", () => {
+	beforeEach(() => {
+		window.localStorage.clear();
+		useUiStore.setState({ chatSendMode: "steer" });
+	});
+
+	it("defaults to steering and persists the selected mode across reload", async () => {
+		expect(useUiStore.getState().chatSendMode).toBe("steer");
+		useUiStore.getState().setChatSendMode("interrupt");
+		expect(localStorage.getItem("ao.chat.sendMode")).toBe("interrupt");
+		vi.resetModules();
+		const reloaded = (await import("./ui-store")).useUiStore;
+		expect(reloaded.getState().chatSendMode).toBe("interrupt");
+		localStorage.setItem("ao.chat.sendMode", "invalid");
+		vi.resetModules();
+		expect((await import("./ui-store")).useUiStore.getState().chatSendMode).toBe("steer");
+	});
+});
+
 describe("sidebar visibility", () => {
 	beforeEach(() => {
 		window.localStorage.clear();

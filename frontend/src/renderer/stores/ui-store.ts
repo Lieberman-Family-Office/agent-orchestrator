@@ -128,6 +128,7 @@ export type UiState = {
 	/** Copy the terminal selection to the clipboard on mouse-up, like native terminals. Default on. */
 	terminalCopyOnSelect: boolean;
 	hideAutomationMessages: boolean;
+	chatSendMode: "steer" | "interrupt";
 	restartingProjectIds: ReadonlySet<string>;
 	// Projects whose initial orchestrator spawn (after import/clone) is still
 	// running in the background. The board renders a progress banner and gates
@@ -178,6 +179,7 @@ export type UiState = {
 	setDiagnostics: (enabled: boolean) => void;
 	setTerminalCopyOnSelect: (enabled: boolean) => void;
 	setHideAutomationMessages: (hidden: boolean) => void;
+	setChatSendMode: (mode: "steer" | "interrupt") => void;
 	/** True while the restart-to-update confirmation is open. */
 	updateInstallPromptOpen: boolean;
 	openUpdateInstallPrompt: () => void;
@@ -242,6 +244,14 @@ function initialHideAutomationMessages(): boolean {
 		return getLocalStorage()?.getItem(hideAutomationMessagesStorageKey) === "true";
 	} catch {
 		return false;
+	}
+}
+const chatSendModeStorageKey = "ao.chat.sendMode";
+function initialChatSendMode(): "steer" | "interrupt" {
+	try {
+		return getLocalStorage()?.getItem(chatSendModeStorageKey) === "interrupt" ? "interrupt" : "steer";
+	} catch {
+		return "steer";
 	}
 }
 function getLocalStorage() {
@@ -325,6 +335,21 @@ export const useUiStore = create<UiState>((set, get) => ({
 	remoteHosts: initialRemoteHosts(),
 	diagnostics: initialDiagnostics(),
 	terminalCopyOnSelect: initialTerminalCopyOnSelect(),
+	chatSendMode: initialChatSendMode(),
+	setChatSendMode: (chatSendMode) => {
+		set({ chatSendMode });
+		try {
+			const storage = getLocalStorage();
+			if (!storage) throw new Error("Storage unavailable");
+			storage.setItem(chatSendModeStorageKey, chatSendMode);
+		} catch {
+			get().showGlobalToast(
+				appI18n.t("chat.automation.storageTitle"),
+				appI18n.t("chat.automation.storageBody"),
+				{ tone: "error", dedupeKey: "chat-send-mode-storage" },
+			);
+		}
+	},
 	hideAutomationMessages: initialHideAutomationMessages(),
 	setHideAutomationMessages: (hideAutomationMessages) => {
 		set({ hideAutomationMessages });

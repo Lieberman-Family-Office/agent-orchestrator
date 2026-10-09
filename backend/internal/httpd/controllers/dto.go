@@ -2397,6 +2397,8 @@ type UnregisterPushDeviceResponse struct {
 // SendConversationMessageRequest is a message for a Chat session's agent.
 type SendConversationMessageRequest struct {
 	Text string `json:"text"`
+	// InterruptAndSend stops the current turn and submits this prompt next while retaining older queued prompts.
+	InterruptAndSend bool `json:"interruptAndSend,omitempty"`
 	// ClientMessageID makes delivery idempotent. A retry carrying the same value
 	// must not produce a second provider turn.
 	ClientMessageID string                               `json:"clientMessageId,omitempty"`

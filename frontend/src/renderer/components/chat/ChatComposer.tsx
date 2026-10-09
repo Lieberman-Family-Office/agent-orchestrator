@@ -5,10 +5,9 @@ import { useChatDraftTranslation } from "../../lib/chat-draft-messages";
  * Submitting is a typed send, not a keystroke: there is no notion of "press
  * Enter at the agent" here, and an empty message is never a way to nudge it.
  *
- * A message typed mid-turn is held by the daemon and sent when the turn ends,
- * because the agent is one conversation and cannot run a second turn alongside
- * the first. The placeholder says so rather than leaving the user to guess where
- * their text went, and the queued message stays visible only in the dock.
+ * Enter uses the selected active-turn mode: steer without stopping, or interrupt
+ * and send next while retaining older queued messages. Unsupported surfaces keep
+ * ordinary queueing. The placeholder and send label state the selected behavior.
  *
  * The model, reasoning effort and approval controls belong here rather than in
  * settings because the provider takes all three per turn: choosing one changes the
@@ -99,6 +98,7 @@ import {
 } from "../../lib/chat-drafts";
 import { attachmentURL, IMAGE_ATTACHMENT_PATH, isInlineImagePath, proseBesideImages } from "./messageAttachments";
 import { setChatDraftBoundary } from "../../lib/chat-draft-boundary";
+import { useUiStore } from "../../stores/ui-store";
 
 // These responses precede AppendUserMessage. Provider/transport errors can
 // follow durable acceptance and must keep the original delivery ID for recovery.
@@ -165,6 +165,7 @@ export const ChatComposer = memo(function ChatComposer({
 	onStageAttachments,
 	nativeImages,
 	onSteer,
+	onInterruptSend,
 	showSteerButton,
 	onInterrupt,
 	canSteer,
@@ -239,6 +240,8 @@ export const ChatComposer = memo(function ChatComposer({
 	 * cannot steer and the choice is never offered.
 	 */
 	onSteer?: (text: string, attachments?: FileAttachmentPayload[], clientMessageId?: string, recoverOnly?: boolean) => Promise<ChatSteerOutcome | void>;
+	/** Stop the current turn, submit this prompt next, and preserve older queued messages. */
+	onInterruptSend?: (text: string, attachments?: FileAttachmentPayload[], clientMessageId?: string) => Promise<unknown>;
 	/** Expose steering as a separate action while a Cloud turn is running. */
 	showSteerButton?: boolean;
 	/** Stop the turn already running when there is no draft to send. */
@@ -343,20 +346,14 @@ export const ChatComposer = memo(function ChatComposer({
 			? readChatSessionDraft(draftScope).composer.delivery
 			: undefined,
 	);
+	const sendMode = useUiStore((state) => state.chatSendMode);
+	const setSendMode = useUiStore((state) => state.setChatSendMode);
 	const [steerNextRequest, setSteerNextRequest] = useState(0);
 	// Cmd/Ctrl held anywhere in the window turns a send-button click into a steer.
 	const [modifierHeld, setModifierHeld] = useState(false);
 	// The DOM event is the source of truth while React catches up with the draft
 	// transition. This keeps Enter-after-fast-typing from observing stale state.
 	const textRef = useRef("");
-	/**
-	 * What Enter does while the agent is working.
-	 *
-	 * Queueing is the safe default and matches `ao send`: the daemon records the
-	 * message durably and dispatches it when the current turn finishes. Steering is
-	 * timing-sensitive and changes the running turn, so it stays an explicit choice.
-	 */
-
 	const editor = useRef<ComposerEditorHandle>(null);
 	const filePicker = useRef<HTMLInputElement>(null);
 	const submitInFlight = useRef<Promise<void> | null>(null);
@@ -543,18 +540,18 @@ export const ChatComposer = memo(function ChatComposer({
 	// A plain send while a turn runs is queued, so the button says so instead of
 	// looking identical to an immediate send.
 	const queuesDraft = Boolean(willQueue && !savingQueuedEdit && !queuedEditRecovery);
-	// Cmd/Ctrl+Enter or Cmd/Ctrl+click steers the current draft into the running
-	// turn; the send button only shows it while the modifier is held.
+	// The selected default steers directly; Cmd/Ctrl remains an explicit override.
 	const canSteerDraft = Boolean(canSteer && onSteer) && !savingQueuedEdit;
-	const steersDraft = modifierHeld && canSteerDraft;
+	const steersDraft = canSteerDraft && (modifierHeld || sendMode === "steer");
 	const showsSteer = steersDraft && !durableDelivery && !queuedEditRecovery;
+	const interruptsDraft = Boolean(willQueue && onInterruptSend && sendMode === "interrupt" && !modifierHeld && !savingQueuedEdit && !durableDelivery && !queuedEditRecovery);
 	const sendActionLabel = translateDraft(durableDelivery
 		? durableDelivery.state === "accepted"
 			? "chat.draft.clearMessage"
 			: "chat.draft.retryMessage"
 		: queuedEditRecovery
 			? "chat.draft.retryEdit"
-			: showsSteer ? "Steer message" : queuesDraft ? "Queue message" : "Send message");
+			: showsSteer ? "Steer message" : interruptsDraft ? "Interrupt and send" : queuesDraft ? "Queue message" : "Send message");
 	const canStopTurn = Boolean(
 		willQueue && onInterrupt && !controlsDisabled && !hasDraft && !savingQueuedEdit,
 	);
@@ -570,7 +567,9 @@ export const ChatComposer = memo(function ChatComposer({
 			? "⏎ save edit"
 			: showsSteer
 				? "Steer into running turn"
-				: willQueue
+				: interruptsDraft
+					? "Interrupt and send; keep queued messages"
+					: willQueue
 					? "⏎ queue"
 					: "Enter to send";
 	const persistedText = persistedDraft?.composer.text;
@@ -1098,6 +1097,7 @@ export const ChatComposer = memo(function ChatComposer({
 			return;
 		}
 		const shouldSteer = Boolean(forceSteer && !savingQueuedEdit);
+		const shouldInterrupt = Boolean(!shouldSteer && willQueue && onInterruptSend && sendMode === "interrupt" && !savingQueuedEdit);
 		const message = withAttachmentReferences(body, attachedPaths);
 		// Ordinary delivery reserves its exact draft before these staged reads await.
 		// Queue editors use their existing owner/revision CAS before mutation.
@@ -1156,7 +1156,7 @@ export const ChatComposer = memo(function ChatComposer({
 			// A plain-text send has a local timeline echo — clear the editor immediately
 			// so the user sees one acknowledgement rather than their draft stranded until
 			// the daemon round-trip completes. Attachments retain the retry path.
-			const clearForLocalEcho = !shouldSteer && !savingQueuedEdit && nativePayloads.length === 0;
+			const clearForLocalEcho = !shouldSteer && !shouldInterrupt && !savingQueuedEdit && nativePayloads.length === 0;
 			try {
 				if (clearForLocalEcho) clearEditorView();
 				if (shouldSteer && onSteer) {
@@ -1167,6 +1167,9 @@ export const ChatComposer = memo(function ChatComposer({
 						setSteerOutcomeNotice(outcome.reason);
 						return;
 					}
+				} else if (shouldInterrupt && onInterruptSend) {
+					if (nativePayloads.length > 0) await onInterruptSend(message, nativePayloads);
+					else await onInterruptSend(message);
 				} else if (savingQueuedEdit) {
 					await onSend(message, nativePayloads.length ? nativePayloads : undefined, undefined,
 						visibleRetainedAttachments.flatMap((item) => item.contentIndex === undefined ? [] : [item.contentIndex]));
@@ -1203,7 +1206,7 @@ export const ChatComposer = memo(function ChatComposer({
 			? recoveringDelivery.requestText
 			: message;
 		const prepared = prepareChatComposerDelivery(draftScope, {
-			kind: recoveringDelivery?.kind ?? (shouldSteer ? "steer" : "send"),
+			kind: recoveringDelivery?.kind ?? (shouldSteer ? "steer" : shouldInterrupt ? "interrupt" : "send"),
 			nativeImages: sendNativeImages,
 			composerText: currentText,
 			attachments: settledAttachments.flatMap((attachment) =>
@@ -1270,6 +1273,11 @@ export const ChatComposer = memo(function ChatComposer({
 					}
 					return;
 				}
+			} else if (delivery.kind === "interrupt") {
+				if (!onInterruptSend) throw new Error("Interrupt-and-send is unavailable");
+				await onInterruptSend(delivery.requestText,
+					sendNativeImages && nativePayloads.length > 0 ? nativePayloads : undefined,
+					delivery.clientMessageId);
 			} else {
 				await onSend(
 					delivery.requestText,
@@ -1339,11 +1347,11 @@ export const ChatComposer = memo(function ChatComposer({
 				setSteerNextRequest((request) => request + 1);
 				return true;
 			}
-			const wantsSteer = (event.metaKey || event.ctrlKey) && canSteerDraft;
+			const wantsSteer = canSteerDraft && (event.metaKey || event.ctrlKey || sendMode === "steer");
 			void submit(undefined, wantsSteer);
 			return true;
 		},
-		[canSteerDraft, canSteerNext, fileAttachments, onCompact, pick, suggestionsFor],
+		[canSteerDraft, canSteerNext, fileAttachments, onCompact, pick, sendMode, suggestionsFor],
 	);
 
 	function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
@@ -1505,7 +1513,7 @@ export const ChatComposer = memo(function ChatComposer({
 					// The focusable context tooltip must keep its focus on click.
 					if (
 						e.target === e.currentTarget ||
-						!(e.target as HTMLElement).closest("button, a, [role='option'], [data-context-meter], ul")
+						!(e.target as HTMLElement).closest("button, select, a, [role='option'], [data-context-meter], ul")
 					) {
 						editor.current?.focus();
 					}
@@ -1589,7 +1597,7 @@ export const ChatComposer = memo(function ChatComposer({
 						disabledPlaceholder ?? (disabled
 							? "The controller is not connected"
 							: willQueue
-								? (queuePlaceholder ?? "Next message you send will be queued")
+								? (queuePlaceholder ?? (steersDraft ? "Next message will steer the running turn" : interruptsDraft ? "Next message will interrupt the turn; queued messages stay" : "Next message you send will be queued"))
 								: emptyPlaceholder ?? "Message the agent")
 					}
 					menuOpen={menuOpen}
@@ -1676,7 +1684,19 @@ export const ChatComposer = memo(function ChatComposer({
 						{settings}
 					</div>
 
-					<div role="group" aria-label="Send message controls" className="flex h-7 shrink-0 items-center">
+					<div role="group" aria-label="Send message controls" className="flex h-7 shrink-0 items-center gap-1.5">
+						{(onSteer || onInterruptSend) && !savingQueuedEdit ? (
+							<select
+								aria-label="Send while agent is working"
+								value={sendMode}
+								onChange={(event) => setSendMode(event.target.value === "interrupt" ? "interrupt" : "steer")}
+								disabled={controlsDisabled || draftMutationPending}
+								className="h-7 rounded-md border border-border bg-transparent px-1.5 text-xs text-muted-foreground focus-visible:outline-2 focus-visible:outline-offset-2"
+							>
+								<option value="steer" disabled={!onSteer}>Steer</option>
+								<option value="interrupt" disabled={!onInterruptSend}>Interrupt</option>
+							</select>
+						) : null}
 						{showSteerButton && canSteerDraft && (hasText || staged) ? (
 							<Button type="button" variant="ghost" size="sm" disabled={!sendActionEnabled} onClick={() => void submit(undefined, true)} aria-label="Steer into running turn" className="h-7 px-2 text-xs">
 								Steer

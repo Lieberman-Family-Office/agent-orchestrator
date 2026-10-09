@@ -1065,6 +1065,14 @@ func (s *Store) appendUserMessage(
 		}); err != nil {
 			return err
 		}
+		if msg.InterruptTargetProviderTurnID != "" {
+			if err := q.SetConversationTurnInterruptTarget(ctx, gen.SetConversationTurnInterruptTargetParams{
+				InterruptTargetProviderTurnID: msg.InterruptTargetProviderTurnID,
+				ID:                            turnID,
+			}); err != nil {
+				return fmt.Errorf("record interrupt target: %w", err)
+			}
+		}
 		interactionAt := msg.InteractionAt
 		if interactionAt.IsZero() {
 			interactionAt = now
@@ -2031,12 +2039,26 @@ func (s *Store) NextQueuedTurn(ctx context.Context, conversationID string) (doma
 		return domain.QueuedTurn{}, fmt.Errorf("select next queued turn for %s: %w", conversationID, err)
 	}
 	return domain.QueuedTurn{
-		TurnID:              row.ID,
-		Text:                row.Text,
-		ClientMessageID:     row.ClientMessageID,
-		Origin:              row.Origin,
-		DeliveryContentJSON: row.DeliveryContentJson,
+		TurnID:                        row.ID,
+		Text:                          row.Text,
+		InterruptTargetProviderTurnID: row.InterruptTargetProviderTurnID,
+		ClientMessageID:               row.ClientMessageID,
+		Origin:                        row.Origin,
+		DeliveryContentJSON:           row.DeliveryContentJson,
 	}, nil
+}
+
+// TurnByProviderID reads one exact durable cancellation target.
+func (s *Store) TurnByProviderID(ctx context.Context, conversationID, providerTurnID string) (domain.ConversationTurn, error) {
+	row, err := s.qr.SelectConversationTurnByProviderID(ctx, gen.SelectConversationTurnByProviderIDParams{
+		ConversationID: conversationID, ProviderTurnID: providerTurnID,
+	})
+	return turnToDomain(row), err
+}
+
+// MarkTurnInterruptDelivered retains cancellation acceptance for request retries.
+func (s *Store) MarkTurnInterruptDelivered(ctx context.Context, turnID string) error {
+	return s.qw.MarkConversationTurnInterruptDelivered(ctx, turnID)
 }
 
 // ReserveQueuedTurnForPromotion atomically removes one selected queued turn from
@@ -3592,14 +3614,16 @@ func rateLimitsFromRow(row gen.Conversation) *domain.ConversationRateLimits {
 
 func turnToDomain(row gen.ConversationTurn) domain.ConversationTurn {
 	turn := domain.ConversationTurn{
-		ID:                 row.ID,
-		ConversationID:     row.ConversationID,
-		BranchID:           row.BranchID,
-		HandledBySessionID: row.HandledBySessionID,
-		ProviderTurnID:     row.ProviderTurnID,
-		State:              row.State,
-		ErrorMessage:       row.ErrorMessage,
-		RequestedAt:        row.RequestedAt,
+		ID:                            row.ID,
+		ConversationID:                row.ConversationID,
+		BranchID:                      row.BranchID,
+		HandledBySessionID:            row.HandledBySessionID,
+		ProviderTurnID:                row.ProviderTurnID,
+		InterruptTargetProviderTurnID: row.InterruptTargetProviderTurnID,
+		InterruptDelivered:            row.InterruptDelivered,
+		State:                         row.State,
+		ErrorMessage:                  row.ErrorMessage,
+		RequestedAt:                   row.RequestedAt,
 	}
 	if row.RetryOfTurnID.Valid {
 		turn.RetryOfTurnID = row.RetryOfTurnID.String

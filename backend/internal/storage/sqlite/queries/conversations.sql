@@ -837,6 +837,7 @@ WHERE conversation_activities.conversation_id = ?
 -- offset, so a multi-byte character here silently corrupts later queries.
 -- name: SelectNextQueuedConversationTurn :one
 SELECT conversation_turns.id,
+       conversation_turns.interrupt_target_provider_turn_id,
        conversation_messages.text,
        conversation_messages.client_message_id,
        conversation_messages.origin,
@@ -857,8 +858,19 @@ WHERE conversation_turns.conversation_id = ?
         AND reports.delivery_batch_id <> ''
         AND reports.delivery_batch_id = conversation_messages.client_message_id
   ))
-ORDER BY conversation_turns.requested_at, conversation_turns.rowid
+ORDER BY (conversation_turns.interrupt_target_provider_turn_id <> '') DESC,
+         conversation_turns.requested_at, conversation_turns.rowid
 LIMIT 1;
+
+-- Persist provider cancellation acceptance before retry can repeat it.
+-- name: MarkConversationTurnInterruptDelivered :exec
+UPDATE conversation_turns SET interrupt_delivered = TRUE WHERE id = ?;
+
+-- Bind an interrupt prompt in the same transaction as its durable message.
+-- name: SetConversationTurnInterruptTarget :exec
+UPDATE conversation_turns
+SET interrupt_target_provider_turn_id = ?
+WHERE id = ?;
 
 -- Claim one selected queue item before contacting the provider. execrows is the
 -- compare-and-set result: zero means the turn is absent, settled, or already being

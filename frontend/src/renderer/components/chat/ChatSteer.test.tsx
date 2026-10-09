@@ -49,33 +49,32 @@ describe("ChatComposer steering", () => {
 		);
 	}
 
-	it("does not show delivery indicators in the composer while a turn is running", () => {
+	it("shows the selected active-turn send mode", () => {
 		composer();
-		expect(screen.queryByRole("group", { name: /where this message goes/i })).not.toBeInTheDocument();
+		expect(screen.getByRole("combobox", { name: "Send while agent is working" })).toHaveValue("steer");
 		expect(screen.queryByText("Queue")).not.toBeInTheDocument();
-		expect(screen.queryByText("Steer")).not.toBeInTheDocument();
 	});
 
-	it("queues by default while a turn is running", async () => {
+	it("steers by default with one Enter while a turn is running", async () => {
 		const onSteer = vi.fn().mockResolvedValue(undefined);
 		const onSend = vi.fn();
 		composer({ onSteer, onSend });
 
-		await typeInLexicalEditor(screen.getByRole("combobox"), "use the unit tests only");
+		await typeInLexicalEditor(screen.getByRole("combobox", { name: "Message the agent" }), "use the unit tests only");
 		await userEvent.keyboard("{Enter}");
-		expect(onSend).toHaveBeenCalledWith("use the unit tests only");
-		expect(onSteer).not.toHaveBeenCalled();
+		expect(onSteer).toHaveBeenCalledWith("use the unit tests only");
+		expect(onSend).not.toHaveBeenCalled();
 	});
 
-	it("keeps Cmd/Ctrl+Enter steering available without advertising it", async () => {
+	it("keeps Cmd/Ctrl+Enter steering available with an explicit mode label", async () => {
 		const onSteer = vi.fn().mockResolvedValue(undefined);
 		composer({ onSteer });
 
-		await typeInLexicalEditor(screen.getByRole("combobox"), "steer this draft");
+		await typeInLexicalEditor(screen.getByRole("combobox", { name: "Message the agent" }), "steer this draft");
 		await userEvent.keyboard("{Control>}{Enter}{/Control}");
 
 		expect(onSteer).toHaveBeenCalledWith("steer this draft");
-		expect(screen.queryByText(/steer/i)).not.toBeInTheDocument();
+		expect(screen.getByRole("combobox", { name: "Send while agent is working" })).toHaveValue("steer");
 	});
 
 	it("steers the next queued message on empty Enter and removes it immediately", async () => {
@@ -96,7 +95,7 @@ describe("ChatComposer steering", () => {
 			/>,
 		);
 
-		await userEvent.click(screen.getByRole("combobox"));
+		await userEvent.click(screen.getByRole("combobox", { name: "Message the agent" }));
 		await userEvent.keyboard("{Enter}");
 
 		await waitFor(() => expect(onPromoteQueuedTurn).toHaveBeenCalledWith("queued-1"));
@@ -138,7 +137,7 @@ describe("ChatComposer steering", () => {
 		await waitFor(() => expect(onPromoteQueuedTurn).toHaveBeenNthCalledWith(2, "queued-2"));
 	});
 
-	it("keeps focus on a refused steer so Enter can queue the retained draft", async () => {
+	it("keeps focus and the draft after a refused steer for an explicit retry", async () => {
 		let rejectSteer!: (reason?: unknown) => void;
 		const onSteer = vi.fn(
 			() =>
@@ -149,7 +148,7 @@ describe("ChatComposer steering", () => {
 		const onSend = vi.fn().mockResolvedValue(undefined);
 		composer({ onSteer, onSend });
 
-		const field = screen.getByRole("combobox");
+		const field = screen.getByRole("combobox", { name: "Message the agent" });
 		await typeInLexicalEditor(field, "actually, skip it");
 		await userEvent.keyboard("{Control>}{Enter}{/Control}");
 		await waitFor(() => expect(field).toHaveAttribute("aria-disabled", "true"));
@@ -166,8 +165,8 @@ describe("ChatComposer steering", () => {
 			expect(field).toHaveTextContent("actually, skip it");
 			expect(field).toHaveFocus();
 
-			await userEvent.keyboard("{Enter}");
-			await waitFor(() => expect(onSend).toHaveBeenCalledWith("actually, skip it"));
+			expect(onSend).not.toHaveBeenCalled();
+			expect(onSteer).toHaveBeenCalledWith("actually, skip it");
 		} finally {
 			if (previousTabIndex === null) document.body.removeAttribute("tabindex");
 			else document.body.setAttribute("tabindex", previousTabIndex);
@@ -180,7 +179,7 @@ describe("ChatComposer steering", () => {
 		const stage = vi.fn().mockResolvedValue([".ao/attachments/shot.png"]);
 		composer({ onSteer, onSend, onStageAttachments: stage, nativeImages: true });
 
-		const field = screen.getByRole("combobox");
+		const field = screen.getByRole("combobox", { name: "Message the agent" });
 		await userEvent.click(field);
 		fireEvent.paste(field, { clipboardData: { files: [png()], items: [] } });
 		await waitFor(() => expect(screen.getAllByRole("listitem")).toHaveLength(1));
@@ -220,7 +219,7 @@ describe("ChatComposer steering", () => {
 		const stage = vi.fn().mockResolvedValue([".ao/attachments/slow.png"]);
 		composer({ onSteer, onStageAttachments: stage, nativeImages: true });
 
-		const field = screen.getByRole("combobox");
+		const field = screen.getByRole("combobox", { name: "Message the agent" });
 		await typeInLexicalEditor(field, "inspect this");
 		fireEvent.paste(field, { clipboardData: { files: [png("slow.png")], items: [] } });
 		act(() => {
@@ -257,9 +256,9 @@ describe("ChatComposer steering", () => {
 		expect(screen.queryByText("Steer")).not.toBeInTheDocument();
 	});
 
-	it("hides delivery indicators in the composer when no turn is in flight", () => {
+	it("keeps the saved send-mode control when no turn is in flight", () => {
 		composer({ canSteer: false, willQueue: false });
-		expect(screen.queryByText("Steer")).not.toBeInTheDocument();
+		expect(screen.getByRole("combobox", { name: "Send while agent is working" })).toHaveValue("steer");
 	});
 });
 
@@ -572,7 +571,7 @@ describe("ChatWorkspace steering", () => {
 		};
 		render(<ChatWorkspace snapshot={snapshot} onSteer={vi.fn()} />);
 		expect(screen.queryByText("Queue")).not.toBeInTheDocument();
-		expect(screen.queryByText("Steer")).not.toBeInTheDocument();
+		expect(screen.getByRole("combobox", { name: "Send while agent is working" })).toHaveValue("steer");
 	});
 
 	it("does not show delivery indicator on a settled conversation", () => {
@@ -582,7 +581,7 @@ describe("ChatWorkspace steering", () => {
 				onSteer={vi.fn()}
 			/>,
 		);
-		expect(screen.queryByText("Steer")).not.toBeInTheDocument();
+		expect(screen.getByRole("combobox", { name: "Send while agent is working" })).toHaveValue("steer");
 		expect(screen.queryByTestId("queued-message-dock")).not.toBeInTheDocument();
 	});
 

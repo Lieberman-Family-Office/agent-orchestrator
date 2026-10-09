@@ -544,6 +544,8 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 				busy={commands.busy}
 				onSend={(text, attachments, clientMessageId) =>
 					commands.send({ text, attachments, clientMessageId })}
+				onInterruptSend={can(renderSnapshot, "interrupt") ? (text, attachments, clientMessageId) =>
+					commands.send({ text, attachments, clientMessageId, interruptAndSend: true }) : undefined}
 				commandError={commands.error}
 				onDecide={commands.resolve}
 				onResolveInput={commands.resolveInput}

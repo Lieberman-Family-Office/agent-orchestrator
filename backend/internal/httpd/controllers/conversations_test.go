@@ -19,6 +19,24 @@ import (
 	chatsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/chat"
 )
 
+func TestConversationSendCarriesInterruptAndSendMode(t *testing.T) {
+	service := &fakeConversationService{}
+	server := conversationTestServer(t, service)
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/sessions/session-1/conversation/messages", bytes.NewBufferString(`{"text":"  exact text\n\n","clientMessageId":"interrupt-one","interruptAndSend":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted || !service.sent.InterruptAndSend || service.sent.Text != "  exact text\n\n" {
+		t.Fatalf("send mode was lost: status=%d message=%+v", response.StatusCode, service.sent)
+	}
+}
+
 func conversationTestServer(t *testing.T, service *fakeConversationService) *httptest.Server {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))

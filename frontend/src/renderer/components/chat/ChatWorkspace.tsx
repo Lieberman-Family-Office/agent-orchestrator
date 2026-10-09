@@ -330,6 +330,11 @@ export interface ChatWorkspaceProps {
 		attachments?: { mimeType: string; data: string }[],
 		clientMessageId?: string,
 	) => void | Promise<unknown>;
+	onInterruptSend?: (
+		text: string,
+		attachments?: { mimeType: string; data: string }[],
+		clientMessageId?: string,
+	) => Promise<unknown>;
 	onDecide?: (requestId: string, decisionId: string) => void;
 	onResolveInput?: (
 		requestId: string,
@@ -582,6 +587,7 @@ function ChatWorkspaceContent({
 	loadingOlder,
 	onLoadOlder,
 	onSend,
+	onInterruptSend,
 	onDecide,
 	onResolveInput,
 	onInterrupt,
@@ -1561,6 +1567,7 @@ function ChatWorkspaceContent({
 										approval={composerApproval}
 										elicitation={composerElicitation}
 										onSend={handleComposerSend}
+										onInterruptSend={newWorkDisabled ? undefined : onInterruptSend}
 										draftSeed={composerDraftSeed}
 										editingQueuedTurnId={queueEdit?.turnId}
 										queuedEditRecovery={Boolean(queueEdit?.clientMessageId)}
@@ -1606,7 +1613,7 @@ function ChatWorkspaceContent({
 										autoFocusKey={draftScope.sessionId}
 										// Steering is only meaningful into a turn that is running. A queued turn
 										// has not reached the provider, so there is nothing to steer.
-										onSteer={newWorkDisabled ? undefined : steer}
+										onSteer={newWorkDisabled || !onSteer ? undefined : steer}
 										showSteerButton={showSteerButton}
 										canSteer={Boolean(onSteer) && turn?.state === "running"}
 										sendPending={sendPending || agentResuming}

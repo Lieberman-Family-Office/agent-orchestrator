@@ -9,6 +9,7 @@ import { ChatComposer } from "./ChatComposer";
 import { attachmentURL } from "./messageAttachments";
 import { getApiBaseUrl } from "../../lib/api-client";
 import { TooltipProvider } from "../ui/tooltip";
+import { useUiStore } from "../../stores/ui-store";
 import type { ChatSkill } from "../../types/conversation";
 import {
 	activateChatDraftScope,
@@ -223,6 +224,51 @@ describe("send keys", () => {
 		await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 		await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
 		expect(onSend.mock.calls[0][0]).toBe(text);
+	});
+
+	it("steers with one Enter and preserves typed text while a turn runs", async () => {
+		useUiStore.setState({ chatSendMode: "steer" });
+		const onSend = vi.fn();
+		const onSteer = vi.fn().mockResolvedValue({ status: "accepted" });
+		render(<ChatComposer onSend={onSend} onSteer={onSteer} canSteer willQueue />);
+		const field = screen.getByLabelText("Message the agent");
+		await typeInComposer(field, "  steer this now  ");
+		await userEvent.keyboard("{Enter}");
+		await waitFor(() => expect(onSteer).toHaveBeenCalledWith("  steer this now  "));
+		expect(onSend).not.toHaveBeenCalled();
+	});
+
+	it("interrupts with one Enter using the selected mode rather than sending or steering", async () => {
+		useUiStore.setState({ chatSendMode: "steer" });
+		const onSend = vi.fn();
+		const onSteer = vi.fn();
+		const onInterruptSend = vi.fn().mockResolvedValue(undefined);
+		render(<ChatComposer onSend={onSend} onSteer={onSteer} onInterruptSend={onInterruptSend} canSteer willQueue />);
+		await userEvent.selectOptions(screen.getByLabelText("Send while agent is working"), "interrupt");
+		const field = screen.getByLabelText("Message the agent");
+		await typeInComposer(field, "Interrupt with these words");
+		await userEvent.keyboard("{Enter}");
+		await waitFor(() => expect(onInterruptSend).toHaveBeenCalledWith("Interrupt with these words"));
+		expect(onSteer).not.toHaveBeenCalled();
+		expect(onSend).not.toHaveBeenCalled();
+		useUiStore.setState({ chatSendMode: "steer" });
+	});
+
+	it("remembers Interrupt but sends normally while idle and keeps Shift+Enter as newline", async () => {
+		useUiStore.setState({ chatSendMode: "interrupt" });
+		const onSend = vi.fn().mockResolvedValue(undefined);
+		const onInterruptSend = vi.fn();
+		render(<ChatComposer onSend={onSend} onInterruptSend={onInterruptSend} onSteer={vi.fn()} />);
+		const field = screen.getByLabelText("Message the agent");
+		await typeInComposer(field, "first line");
+		await userEvent.keyboard("{Shift>}{Enter}{/Shift}");
+		expect(onSend).not.toHaveBeenCalled();
+		expect(onInterruptSend).not.toHaveBeenCalled();
+		await typeInComposer(field, "second line");
+		await userEvent.keyboard("{Enter}");
+		await waitFor(() => expect(onSend).toHaveBeenCalledWith("first line\nsecond line"));
+		expect(onInterruptSend).not.toHaveBeenCalled();
+		useUiStore.setState({ chatSendMode: "steer" });
 	});
 
 	it("sends on Enter", async () => {
@@ -830,14 +876,14 @@ describe("steering", () => {
 		expect(onSend).not.toHaveBeenCalled();
 	});
 
-	it("queues on a bare Enter even while a turn is running", async () => {
+	it("steers on a bare Enter while a turn is running", async () => {
 		const { onSend, onSteer, field } = renderSteerable();
 
 		await typeInComposer(field, "wait your turn");
 		await userEvent.keyboard("{Enter}");
 
-		await waitFor(() => expect(onSend).toHaveBeenCalledWith("wait your turn"));
-		expect(onSteer).not.toHaveBeenCalled();
+		await waitFor(() => expect(onSteer).toHaveBeenCalledWith("wait your turn"));
+		expect(onSend).not.toHaveBeenCalled();
 	});
 
 	// The modifier is a request, not a guarantee: a harness that cannot steer must
@@ -860,7 +906,7 @@ describe("steering", () => {
 		const { onSend, onSteer, field } = renderSteerable();
 
 		await typeInComposer(field, "pointer agrees with the chip");
-		expect(screen.getByRole("button", { name: "Queue message" })).toBeEnabled();
+		expect(screen.getByRole("button", { name: "Steer message" })).toBeEnabled();
 		act(() => {
 			window.dispatchEvent(new KeyboardEvent("keydown", { key: "Meta", metaKey: true }));
 		});
@@ -871,7 +917,7 @@ describe("steering", () => {
 		expect(onSend).not.toHaveBeenCalled();
 	});
 
-	it("releasing the modifier returns the send control to queueing", async () => {
+	it("releasing the modifier keeps the selected steering send action", async () => {
 		const { onSend, onSteer, field } = renderSteerable();
 
 		await typeInComposer(field, "back to the queue");
@@ -882,10 +928,10 @@ describe("steering", () => {
 			window.dispatchEvent(new KeyboardEvent("keyup", { key: "Meta", metaKey: false }));
 		});
 
-		await userEvent.click(screen.getByRole("button", { name: "Queue message" }));
+		await userEvent.click(screen.getByRole("button", { name: "Steer message" }));
 
-		await waitFor(() => expect(onSend).toHaveBeenCalledWith("back to the queue"));
-		expect(onSteer).not.toHaveBeenCalled();
+		await waitFor(() => expect(onSteer).toHaveBeenCalledWith("back to the queue"));
+		expect(onSend).not.toHaveBeenCalled();
 	});
 
 	// A refused steer is an ordinary outcome — the turn may have ended mid-keystroke —

@@ -397,6 +397,8 @@ type ChatUserMessage struct {
 	// InteractionAt preserves initial acceptance across transition outbox replay.
 	InteractionAt time.Time
 	Text          string
+	// InterruptAndSend stops the current turn and prioritizes this durable prompt without cancelling queued work.
+	InterruptAndSend bool
 	// SenderSessionID identifies the AO session that authored an automation steer.
 	// It is presentation metadata only and is never sent to the provider.
 	SenderSessionID string
