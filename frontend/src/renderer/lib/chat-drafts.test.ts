@@ -48,6 +48,19 @@ class MemoryStorage implements DraftStorage {
 }
 
 describe("Chat draft storage", () => {
+	it("retains interrupt delivery mode and original key across recovery", () => {
+		const storage = new MemoryStorage();
+		activateChatDraftScope("interrupt-recovery", storage);
+		writeChatComposerText("interrupt-recovery", "keep exact text", storage);
+		const first = prepareChatComposerDelivery("interrupt-recovery", {
+			kind: "interrupt", composerText: "keep exact text", attachments: [], requestText: "keep exact text", clientMessageId: "interrupt-once",
+		}, storage);
+		expect(first).toMatchObject({ ok: true, recovered: false, mutation: { kind: "interrupt", clientMessageId: "interrupt-once" } });
+		const recovered = prepareChatComposerDelivery("interrupt-recovery", {
+			kind: "steer", composerText: "changed choice", attachments: [], requestText: "changed text", clientMessageId: "different-key",
+		}, storage);
+		expect(recovered).toMatchObject({ ok: true, recovered: true, mutation: { kind: "interrupt", clientMessageId: "interrupt-once", requestText: "keep exact text" } });
+	});
 	it("lets authoritative recreation purge once while every late obsolete callback fails closed", () => {
 		const storage = new MemoryStorage();
 		const first: ChatDraftScope = {

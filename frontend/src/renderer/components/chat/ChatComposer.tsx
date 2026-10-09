@@ -556,7 +556,7 @@ export const ChatComposer = memo(function ChatComposer({
 		willQueue && onInterrupt && !controlsDisabled && !hasDraft && !savingQueuedEdit,
 	);
 	const canSteerNext =
-		Boolean(canSteer && onSteer) &&
+		sendMode === "steer" && Boolean(canSteer && onSteer) &&
 		!controlsDisabled &&
 		!hasDraft &&
 		!savingQueuedEdit &&
