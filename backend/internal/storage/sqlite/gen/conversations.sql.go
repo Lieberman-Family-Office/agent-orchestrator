@@ -777,6 +777,28 @@ func (q *Queries) FinalizeConversationPlanActivity(ctx context.Context, arg Fina
 	return err
 }
 
+const hasAcceptedConversationInterrupt = `-- name: HasAcceptedConversationInterrupt :one
+SELECT EXISTS (
+    SELECT 1 FROM conversation_turns
+    WHERE conversation_id = ? AND interrupt_target_provider_turn_id = ?
+      AND interrupt_target_provider_turn_id <> ''
+      AND interrupt_delivered = TRUE AND rolled_back_at IS NULL
+)
+`
+
+type HasAcceptedConversationInterruptParams struct {
+	ConversationID                string
+	InterruptTargetProviderTurnID string
+}
+
+// Handoff cancels queue rows before provider I/O, but acceptance survives that change.
+func (q *Queries) HasAcceptedConversationInterrupt(ctx context.Context, arg HasAcceptedConversationInterruptParams) (bool, error) {
+	row := q.db.QueryRowContext(ctx, hasAcceptedConversationInterrupt, arg.ConversationID, arg.InterruptTargetProviderTurnID)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const hasConversationTurns = `-- name: HasConversationTurns :one
 SELECT EXISTS (SELECT 1 FROM conversation_turns WHERE conversation_id = ?)
 `

@@ -4768,6 +4768,96 @@ func TestChatHandoffInterruptCompletionDuringProviderCancellationCannotPromoteQu
 	}
 }
 
+// ACP retains accepted cancellation until the root prompt returns a terminal result.
+type pendingACPCancellationConversation struct {
+	*interruptRecorder
+}
+
+func (c *pendingACPCancellationConversation) Interrupt(_ context.Context, target string) error {
+	c.activeMu.Lock()
+	defer c.activeMu.Unlock()
+	duplicate := slices.Contains(c.attempts, target)
+	c.attempts = append(c.attempts, target)
+	if duplicate {
+		return errors.New("injected ACP duplicate cancellation rejection")
+	}
+	if !c.active[target] {
+		return ports.ErrChatNoActiveTurn
+	}
+	return nil
+}
+
+func TestChatHandoffInterruptReusesAcceptedInterruptSendBeforeTerminalEvent(t *testing.T) {
+	provider := &pendingACPCancellationConversation{interruptRecorder: newInterruptRecorder()}
+	h := newHarnessWithConversation(t, provider)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	running, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "running", ClientMessageID: "handoff-accepted-running"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.markActive(running.ProviderTurnID)
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: running.ProviderTurnID})
+	older, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "older queue", ClientMessageID: "handoff-accepted-older"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	priority, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "priority", ClientMessageID: "handoff-accepted-priority", InterruptAndSend: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ctrl.BeginHandoff(ctx, domain.SessionInterfaceTransitionInterrupt); err != nil {
+		t.Fatalf("handoff repeated accepted cancellation: %v", err)
+	}
+	if count := provider.attemptCount(); count != 1 {
+		t.Fatalf("provider cancellations=%d, want 1", count)
+	}
+	snapshot, err := h.st.LoadConversationSnapshot(ctx, h.ctrl.ConversationID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, _ := turnByID(snapshot, running.ID)
+	if active.State != domain.TurnStateRunning {
+		t.Fatalf("invented terminal result: %+v", active)
+	}
+	for _, id := range []string{older.ID, priority.ID} {
+		turn, _ := turnByID(snapshot, id)
+		if turn.State != domain.TurnStateInterrupted {
+			t.Fatalf("handoff queue cancellation changed: %+v", turn)
+		}
+	}
+	accepted, err := h.st.TurnByID(ctx, priority.ID)
+	if err != nil || !accepted.InterruptDelivered {
+		t.Fatalf("lost durable cancellation acceptance: %+v err=%v", accepted, err)
+	}
+}
+
+type unreadableInterruptAcceptanceStore struct{ chatsvc.Store }
+
+func (s *unreadableInterruptAcceptanceStore) HasAcceptedInterrupt(context.Context, string, string) (bool, error) {
+	return false, errors.New("injected acceptance read failure")
+}
+
+func TestChatHandoffInterruptFailsClosedWhenAcceptanceCannotBeRead(t *testing.T) {
+	provider := newInterruptRecorder()
+	h := newHarnessWithConversationAndStore(t, provider, func(st *sqlite.Store) chatsvc.Store {
+		return &unreadableInterruptAcceptanceStore{Store: st}
+	})
+	ctx := context.Background()
+	turn, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "running", ClientMessageID: "handoff-read-failure"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.markActive(turn.ProviderTurnID)
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: turn.ProviderTurnID})
+	if err := h.ctrl.BeginHandoff(ctx, domain.SessionInterfaceTransitionInterrupt); err == nil || !strings.Contains(err.Error(), "acceptance read failure") {
+		t.Fatalf("unreadable acceptance treated as clear: %v", err)
+	}
+	if count := provider.attemptCount(); count != 0 {
+		t.Fatalf("unproven provider cancellation repeated %d times", count)
+	}
+}
+
 func TestChatHandoffInterruptDoesNotWaitForTurnCompletion(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()

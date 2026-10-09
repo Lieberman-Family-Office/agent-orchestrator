@@ -700,6 +700,42 @@ func TestLegacyWorkerReportQueueDoesNotDrainAheadOfHumanMessages(t *testing.T) {
 	}
 }
 
+func TestInterruptAcceptanceSurvivesHandoffQueueCancellationAndRemainsTargetScoped(t *testing.T) {
+	s, session, conversation := conversationFixture(t)
+	ctx := context.Background()
+	created, err := s.AppendUserMessage(ctx, conversation, session, "gen-1", domain.ConversationMessage{
+		ID: "accepted-message", Text: "priority", Origin: domain.MessageOriginHuman,
+		ClientMessageID: "accepted-message", InterruptTargetProviderTurnID: "active-provider",
+	}, "accepted-intent", histClock)
+	if err != nil || !created {
+		t.Fatalf("append: created=%v err=%v", created, err)
+	}
+	accepted, err := s.HasAcceptedInterrupt(ctx, conversation, "active-provider")
+	if err != nil || accepted {
+		t.Fatalf("unproven acceptance: accepted=%v err=%v", accepted, err)
+	}
+	if err := s.MarkTurnInterruptDelivered(ctx, "accepted-intent"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CancelAllQueuedTurns(ctx, conversation, histClock); err != nil {
+		t.Fatal(err)
+	}
+	for _, check := range []struct {
+		conversation, target string
+		want                 bool
+	}{
+		{conversation, "active-provider", true},
+		{conversation, "other-provider", false},
+		{"other-conversation", "active-provider", false},
+		{conversation, "", false},
+	} {
+		accepted, err := s.HasAcceptedInterrupt(ctx, check.conversation, check.target)
+		if err != nil || accepted != check.want {
+			t.Fatalf("acceptance for %q/%q: got=%v err=%v want=%v", check.conversation, check.target, accepted, err, check.want)
+		}
+	}
+}
+
 func TestInterruptBatchPrioritySurvivesDatabaseReopen(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

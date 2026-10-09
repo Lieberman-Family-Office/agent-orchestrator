@@ -883,6 +883,15 @@ WHERE conversation_id = ? AND state = 'queued'
   AND interrupt_target_provider_turn_id <> ''
 ORDER BY requested_at, rowid;
 
+-- Handoff cancels queue rows before provider I/O, but acceptance survives that change.
+-- name: HasAcceptedConversationInterrupt :one
+SELECT EXISTS (
+    SELECT 1 FROM conversation_turns
+    WHERE conversation_id = ? AND interrupt_target_provider_turn_id = ?
+      AND interrupt_target_provider_turn_id <> ''
+      AND interrupt_delivered = TRUE AND rolled_back_at IS NULL
+);
+
 -- Persist provider cancellation acceptance before retry can repeat it; concurrent
 -- requests accepted for this exact target share that acknowledgement.
 -- name: MarkConversationTurnInterruptDelivered :exec

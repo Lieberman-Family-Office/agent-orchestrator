@@ -2064,6 +2064,13 @@ func (s *Store) PendingInterruptTurns(ctx context.Context, conversationID string
 	return turns, nil
 }
 
+// HasAcceptedInterrupt reads acceptance for the exact target, even after queue cancellation.
+func (s *Store) HasAcceptedInterrupt(ctx context.Context, conversationID, providerTurnID string) (bool, error) {
+	return s.qr.HasAcceptedConversationInterrupt(ctx, gen.HasAcceptedConversationInterruptParams{
+		ConversationID: conversationID, InterruptTargetProviderTurnID: providerTurnID,
+	})
+}
+
 // TurnByProviderID reads one exact durable cancellation target.
 func (s *Store) TurnByProviderID(ctx context.Context, conversationID, providerTurnID string) (domain.ConversationTurn, error) {
 	row, err := s.qr.SelectConversationTurnByProviderID(ctx, gen.SelectConversationTurnByProviderIDParams{

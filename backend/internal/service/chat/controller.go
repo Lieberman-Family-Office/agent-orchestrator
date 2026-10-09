@@ -75,6 +75,7 @@ type Store interface {
 	AppendReviewRetryUserMessage(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation string, msg domain.ConversationMessage, turnID, retryOfTurnID string, now time.Time) (bool, error)
 	MarkTurnDispatching(ctx context.Context, turnID string) error
 	MarkTurnInterruptDelivered(ctx context.Context, turnID string) error
+	HasAcceptedInterrupt(ctx context.Context, conversationID, providerTurnID string) (bool, error)
 	TurnByProviderID(ctx context.Context, conversationID, providerTurnID string) (domain.ConversationTurn, error)
 	BindTurnToProvider(ctx context.Context, turnID, providerTurnID string, now time.Time) error
 	SettleTurn(ctx context.Context, conversationID, providerTurnID string, state domain.TurnState, errMessage string, now time.Time) error
@@ -2305,8 +2306,17 @@ const turnAckWait = 3 * time.Second
 // cancelled the durable queue under the dispatch lock, so reusing Interrupt here
 // would reintroduce a second, callback-ordered cancellation path.
 func (c *Controller) interruptForHandoff(ctx context.Context) error {
+	c.interruptSendMu.Lock()
+	defer c.interruptSendMu.Unlock()
 	turn, ok := c.awaitAcknowledgedTurn(ctx)
 	if !ok {
+		return nil
+	}
+	accepted, err := c.store.HasAcceptedInterrupt(ctx, c.conversation.ID, turn)
+	if err != nil {
+		return fmt.Errorf("read cancellation acceptance for handoff: %w", err)
+	}
+	if accepted {
 		return nil
 	}
 	if err := c.conv.Interrupt(ctx, turn); err != nil {
