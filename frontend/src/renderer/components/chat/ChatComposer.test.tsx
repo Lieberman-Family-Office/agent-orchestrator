@@ -451,6 +451,23 @@ describe("send keys", () => {
 		await waitFor(() => expect(restored).toHaveTextContent(""));
 	});
 
+	it.each(["CHAT_INTERFACE_TRANSITION", "SESSION_MODE_UNSUPPORTED"])("unlocks an initially rejected interrupt draft (%s)", async (code) => {
+		useUiStore.setState({ chatSendMode: "interrupt" });
+		const sessionId = `interrupt-rejected-${code}`;
+		const onInterruptSend = vi.fn().mockRejectedValue({ code, message: "Request was rejected" });
+		const view = render(<ChatComposer draftSessionId={sessionId} onSend={vi.fn()} onInterruptSend={onInterruptSend} willQueue />);
+		const field = screen.getByLabelText("Message the agent");
+		await typeInComposer(field, "keep my rejected text");
+		fireEvent.keyDown(field, { key: "Enter" });
+		await waitFor(() => expect(onInterruptSend).toHaveBeenCalledTimes(1));
+		await waitFor(() => expect(readChatSessionDraft(sessionId).composer.delivery).toBeUndefined());
+		expect(field).toHaveAttribute("contenteditable", "true");
+		expect(field).toHaveTextContent("keep my rejected text");
+		expect(screen.getByLabelText("Send while agent is working")).toBeEnabled();
+		view.unmount();
+		useUiStore.setState({ chatSendMode: "steer" });
+	});
+
 	it.each(["CHAT_CONTROLLER_NOT_READY", "validation_error"])("keeps an uncertain earlier send locked when its retry is definitively refused (%s)", async (code) => {
 		const sessionId = `composer-recovery-send-refused-${code}`;
 		const onSend = vi.fn()
@@ -468,6 +485,27 @@ describe("send keys", () => {
 		expect(onSend.mock.calls[1]).toEqual(onSend.mock.calls[0]);
 		expect(screen.getByLabelText("Message the agent")).toHaveAttribute("contenteditable", "false");
 		expect(readChatSessionDraft(sessionId).composer.delivery?.state).toBe("dispatching");
+	});
+
+	it("retains an uncertain interrupt receipt when a recovered attempt is definitively rejected", async () => {
+		useUiStore.setState({ chatSendMode: "interrupt" });
+		const sessionId = "interrupt-recovered-rejection";
+		const onInterruptSend = vi.fn().mockRejectedValueOnce(new Error("response lost"))
+			.mockRejectedValue({ code: "CHAT_INTERFACE_TRANSITION", message: "Request was rejected" });
+		const props = { draftSessionId: sessionId, onSend: vi.fn(), onInterruptSend, willQueue: true };
+		const first = render(<ChatComposer {...props} />);
+		await typeInComposer(screen.getByLabelText("Message the agent"), "possibly accepted interrupt");
+		fireEvent.keyDown(screen.getByLabelText("Message the agent"), { key: "Enter" });
+		await waitFor(() => expect(screen.getByRole("button", { name: "Retry message safely" })).toBeEnabled());
+		first.unmount();
+		const recovered = render(<ChatComposer {...props} />);
+		await userEvent.click(screen.getByRole("button", { name: "Retry message safely" }));
+		await waitFor(() => expect(onInterruptSend).toHaveBeenCalledTimes(2));
+		expect(onInterruptSend.mock.calls[1]).toEqual(onInterruptSend.mock.calls[0]);
+		expect(readChatSessionDraft(sessionId).composer.delivery).toMatchObject({ kind: "interrupt", state: "dispatching" });
+		expect(screen.getByLabelText("Message the agent")).toHaveAttribute("contenteditable", "false");
+		recovered.unmount();
+		useUiStore.setState({ chatSendMode: "steer" });
 	});
 
 	it("locks an accepted draft whose durable clear failed and clears without redispatch", async () => {

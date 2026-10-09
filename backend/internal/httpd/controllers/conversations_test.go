@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -34,6 +35,23 @@ func TestConversationSendCarriesInterruptAndSendMode(t *testing.T) {
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusAccepted || !service.sent.InterruptAndSend || service.sent.Text != "  exact text\n\n" {
 		t.Fatalf("send mode was lost: status=%d message=%+v", response.StatusCode, service.sent)
+	}
+}
+
+func TestAcceptedInterruptSendDoesNotExposePreIntakeRejection(t *testing.T) {
+	service := &fakeConversationService{sendErr: errors.Join(chatsvc.ErrInterruptSendUncertain, chatsvc.ErrControllerHandoff)}
+	server := conversationTestServer(t, service)
+	response, err := server.Client().Post(server.URL+"/api/v1/sessions/session-1/conversation/messages", "application/json", bytes.NewBufferString(`{"text":"accepted prompt","clientMessageId":"accepted-interrupt","interruptAndSend":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("CHAT_INTERRUPT_SEND_UNCERTAIN")) || bytes.Contains(body, []byte("CHAT_INTERFACE_TRANSITION")) {
+		t.Fatalf("accepted prompt reported unaccepted: status=%d body=%s", response.StatusCode, body)
 	}
 }
 

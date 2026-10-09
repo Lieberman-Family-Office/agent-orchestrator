@@ -115,6 +115,7 @@ const DEFINITIVE_SEND_REJECTIONS = new Set([
 	"ATTACHMENTS_TOO_LARGE",
 	"SESSION_NOT_FOUND",
 	"SESSION_MODE_MISMATCH",
+	"SESSION_MODE_UNSUPPORTED",
 	"CHAT_CONTROLLER_NOT_READY",
 	"CHAT_INTERFACE_TRANSITION",
 ]);
@@ -1293,7 +1294,7 @@ export const ChatComposer = memo(function ChatComposer({
 			// Refusal of a retry says nothing about a previous attempt whose response
 			// was lost. Only an initial, definitively unaccepted send can be edited.
 			if (
-				delivery.kind === "send" && !prepared.recovered &&
+				(delivery.kind === "send" || delivery.kind === "interrupt") && !prepared.recovered &&
 				DEFINITIVE_SEND_REJECTIONS.has(apiErrorCode(error) ?? "")
 			) {
 				const cleared = clearRejectedChatComposerDelivery(

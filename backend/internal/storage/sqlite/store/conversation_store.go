@@ -1072,6 +1072,9 @@ func (s *Store) appendUserMessage(
 			}); err != nil {
 				return fmt.Errorf("record interrupt target: %w", err)
 			}
+			if err := q.InheritConversationTurnInterruptDelivered(ctx, turnID); err != nil {
+				return fmt.Errorf("inherit interrupt acceptance: %w", err)
+			}
 		}
 		interactionAt := msg.InteractionAt
 		if interactionAt.IsZero() {
@@ -2048,6 +2051,19 @@ func (s *Store) NextQueuedTurn(ctx context.Context, conversationID string) (doma
 	}, nil
 }
 
+// PendingInterruptTurns lists durable queue-preserving cancellation intents for reconnect.
+func (s *Store) PendingInterruptTurns(ctx context.Context, conversationID string) ([]domain.ConversationTurn, error) {
+	rows, err := s.qr.ListPendingConversationInterruptTurns(ctx, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	turns := make([]domain.ConversationTurn, len(rows))
+	for i, row := range rows {
+		turns[i] = turnToDomain(row)
+	}
+	return turns, nil
+}
+
 // TurnByProviderID reads one exact durable cancellation target.
 func (s *Store) TurnByProviderID(ctx context.Context, conversationID, providerTurnID string) (domain.ConversationTurn, error) {
 	row, err := s.qr.SelectConversationTurnByProviderID(ctx, gen.SelectConversationTurnByProviderIDParams{
@@ -2058,6 +2074,8 @@ func (s *Store) TurnByProviderID(ctx context.Context, conversationID, providerTu
 
 // MarkTurnInterruptDelivered retains cancellation acceptance for request retries.
 func (s *Store) MarkTurnInterruptDelivered(ctx context.Context, turnID string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	return s.qw.MarkConversationTurnInterruptDelivered(ctx, turnID)
 }
 

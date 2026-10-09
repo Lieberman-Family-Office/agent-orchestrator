@@ -862,9 +862,31 @@ ORDER BY (conversation_turns.interrupt_target_provider_turn_id <> '') DESC,
          conversation_turns.requested_at, conversation_turns.rowid
 LIMIT 1;
 
--- Persist provider cancellation acceptance before retry can repeat it.
+-- Reconnect recovers every accepted interrupt intent, not just the queue head.
+-- name: ListPendingConversationInterruptTurns :many
+SELECT * FROM conversation_turns
+WHERE conversation_id = ? AND state = 'queued'
+  AND promotion_started_at IS NULL AND rolled_back_at IS NULL
+  AND interrupt_target_provider_turn_id <> ''
+ORDER BY requested_at, rowid;
+
+-- Persist provider cancellation acceptance before retry can repeat it; concurrent
+-- requests accepted for this exact target share that acknowledgement.
 -- name: MarkConversationTurnInterruptDelivered :exec
-UPDATE conversation_turns SET interrupt_delivered = TRUE WHERE id = ?;
+UPDATE conversation_turns SET interrupt_delivered = TRUE
+WHERE conversation_id = (SELECT target.conversation_id FROM conversation_turns target WHERE target.id = sqlc.arg(id))
+  AND interrupt_target_provider_turn_id <> ''
+  AND interrupt_target_provider_turn_id = (SELECT target.interrupt_target_provider_turn_id FROM conversation_turns target WHERE target.id = sqlc.arg(id));
+
+-- Reuse accepted cancellation of the same exact target for later requests.
+-- name: InheritConversationTurnInterruptDelivered :exec
+UPDATE conversation_turns SET interrupt_delivered = TRUE
+WHERE conversation_turns.id = ? AND EXISTS (
+    SELECT 1 FROM conversation_turns previous
+    WHERE previous.conversation_id = conversation_turns.conversation_id
+      AND previous.interrupt_target_provider_turn_id = conversation_turns.interrupt_target_provider_turn_id
+      AND previous.interrupt_delivered = TRUE
+);
 
 -- Bind an interrupt prompt in the same transaction as its durable message.
 -- name: SetConversationTurnInterruptTarget :exec

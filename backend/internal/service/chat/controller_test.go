@@ -5845,6 +5845,78 @@ func (r *interruptRecorder) attemptCount() int {
 	return len(r.attempts)
 }
 
+type blockingInterruptAcceptance struct {
+	*fakeConversation
+	started chan string
+	release chan struct{}
+}
+
+func (c *blockingInterruptAcceptance) Interrupt(ctx context.Context, target string) error {
+	c.started <- target
+	select {
+	case <-c.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestConcurrentInterruptSendsCaptureOriginalTargetBeforeCancellationFinishes(t *testing.T) {
+	conv := &blockingInterruptAcceptance{fakeConversation: newFakeConversation(), started: make(chan string, 4), release: make(chan struct{})}
+	h := newHarnessWithConversation(t, conv)
+	ctx := context.Background()
+	first, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "running", ClientMessageID: "concurrent-running", Origin: domain.MessageOriginHuman})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: first.ProviderTurnID})
+	done := make(chan error, 2)
+	go func() {
+		_, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "first priority", ClientMessageID: "first-priority", Origin: domain.MessageOriginHuman, InterruptAndSend: true})
+		done <- err
+	}()
+	select {
+	case target := <-conv.started:
+		if target != first.ProviderTurnID {
+			t.Fatal("wrong first target")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no cancel attempt")
+	}
+	go func() {
+		_, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "second priority", ClientMessageID: "second-priority", Origin: domain.MessageOriginHuman, InterruptAndSend: true})
+		done <- err
+	}()
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Turns) == 3 })
+	close(conv.release)
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case target := <-conv.started:
+		t.Fatalf("same running target cancelled twice: %q", target)
+	default:
+	}
+	snapshot, err := h.st.LoadConversationSnapshot(ctx, h.ctrl.ConversationID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, turn := range snapshot.Turns {
+		if turn.ID != first.ID && turn.InterruptTargetProviderTurnID != first.ProviderTurnID {
+			t.Fatalf("concurrent request retargeted: %+v", turn)
+		}
+	}
+	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: first.ProviderTurnID, TurnState: domain.TurnStateInterrupted})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return turnStateByText(t, s)["first priority"] == domain.TurnStateRunning
+	})
+	if !reflect.DeepEqual(conv.sentTexts(), []string{"running", "first priority"}) {
+		t.Fatalf("wrong concurrent order: %v", conv.sentTexts())
+	}
+}
+
 func TestInterruptAndSendPrioritizesNewPromptAndPreservesQueue(t *testing.T) {
 	conv := newInterruptRecorder()
 	h := newHarnessWithConversation(t, conv)
@@ -5894,7 +5966,7 @@ func TestInterruptAndSendPrioritizesNewPromptAndPreservesQueue(t *testing.T) {
 	}
 }
 
-func TestInterruptAndSendReconcilesAnExactTargetAlreadyGone(t *testing.T) {
+func TestInterruptAndSendNoActiveDoesNotInventSuccessfulCancellation(t *testing.T) {
 	conv := newInterruptRecorder()
 	h := newHarnessWithConversation(t, conv)
 	ctx := context.Background()
@@ -5911,22 +5983,43 @@ func TestInterruptAndSendReconcilesAnExactTargetAlreadyGone(t *testing.T) {
 		t.Fatal(err)
 	}
 	accepted, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "next", ClientMessageID: "next", Origin: domain.MessageOriginHuman, InterruptAndSend: true})
-	if err != nil {
-		t.Fatalf("provider reports no active exact target: %v", err)
+	if accepted.ID == "" {
+		t.Fatalf("accepted prompt missing: %v", err)
 	}
+	before, readErr := h.st.LoadConversationSnapshot(ctx, h.ctrl.ConversationID())
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	target, _ := turnByID(before, first.ID)
+	next, _ := turnByID(before, accepted.ID)
+	if target.State != domain.TurnStateRunning || next.State != domain.TurnStateQueued || len(conv.sentTexts()) != 1 {
+		t.Fatalf("inactivity invented successful cancellation: target=%+v next=%+v sent=%v", target, next, conv.sentTexts())
+	}
+	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: first.ProviderTurnID, TurnState: domain.TurnStateFailed, Err: errors.New("failure projection was delayed")})
 	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
-		current, _ := turnByID(s, accepted.ID)
-		return current.State == domain.TurnStateRunning
+		target, _ := turnByID(s, first.ID)
+		return target.State == domain.TurnStateFailed
 	})
 	retained, _ := turnByID(snapshot, old.ID)
-	if retained.State != domain.TurnStateQueued || !reflect.DeepEqual(conv.sentTexts(), []string{"gone", "next"}) {
-		t.Fatalf("reconciliation discarded queue: retained=%+v sent=%v", retained, conv.sentTexts())
+	next, _ = turnByID(snapshot, accepted.ID)
+	if retained.State != domain.TurnStateQueued || next.State != domain.TurnStateQueued || !reflect.DeepEqual(conv.sentTexts(), []string{"gone"}) {
+		t.Fatalf("delayed failure released work: retained=%+v next=%+v sent=%v", retained, next, conv.sentTexts())
 	}
 }
 
+type reconnectInterruptRecorder struct {
+	*liveReconnectedConversation
+	attempts chan string
+}
+
+func (c *reconnectInterruptRecorder) Interrupt(_ context.Context, target string) error {
+	c.attempts <- target
+	return nil
+}
+
 func TestInterruptAndSendRecoversAcceptedPromptAcrossControllerRestart(t *testing.T) {
-	for _, targetSettled := range []bool{false, true} {
-		t.Run(fmt.Sprintf("target-settled=%v", targetSettled), func(t *testing.T) {
+	for _, mode := range []string{"before-cancellation", "cancellation-delivered", "target-settled"} {
+		t.Run(mode, func(t *testing.T) {
 			st := openStore(t)
 			ctx := context.Background()
 			var ids atomic.Int32
@@ -5950,21 +6043,33 @@ func TestInterruptAndSendRecoversAcceptedPromptAcrossControllerRestart(t *testin
 			if _, err := ctrl.Send(ctx, ports.ChatUserMessage{Text: "older", ClientMessageID: "restart-older", Origin: domain.MessageOriginHuman}); err != nil {
 				t.Fatal(err)
 			}
-			pending, err := ctrl.Send(ctx, ports.ChatUserMessage{Text: "priority", ClientMessageID: "restart-priority", Origin: domain.MessageOriginHuman, InterruptAndSend: true})
-			if err != nil {
-				t.Fatal(err)
+			var pending domain.ConversationTurn
+			if mode == "before-cancellation" {
+				created, err := st.AppendUserMessage(ctx, ctrl.ConversationID(), testSession, ctrl.Generation(), domain.ConversationMessage{
+					ID: "crash-window-message", Text: "priority", Origin: domain.MessageOriginHuman, ClientMessageID: "restart-priority", InterruptTargetProviderTurnID: running.ProviderTurnID,
+				}, "crash-window-turn", time.Now())
+				if err != nil || !created {
+					t.Fatalf("seed durable intake: created=%v err=%v", created, err)
+				}
+				pending.ID = "crash-window-turn"
+			} else {
+				pending, err = ctrl.Send(ctx, ports.ChatUserMessage{Text: "priority", ClientMessageID: "restart-priority", Origin: domain.MessageOriginHuman, InterruptAndSend: true})
+				if err != nil {
+					t.Fatal(err)
+				}
 			}
 			first.StopAll(ctx)
-			if targetSettled {
+			if mode == "target-settled" {
 				if err := st.SettleTurnByID(ctx, running.ID, domain.TurnStateInterrupted, "", time.Now()); err != nil {
 					t.Fatal(err)
 				}
 			}
 			secondProvider := &liveReconnectedConversation{nativeHistoryConversation: &nativeHistoryConversation{fakeConversation: newFakeConversation()}}
 			secondProvider.turnSeq = firstProvider.turnSeq
+			reconnected := &reconnectInterruptRecorder{liveReconnectedConversation: secondProvider, attempts: make(chan string, 4)}
 			second := chatsvc.New(chatsvc.Options{
 				Store: st, Reader: fullSnapshotReader(st), Sessions: st,
-				Drivers: fakeRegistry{driver: fakeDriver{conv: secondProvider}},
+				Drivers: fakeRegistry{driver: fakeDriver{conv: reconnected}},
 				Log:     slog.New(slog.DiscardHandler), NewID: newID,
 			})
 			t.Cleanup(func() { second.StopAll(ctx) })
@@ -5973,11 +6078,17 @@ func TestInterruptAndSendRecoversAcceptedPromptAcrossControllerRestart(t *testin
 			if err != nil {
 				t.Fatal(err)
 			}
-			if targetSettled {
-				if _, err := secondController.Send(ctx, ports.ChatUserMessage{Text: "priority", ClientMessageID: "restart-priority", Origin: domain.MessageOriginHuman, InterruptAndSend: true}); err != nil {
-					t.Fatal(err)
+			if mode == "before-cancellation" {
+				select {
+				case target := <-reconnected.attempts:
+					if target != running.ProviderTurnID {
+						t.Fatalf("recovery retargeted %q", target)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("reconnect did not recover pending cancellation without client resend")
 				}
-			} else {
+			}
+			if mode != "target-settled" {
 				secondProvider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: running.ProviderTurnID, TurnState: domain.TurnStateInterrupted})
 			}
 			h := &harness{st: st, ctrl: secondController}
@@ -6019,6 +6130,19 @@ func TestInterruptAndSendDoesNotDrainAfterTargetFails(t *testing.T) {
 	changedMode := ports.ChatUserMessage{Text: "hold", ClientMessageID: "hold", Origin: domain.MessageOriginHuman}
 	if _, err := h.svc.Send(ctx, testSession, changedMode); !errors.Is(err, domain.ErrClientMessageConflict) {
 		t.Fatalf("mode change under same key = %v, want conflict", err)
+	}
+	later, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "later ordinary turn", ClientMessageID: "later", Origin: domain.MessageOriginHuman})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: later.ProviderTurnID, TurnState: domain.TurnStateCompleted})
+	snapshot = h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		current, _ := turnByID(s, later.ID)
+		return current.State == domain.TurnStateCompleted
+	})
+	held, _ = turnByID(snapshot, accepted.ID)
+	if held.State != domain.TurnStateQueued || !reflect.DeepEqual(conv.sentTexts(), []string{"failing", "later ordinary turn"}) {
+		t.Fatalf("unrelated completion released failed target: held=%+v sent=%v", held, conv.sentTexts())
 	}
 }
 

@@ -805,6 +805,22 @@ func (q *Queries) HasPendingConversationInteractions(ctx context.Context, conver
 	return exists, err
 }
 
+const inheritConversationTurnInterruptDelivered = `-- name: InheritConversationTurnInterruptDelivered :exec
+UPDATE conversation_turns SET interrupt_delivered = TRUE
+WHERE conversation_turns.id = ? AND EXISTS (
+    SELECT 1 FROM conversation_turns previous
+    WHERE previous.conversation_id = conversation_turns.conversation_id
+      AND previous.interrupt_target_provider_turn_id = conversation_turns.interrupt_target_provider_turn_id
+      AND previous.interrupt_delivered = TRUE
+)
+`
+
+// Reuse accepted cancellation of the same exact target for later requests.
+func (q *Queries) InheritConversationTurnInterruptDelivered(ctx context.Context, id string) error {
+	_, err := q.db.ExecContext(ctx, inheritConversationTurnInterruptDelivered, id)
+	return err
+}
+
 const insertConversation = `-- name: InsertConversation :exec
 
 INSERT INTO conversations (
@@ -1244,6 +1260,59 @@ func (q *Queries) InterruptRolledBackQueuedTurns(ctx context.Context, arg Interr
 	return err
 }
 
+const listPendingConversationInterruptTurns = `-- name: ListPendingConversationInterruptTurns :many
+SELECT id, conversation_id, handled_by_session_id, provider_turn_id, controller_generation, state, error_message, requested_at, started_at, completed_at, diff_json, rolled_back_at, plan_json, branch_id, promotion_started_at, promoted_to_turn_id, retry_of_turn_id, handled_by_review_id, interrupt_target_provider_turn_id, interrupt_delivered FROM conversation_turns
+WHERE conversation_id = ? AND state = 'queued'
+  AND promotion_started_at IS NULL AND rolled_back_at IS NULL
+  AND interrupt_target_provider_turn_id <> ''
+ORDER BY requested_at, rowid
+`
+
+// Reconnect recovers every accepted interrupt intent, not just the queue head.
+func (q *Queries) ListPendingConversationInterruptTurns(ctx context.Context, conversationID string) ([]ConversationTurn, error) {
+	rows, err := q.db.QueryContext(ctx, listPendingConversationInterruptTurns, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ConversationTurn{}
+	for rows.Next() {
+		var i ConversationTurn
+		if err := rows.Scan(
+			&i.ID,
+			&i.ConversationID,
+			&i.HandledBySessionID,
+			&i.ProviderTurnID,
+			&i.ControllerGeneration,
+			&i.State,
+			&i.ErrorMessage,
+			&i.RequestedAt,
+			&i.StartedAt,
+			&i.CompletedAt,
+			&i.DiffJson,
+			&i.RolledBackAt,
+			&i.PlanJson,
+			&i.BranchID,
+			&i.PromotionStartedAt,
+			&i.PromotedToTurnID,
+			&i.RetryOfTurnID,
+			&i.HandledByReviewID,
+			&i.InterruptTargetProviderTurnID,
+			&i.InterruptDelivered,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listVisibleRunningTurnsForConversation = `-- name: ListVisibleRunningTurnsForConversation :many
 WITH RECURSIVE active_path(branch_id, max_sequence) AS (
     SELECT conversations.active_branch_id, CAST(NULL AS INTEGER)
@@ -1327,10 +1396,14 @@ func (q *Queries) MarkConversationCompacted(ctx context.Context, arg MarkConvers
 }
 
 const markConversationTurnInterruptDelivered = `-- name: MarkConversationTurnInterruptDelivered :exec
-UPDATE conversation_turns SET interrupt_delivered = TRUE WHERE id = ?
+UPDATE conversation_turns SET interrupt_delivered = TRUE
+WHERE conversation_id = (SELECT target.conversation_id FROM conversation_turns target WHERE target.id = ?1)
+  AND interrupt_target_provider_turn_id <> ''
+  AND interrupt_target_provider_turn_id = (SELECT target.interrupt_target_provider_turn_id FROM conversation_turns target WHERE target.id = ?1)
 `
 
-// Persist provider cancellation acceptance before retry can repeat it.
+// Persist provider cancellation acceptance before retry can repeat it; concurrent
+// requests accepted for this exact target share that acknowledgement.
 func (q *Queries) MarkConversationTurnInterruptDelivered(ctx context.Context, id string) error {
 	_, err := q.db.ExecContext(ctx, markConversationTurnInterruptDelivered, id)
 	return err
