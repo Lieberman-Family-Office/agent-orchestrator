@@ -177,7 +177,7 @@ function latestPendingInteraction(
 			item.kind !== "activity" ||
 			item.activityKind !== activityKind ||
 			item.status !== "pending" ||
-			(item.turnId ? item.turnId !== turn?.id : !turn)
+			(!(activityKind === "user_input" && item.detail?.persistentQuestion) && (item.turnId ? item.turnId !== turn?.id : !turn))
 		) {
 			return latest;
 		}
@@ -407,6 +407,9 @@ export interface ChatWorkspaceProps {
 	onOpenFiles?: () => void;
 	/** Opens the Files inspector focused on one changed path. */
 	onOpenFile?: (path: string, line?: number) => void;
+	onOpenArtifact?: (path:string)=>void;
+	onOpenFileExternal?: (path:string,source:"workspace"|"artifact")=>void;
+	artifactPaths?: string[];
 	/**
 	 * Re-dispatch a failed turn's durable prompt as a new turn. Offered only for
 	 * eligible failed human turns, so the affordance is drawn on the failed-turn
@@ -621,6 +624,9 @@ function ChatWorkspaceContent({
 	rollbackError,
 	onOpenFiles,
 	onOpenFile,
+	onOpenArtifact,
+	onOpenFileExternal,
+	artifactPaths,
 	retryControl,
 	onEditMessage,
 	editMessagePending,
@@ -1267,7 +1273,7 @@ function ChatWorkspaceContent({
 	const composerElicitation = useMemo(
 		() =>
 			stablePendingUserInput ? (
-				<ElicitationDock activity={stablePendingUserInput} onResolve={onResolveInput} />
+				<ElicitationDock key={stablePendingUserInput.id} activity={stablePendingUserInput} onResolve={onResolveInput} />
 			) : undefined,
 		[onResolveInput, stablePendingUserInput],
 	);
@@ -1506,7 +1512,7 @@ function ChatWorkspaceContent({
 						className={cn("flex min-h-0 flex-1 flex-col", conversationEmpty && "justify-center")}
 						data-composer-placement={conversationEmpty ? "center" : "dock"}
 					>
-						<ChatLinkProvider onLinkOpen={onLinkOpen} onFileOpen={onOpenFile} onSessionLinkOpen={onSessionLinkOpen} remoteHost={Boolean(activeRemoteHostId)} workspacePaths={filePaths}>
+						<ChatLinkProvider onLinkOpen={onLinkOpen} onFileOpen={onOpenFile} onArtifactOpen={onOpenArtifact} onFileExternalOpen={onOpenFileExternal} artifactPaths={artifactPaths} onSessionLinkOpen={onSessionLinkOpen} remoteHost={Boolean(activeRemoteHostId)} workspacePaths={filePaths}>
 							<ChatImageSourceProvider sessionId={snapshot.sessionId} assetBaseUrl={assetBaseUrl} remoteHost={Boolean(activeRemoteHostId)}>
 								<Timeline
 									key={draftScopeKey}

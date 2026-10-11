@@ -13,6 +13,7 @@ export const aoBridge: AoBridge =
 			openExternal: async (url: string) => {
 				window.open(url, "_blank", "noopener,noreferrer");
 			},
+			openSessionFile:async()=>{throw new Error("Desktop app is required to open a file in its default app");},
 			scanImportFolder: async ({ path }) => ({ path, repos: [] }),
 			checkAncestorRepo: async () => undefined,
 		getRepositoryBranch: async () => undefined,

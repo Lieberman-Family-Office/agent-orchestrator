@@ -34,6 +34,19 @@ func desktopWorkspaceServer(t *testing.T, svc fakeDesktopWorkspaceService) *http
 	return server
 }
 
+func (f fakeDesktopWorkspaceService) ArtifactLocation(context.Context, domain.SessionID) (string, error) {
+	return f.path, f.err
+}
+
+func TestDesktopArtifactLocationReturnsPathToLoopbackSupervisor(t *testing.T) {
+	server := desktopWorkspaceServer(t, fakeDesktopWorkspaceService{path: "/tmp/ao/artifacts/ao-1"})
+	body, status, headers := doRequest(t, server, http.MethodGet, "/api/v1/desktop/sessions/ao-1/artifacts", "")
+	assertJSON(t, headers)
+	if status != http.StatusOK || !containsAll(body, `"workspacePath":"/tmp/ao/artifacts/ao-1"`) {
+		t.Fatalf("artifact root: status=%d body=%s", status, body)
+	}
+}
+
 func TestDesktopWorkspaceLocationReturnsPathToLoopbackSupervisor(t *testing.T) {
 	server := desktopWorkspaceServer(t, fakeDesktopWorkspaceService{path: "/tmp/ao/worktrees/ao-1"})
 	body, status, headers := doRequest(t, server, http.MethodGet, "/api/v1/desktop/sessions/ao-1/workspace", "")

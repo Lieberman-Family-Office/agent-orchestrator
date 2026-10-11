@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
 )
 
@@ -2693,6 +2694,23 @@ func (s *Store) ResolveApproval(
 	return nil
 }
 
+// ConversationInput reads a question only on the active, undiscarded branch.
+func (s *Store) ConversationInput(ctx context.Context, conversationID, requestID string) (domain.ConversationActivity, error) {
+	row, err := s.qr.SelectConversationInputByRequest(ctx, gen.SelectConversationInputByRequestParams{ConversationID: conversationID, RequestID: requestID})
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.ConversationActivity{}, ports.ErrChatRequestNotPending
+	}
+	return activityToDomain(row), err
+}
+
+// DetachQuestion keeps an unanswered clarification after its provider RPC disappears.
+func (s *Store) DetachQuestion(ctx context.Context, conversationID, requestID string, now time.Time) (bool, error) {
+	q, unlock := s.conversationWriter(ctx)
+	defer unlock()
+	rows, err := q.DetachPersistentConversationQuestion(ctx, gen.DetachPersistentConversationQuestionParams{UpdatedAt: now, ConversationID: conversationID, RequestID: requestID})
+	return rows > 0, err
+}
+
 // HasPendingConversationInteractions reports whether the durable conversation
 // still contains an actionable approval or structured-input request.
 func (s *Store) HasPendingConversationInteractions(ctx context.Context, conversationID string) (bool, error) {
@@ -3196,6 +3214,22 @@ func (s *Store) LoadConversationSnapshotPage(
 		if activityRows[i].Sequence >= oldest && activityRows[i].Sequence > visibleAfterSequence {
 			snapshot.Activities = append(snapshot.Activities, activityToDomain(activityRows[i]))
 		}
+	}
+	if beforeSequence == conv.LatestSequence+1 {
+		questions, err := s.qr.ListPersistentConversationQuestions(ctx, conversationID)
+		if err != nil {
+			return ConversationSnapshot{}, fmt.Errorf("read unanswered questions: %w", err)
+		}
+		seen := make(map[string]bool, len(snapshot.Activities))
+		for _, a := range snapshot.Activities {
+			seen[a.ID] = true
+		}
+		for _, row := range questions {
+			if row.Sequence > visibleAfterSequence && !seen[row.ID] {
+				snapshot.Activities = append(snapshot.Activities, activityToDomain(row))
+			}
+		}
+		sort.Slice(snapshot.Activities, func(i, j int) bool { return snapshot.Activities[i].Sequence < snapshot.Activities[j].Sequence })
 	}
 	return snapshot, nil
 }

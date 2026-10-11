@@ -130,10 +130,28 @@ describe("ChatMarkdown", () => {
 			onFileOpen,
 		);
 
-		await userEvent.click(screen.getByRole("button", { name: "Open backend/service.go in Files" }));
+		await userEvent.click(screen.getByRole("link", { name: "Open backend/service.go in Files" }));
 
 		expect(onFileOpen).toHaveBeenCalledWith("backend/service.go", 42);
 		expect(screen.getByText("--resume").closest("button")).toBeNull();
+	});
+
+	it("opens a known artifact filename in AO and Command-click in its default app", async () => {
+		const onArtifactOpen=vi.fn();
+		const onFileExternalOpen=vi.fn();
+		render(<ChatLinkProvider artifactPaths={["exitclass-pr1-noop-line-draft.txt"]} onArtifactOpen={onArtifactOpen} onFileExternalOpen={onFileExternalOpen}><ChatMarkdown text="My draft is `exitclass-pr1-noop-line-draft.txt`." /></ChatLinkProvider>);
+		const link=screen.getByRole("link",{name:"Open exitclass-pr1-noop-line-draft.txt in Files"});
+		await userEvent.click(link);
+		expect(onArtifactOpen).toHaveBeenCalledWith("exitclass-pr1-noop-line-draft.txt");
+		fireEvent.click(link,{metaKey:true});
+		expect(onFileExternalOpen).toHaveBeenCalledWith("exitclass-pr1-noop-line-draft.txt","artifact");
+		expect(onArtifactOpen).toHaveBeenCalledTimes(1);
+	});
+
+	it("does not guess between a workspace file and artifact with the same filename", () => {
+		render(<ChatLinkProvider workspacePaths={["draft.txt"]} artifactPaths={["draft.txt"]} onFileOpen={vi.fn()} onArtifactOpen={vi.fn()}><ChatMarkdown text="See `draft.txt` and `--resume`." /></ChatLinkProvider>);
+		expect(screen.queryByRole("link")).not.toBeInTheDocument();
+		expect(screen.getByText("draft.txt").tagName).toBe("CODE");
 	});
 
 	it("opens an absolute markdown file link in Files instead of externally", async () => {

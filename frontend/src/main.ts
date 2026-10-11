@@ -160,7 +160,7 @@ import { connectSupervisor, type SupervisorLinkHandle } from "./main/supervisor-
 import { connectBrowserRuntime, type BrowserRuntimeLinkHandle } from "./main/browser-runtime-link";
 import { keepDaemonAlive, shouldLinkOnAttach } from "./main/daemon-owner";
 import { readMigrationState, updateMigration, writeAppStateMarker, type MigrationState } from "./main/app-state";
-import { isAllowedAppExternalURL, openAllowedAppExternalURL } from "./main/external-open";
+import { isAllowedAppExternalURL, openAllowedAppExternalURL,openSessionFileInDefaultApp } from "./main/external-open";
 import {
 	dockBounceType,
 	shouldReplaceBounce,
@@ -938,7 +938,7 @@ function editorStateDir(): string {
 const workspaceCheckUnavailable = (message: string) =>
 	Object.assign(new Error(message), { code: "SERVICE_UNAVAILABLE" });
 
-async function resolveSessionWorkspaceForDesktop(sessionId: string): Promise<string> {
+async function resolveSessionWorkspaceForDesktop(sessionId: string,source:"workspace"|"artifact"="workspace"): Promise<string> {
 	if (daemonStatus.state !== "ready" || !daemonStatus.port) {
 		throw workspaceCheckUnavailable("AO daemon is not ready.");
 	}
@@ -946,7 +946,7 @@ async function resolveSessionWorkspaceForDesktop(sessionId: string): Promise<str
 	const timer = setTimeout(() => controller.abort(), DAEMON_PROBE_TIMEOUT_MS);
 	try {
 		const response = await net.fetch(
-			`http://127.0.0.1:${daemonStatus.port}/api/v1/desktop/sessions/${encodeURIComponent(sessionId)}/workspace`,
+			`http://127.0.0.1:${daemonStatus.port}/api/v1/desktop/sessions/${encodeURIComponent(sessionId)}/${source==="artifact" ? "artifacts" : "workspace"}`,
 			{ signal: controller.signal },
 		).catch((error: unknown) => {
 			if (error instanceof Error && error.name === "AbortError") throw error;
@@ -2010,6 +2010,11 @@ ipcMain.handle("editorHandoff:open", (event, input) => {
 ipcMain.handle("app:getVersion", () => app.getVersion());
 ipcMain.handle("app:openExternal", async (_event, url: string) => {
 	await openAllowedAppExternalURL(url, shell);
+});
+ipcMain.handle("app:openSessionFile",async(event,input)=>{
+	if(event.sender!==getShellWebContents()) throw new Error("Untrusted session file request");
+	if(!input || typeof input!=="object") throw new Error("Invalid session file request");
+	await openSessionFileInDefaultApp(input.sessionId,input.path,input.source,resolveSessionWorkspaceForDesktop,shell);
 });
 
 ipcMain.handle("window:getZoomFactor", () => {

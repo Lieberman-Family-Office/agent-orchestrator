@@ -111,6 +111,8 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 	shellError,
 	onOpenFiles,
 	onOpenFile,
+	onOpenArtifact,
+	onOpenFileExternal,
 	onOpenLinkInBrowser,
 	headerActions,
 	sessionTabAction,
@@ -157,6 +159,8 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 	onOpenFiles?: () => void;
 	/** Opens the Files inspector focused on one changed path. */
 	onOpenFile?: (path: string, line?: number) => void;
+	onOpenArtifact?: (path:string)=>void;
+	onOpenFileExternal?: (path:string,source:"workspace"|"artifact")=>void;
 	/** Opens a chat link in the active blank tab or a new tab in this session's AO Browser. */
 	onOpenLinkInBrowser?: (uri: string) => Promise<void>;
 	headerActions?: ReactNode;
@@ -577,6 +581,9 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 				rollbackError={commands.rollbackError}
 				onOpenFiles={onOpenFiles}
 				onOpenFile={onOpenFile}
+				onOpenArtifact={onOpenArtifact}
+				onOpenFileExternal={onOpenFileExternal}
+				artifactPaths={session.artifactFiles?.map(artifact=>artifact.path)}
 				retryControl={commands.retryControl}
 				onEditMessage={commands.editMessage}
 				editMessagePending={commands.editMessagePending}

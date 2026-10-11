@@ -1731,6 +1731,8 @@ export function SessionView({ sessionId, cloudOrgId, projectId, hostId }: Sessio
 									}
 									onOpenFiles={browserOnly ? undefined : handleOpenFiles}
 									onOpenFile={handleOpenFile}
+									onOpenArtifact={browserOnly ? undefined : (path)=>handleOpenArtifact({path})}
+									onOpenFileExternal={hostId || browserOnly ? undefined : (path,source)=>{void aoBridge.app.openSessionFile({sessionId,path,source}).catch(error=>useUiStore.getState().showGlobalToast("Could not open file",apiErrorMessage(error),{tone:"error"}));}}
 									onOpenLinkInBrowser={browserView.openLink}
 								/>
 								{reviewerChatId ? (

@@ -841,6 +841,112 @@ type ChatInputRequest struct {
 	ElicitationID string
 }
 
+// PersistentQuestion identifies Claude's question form, never tool or URL consent.
+func (r ChatInputRequest) PersistentQuestion() bool {
+	if r.Mode != ChatInputModeForm {
+		return false
+	}
+	properties, _ := r.Schema["properties"].(map[string]any)
+	for _, raw := range properties {
+		property, _ := raw.(map[string]any)
+		meta, _ := property["_meta"].(map[string]any)
+		question, _ := meta["_askUserQuestionCustomAnswer"].(map[string]any)
+		if question["isCustomAnswer"] == true {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateQuestionResponse checks delayed answers against the stored question options.
+func (r ChatInputRequest) ValidateQuestionResponse(response ChatInputResponse) error {
+	if !r.PersistentQuestion() || !response.Action.Valid() {
+		return ErrChatDecisionNotOffered
+	}
+	if response.Action != ChatInputActionAccept {
+		if len(response.Content) != 0 {
+			return ErrChatDecisionNotOffered
+		}
+		return nil
+	}
+	properties, _ := r.Schema["properties"].(map[string]any)
+	for name, raw := range properties {
+		property, _ := raw.(map[string]any)
+		if !strings.HasPrefix(name, "question_") || strings.HasSuffix(name, "_custom") {
+			continue
+		}
+		custom, _ := response.Content[name+"_custom"].(string)
+		if strings.TrimSpace(custom) != "" {
+			continue
+		}
+		value, present := response.Content[name]
+		if !present {
+			return ErrChatDecisionNotOffered
+		}
+		if property["type"] == "string" && value == "" {
+			return ErrChatDecisionNotOffered
+		}
+		if property["type"] == "array" {
+			values, ok := value.([]any)
+			if !ok || len(values) == 0 {
+				return ErrChatDecisionNotOffered
+			}
+		}
+	}
+	for name, value := range response.Content {
+		property, ok := properties[name].(map[string]any)
+		if !ok {
+			return ErrChatDecisionNotOffered
+		}
+		var values []any
+		switch property["type"] {
+		case "string":
+			text, ok := value.(string)
+			if !ok {
+				return ErrChatDecisionNotOffered
+			}
+			values = []any{text}
+		case "array":
+			var ok bool
+			values, ok = value.([]any)
+			if !ok {
+				return ErrChatDecisionNotOffered
+			}
+			property, _ = property["items"].(map[string]any)
+		default:
+			return ErrChatDecisionNotOffered
+		}
+		options, _ := property["oneOf"].([]any)
+		if options == nil {
+			options, _ = property["anyOf"].([]any)
+		}
+		for _, value := range values {
+			text, ok := value.(string)
+			if !ok {
+				return ErrChatDecisionNotOffered
+			}
+			if len(options) == 0 {
+				if !strings.HasSuffix(name, "_custom") {
+					return ErrChatDecisionNotOffered
+				}
+				continue
+			}
+			offered := false
+			for _, raw := range options {
+				option, _ := raw.(map[string]any)
+				if option["const"] == text {
+					offered = true
+					break
+				}
+			}
+			if !offered {
+				return ErrChatDecisionNotOffered
+			}
+		}
+	}
+	return nil
+}
+
 // ChatInputResponder is optional because not every machine protocol supports
 // structured user input. AO gates the route/UI on the negotiated capability.
 type ChatInputResponder interface {

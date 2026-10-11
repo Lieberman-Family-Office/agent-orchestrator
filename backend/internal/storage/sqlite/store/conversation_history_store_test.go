@@ -472,6 +472,37 @@ func TestActivityStreamedTextStopsChangingAfterTruncation(t *testing.T) {
 	}
 }
 
+func TestPersistentQuestionRemainsInLivePageWhileBackgroundHistoryGrows(t *testing.T) {
+	s, session, conversation := conversationFixture(t)
+	ctx := context.Background()
+	created, err := s.AppendUserMessage(ctx, conversation, session, "gen-1", domain.ConversationMessage{ID: "question-work", Text: "work", Origin: domain.MessageOriginHuman}, "question-turn", histClock)
+	if err != nil || !created {
+		t.Fatal(err)
+	}
+	if err := s.BindTurnToProvider(ctx, "question-turn", "question-provider", histClock); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertActivity(ctx, conversation, "question-provider", domain.ConversationActivity{ID: "persistent-question", Kind: domain.ActivityKindUserInput, Status: domain.ActivityStatusPending, RequestID: "persistent-request", Summary: "Question", Detail: []byte(`{"persistentQuestion":true,"providerPending":false}`)}, histClock); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 5 {
+		id := fmt.Sprintf("later-%d", i)
+		if _, err := s.AppendUserMessage(ctx, conversation, session, "gen-1", domain.ConversationMessage{ID: id, Text: id, Origin: domain.MessageOriginAutomation}, id+"-turn", histClock.Add(time.Duration(i+1)*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	page, err := s.LoadConversationSnapshotPage(ctx, conversation, 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Messages) != 2 || page.OldestSequence != 6 {
+		t.Fatalf("history page changed: %+v", page)
+	}
+	if len(page.Activities) != 1 || page.Activities[0].ID != "persistent-question" {
+		t.Fatalf("unanswered question fell out of live page: %+v", page.Activities)
+	}
+}
+
 func TestConversationSnapshotPagesCombinedTimelineBySequence(t *testing.T) {
 	s, session, conversation := conversationFixture(t)
 	ctx := context.Background()

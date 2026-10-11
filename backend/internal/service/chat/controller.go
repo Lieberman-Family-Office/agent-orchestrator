@@ -152,6 +152,8 @@ type Store interface {
 	UpsertActivity(ctx context.Context, conversationID, providerTurnID string, activity domain.ConversationActivity, now time.Time) error
 	MarkCompacted(ctx context.Context, conversationID string, at time.Time) error
 	ResolveApproval(ctx context.Context, conversationID, requestID, detailJSON string, now time.Time) error
+	ConversationInput(ctx context.Context, conversationID, requestID string) (domain.ConversationActivity, error)
+	DetachQuestion(ctx context.Context, conversationID, requestID string, now time.Time) (bool, error)
 	HasPendingConversationInteractions(ctx context.Context, conversationID string) (bool, error)
 	FailPendingApprovals(ctx context.Context, conversationID string, now time.Time) error
 	FailPendingInputs(ctx context.Context, conversationID string, now time.Time) error
@@ -221,6 +223,7 @@ type Controller struct {
 	configMu sync.Mutex
 	// interruptSendMu joins duplicate cancellation attempts without blocking provider projection.
 	interruptSendMu sync.Mutex
+	inputMu         sync.Mutex
 
 	mu sync.Mutex
 	// suppressStoppedActivity marks a deliberate branch-controller retirement.
@@ -2223,12 +2226,61 @@ func (c *Controller) ResolveInput(
 	requestID string,
 	response ports.ChatInputResponse,
 ) error {
+	c.inputMu.Lock()
+	defer c.inputMu.Unlock()
+	activity, loadErr := c.store.ConversationInput(ctx, c.conversation.ID, requestID)
+	if loadErr != nil {
+		return fmt.Errorf("read input %s: %w", requestID, loadErr)
+	}
+	var stored struct {
+		PersistentQuestion bool                  `json:"persistentQuestion"`
+		ProviderPending    bool                  `json:"providerPending"`
+		InputMode          ports.ChatInputMode   `json:"inputMode"`
+		Message            string                `json:"message"`
+		Schema             map[string]any        `json:"schema"`
+		Action             ports.ChatInputAction `json:"action"`
+		Content            map[string]any        `json:"content"`
+	}
+	if err := json.Unmarshal(activity.Detail, &stored); err != nil {
+		return fmt.Errorf("read input detail: %w", err)
+	}
+	if activity.Status == domain.ActivityStatusResolved {
+		old, _ := json.Marshal(ports.ChatInputResponse{Action: stored.Action, Content: stored.Content})
+		current, _ := json.Marshal(response)
+		if bytes.Equal(old, current) {
+			return nil
+		}
+		return domain.ErrClientMessageConflict
+	}
+	if activity.Status != domain.ActivityStatusPending {
+		return ports.ErrChatRequestNotPending
+	}
+	question := ports.ChatInputRequest{Mode: stored.InputMode, Message: stored.Message, Schema: stored.Schema}
+	persistent := stored.PersistentQuestion && c.harness == domain.HarnessClaudeCode && question.PersistentQuestion()
+	if persistent {
+		if err := question.ValidateQuestionResponse(response); err != nil {
+			return err
+		}
+	}
 	responder, ok := c.conv.(ports.ChatInputResponder)
 	if !ok {
 		return fmt.Errorf("%w: structured input", ports.ErrChatUnsupported)
 	}
-	if err := responder.ResolveInput(ctx, requestID, response); err != nil {
-		return fmt.Errorf("resolve input %s: %w", requestID, err)
+	resolveErr := responder.ResolveInput(ctx, requestID, response)
+	if resolveErr != nil {
+		if !persistent || stored.ProviderPending || !errors.Is(resolveErr, ports.ErrChatRequestNotPending) {
+			return fmt.Errorf("resolve input %s: %w", requestID, resolveErr)
+		}
+		if response.Action == ports.ChatInputActionAccept {
+			contextJSON, err := json.Marshal(map[string]any{"message": question.Message, "schema": question.Schema, "answers": response.Content})
+			if err != nil {
+				return err
+			}
+			msg := ports.ChatUserMessage{Text: "Response to an earlier unanswered question (the original tool call was interrupted):\n" + string(contextJSON), Origin: domain.MessageOriginHuman, ClientMessageID: "question-answer/" + requestID}
+			if _, err := c.SteerOrSend(ctx, msg, false); err != nil {
+				return err
+			}
+		}
 	}
 	detail, _ := json.Marshal(map[string]any{
 		"action":  response.Action,
@@ -3208,11 +3260,13 @@ func (c *Controller) apply(ctx context.Context, event ports.ChatEvent) error {
 			return nil
 		}
 		detail, _ := json.Marshal(map[string]any{
-			"inputMode":     event.Input.Mode,
-			"message":       event.Input.Message,
-			"schema":        event.Input.Schema,
-			"url":           event.Input.URL,
-			"elicitationId": event.Input.ElicitationID,
+			"inputMode":          event.Input.Mode,
+			"message":            event.Input.Message,
+			"schema":             event.Input.Schema,
+			"url":                event.Input.URL,
+			"elicitationId":      event.Input.ElicitationID,
+			"persistentQuestion": c.harness == domain.HarnessClaudeCode && event.Input.PersistentQuestion(),
+			"providerPending":    true,
 		})
 		return c.store.UpsertActivity(ctx, c.conversation.ID, event.ProviderTurnID,
 			domain.ConversationActivity{
@@ -3226,6 +3280,12 @@ func (c *Controller) apply(ctx context.Context, event ports.ChatEvent) error {
 			}, now)
 
 	case ports.ChatEventInputResolved:
+		if len(event.Detail) == 0 {
+			detached, err := c.store.DetachQuestion(ctx, c.conversation.ID, event.RequestID, now)
+			if err != nil || detached {
+				return err
+			}
+		}
 		detail := event.Detail
 		if len(detail) == 0 {
 			detail, _ = json.Marshal(map[string]string{"resolvedBy": "provider"})

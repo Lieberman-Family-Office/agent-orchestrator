@@ -25,6 +25,7 @@ type DesktopWorkspaceController struct {
 // Register mounts the desktop-only workspace-location route.
 func (c *DesktopWorkspaceController) Register(r chi.Router) {
 	r.Get("/desktop/sessions/{sessionId}/workspace", c.location)
+	r.Get("/desktop/sessions/{sessionId}/artifacts", c.artifactLocation)
 }
 
 func (c *DesktopWorkspaceController) location(w http.ResponseWriter, r *http.Request) {
@@ -42,4 +43,21 @@ func (c *DesktopWorkspaceController) location(w http.ResponseWriter, r *http.Req
 		SessionID:     id,
 		WorkspacePath: workspacePath,
 	})
+}
+
+func (c *DesktopWorkspaceController) artifactLocation(w http.ResponseWriter, r *http.Request) {
+	svc, ok := c.Svc.(interface {
+		ArtifactLocation(context.Context, domain.SessionID) (string, error)
+	})
+	if !ok {
+		apispec.NotImplemented(w, r, http.MethodGet, "/api/v1/desktop/sessions/{sessionId}/artifacts")
+		return
+	}
+	id := domain.SessionID(chi.URLParam(r, "sessionId"))
+	root, err := svc.ArtifactLocation(r.Context(), id)
+	if err != nil {
+		envelope.WriteError(w, r, err)
+		return
+	}
+	envelope.WriteJSON(w, http.StatusOK, DesktopWorkspaceLocationResponse{SessionID: id, WorkspacePath: root})
 }

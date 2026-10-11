@@ -577,6 +577,30 @@ func (q *Queries) ConversationActivityExistsForProviderItem(ctx context.Context,
 	return exists, err
 }
 
+const detachPersistentConversationQuestion = `-- name: DetachPersistentConversationQuestion :execrows
+UPDATE conversation_activities
+SET detail_json = json_patch(detail_json, '{"providerPending":false}'),
+    revision = revision + 1, updated_at = ?1
+WHERE conversation_id = ?2 AND request_id = ?3
+  AND kind = 'user_input' AND status = 'pending'
+  AND json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.persistentQuestion') = 1
+`
+
+type DetachPersistentConversationQuestionParams struct {
+	UpdatedAt      time.Time
+	ConversationID string
+	RequestID      string
+}
+
+// A cancelled question callback is not a cancelled human decision.
+func (q *Queries) DetachPersistentConversationQuestion(ctx context.Context, arg DetachPersistentConversationQuestionParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, detachPersistentConversationQuestion, arg.UpdatedAt, arg.ConversationID, arg.RequestID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const failOrphanedConversationActivities = `-- name: FailOrphanedConversationActivities :exec
 UPDATE conversation_activities
 SET status = 'failed', revision = revision + 1, updated_at = ?1
@@ -649,6 +673,7 @@ const failPendingConversationInputs = `-- name: FailPendingConversationInputs :e
 UPDATE conversation_activities
 SET status = 'failed', revision = revision + 1, updated_at = ?
 WHERE conversation_id = ? AND kind = 'user_input' AND status = 'pending'
+  AND COALESCE(json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.persistentQuestion'), 0) <> 1
 `
 
 type FailPendingConversationInputsParams struct {
@@ -670,6 +695,7 @@ SET status = 'failed', revision = revision + 1, updated_at = ?1
 WHERE conversation_activities.conversation_id = ?2
   AND kind IN ('approval', 'user_input')
   AND status = 'pending'
+  AND NOT (kind = 'user_input' AND COALESCE(json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.persistentQuestion'), 0) = 1)
   AND turn_id IN (
     SELECT id
     FROM conversation_turns
@@ -698,6 +724,7 @@ SET status = 'failed', revision = revision + 1, updated_at = ?1
 WHERE conversation_activities.conversation_id = ?2
   AND kind IN ('approval', 'user_input')
   AND status = 'pending'
+  AND NOT (kind = 'user_input' AND COALESCE(json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.persistentQuestion'), 0) = 1)
   AND conversation_activities.turn_id IN (
     SELECT conversation_turns.id FROM conversation_turns
     WHERE conversation_turns.conversation_id = ?2
@@ -817,6 +844,8 @@ SELECT EXISTS (
     WHERE conversation_id = ?
       AND kind IN ('approval', 'user_input')
       AND status = 'pending'
+      AND NOT (kind = 'user_input' AND COALESCE(json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.persistentQuestion'), 0) = 1
+               AND json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.providerPending') = 0)
 )
 `
 
@@ -1321,6 +1350,60 @@ func (q *Queries) ListPendingConversationInterruptTurns(ctx context.Context, con
 			&i.HandledByReviewID,
 			&i.InterruptTargetProviderTurnID,
 			&i.InterruptDelivered,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPersistentConversationQuestions = `-- name: ListPersistentConversationQuestions :many
+SELECT a.id, a.conversation_id, a.turn_id, a.sequence, a.revision, a.kind, a.status, a.summary, a.detail_json, a.request_id, a.provider_item_id, a.created_at, a.updated_at, a.command_output, a.command_output_truncated, a.streamed_text, a.streamed_text_truncated, a.branch_id FROM conversation_activities a
+JOIN conversations c ON c.id = a.conversation_id
+LEFT JOIN conversation_turns t ON t.id = a.turn_id
+WHERE a.conversation_id = ? AND a.branch_id = c.active_branch_id
+  AND a.kind = 'user_input' AND a.status = 'pending'
+  AND json_extract(CASE WHEN json_valid(a.detail_json) THEN a.detail_json ELSE '{}' END, '$.persistentQuestion') = 1
+  AND (a.turn_id IS NULL OR (t.rolled_back_at IS NULL AND t.state <> 'cancelled'))
+ORDER BY a.sequence
+`
+
+// Pending clarification remains actionable independently of the history page.
+func (q *Queries) ListPersistentConversationQuestions(ctx context.Context, conversationID string) ([]ConversationActivity, error) {
+	rows, err := q.db.QueryContext(ctx, listPersistentConversationQuestions, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ConversationActivity{}
+	for rows.Next() {
+		var i ConversationActivity
+		if err := rows.Scan(
+			&i.ID,
+			&i.ConversationID,
+			&i.TurnID,
+			&i.Sequence,
+			&i.Revision,
+			&i.Kind,
+			&i.Status,
+			&i.Summary,
+			&i.DetailJson,
+			&i.RequestID,
+			&i.ProviderItemID,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.CommandOutput,
+			&i.CommandOutputTruncated,
+			&i.StreamedText,
+			&i.StreamedTextTruncated,
+			&i.BranchID,
 		); err != nil {
 			return nil, err
 		}
@@ -2520,6 +2603,47 @@ func (q *Queries) SelectConversationEditDelivery(ctx context.Context, arg Select
 		&i.CreatedAt,
 		&i.SettledAt,
 		&i.ProviderWorkStarted,
+	)
+	return i, err
+}
+
+const selectConversationInputByRequest = `-- name: SelectConversationInputByRequest :one
+SELECT a.id, a.conversation_id, a.turn_id, a.sequence, a.revision, a.kind, a.status, a.summary, a.detail_json, a.request_id, a.provider_item_id, a.created_at, a.updated_at, a.command_output, a.command_output_truncated, a.streamed_text, a.streamed_text_truncated, a.branch_id FROM conversation_activities a
+LEFT JOIN conversation_turns t ON t.id = a.turn_id
+JOIN conversations c ON c.id = a.conversation_id
+WHERE a.conversation_id = ? AND a.request_id = ? AND a.kind = 'user_input'
+  AND a.branch_id = c.active_branch_id
+  AND (a.turn_id IS NULL OR (t.rolled_back_at IS NULL AND t.state <> 'cancelled'))
+ORDER BY a.sequence DESC LIMIT 1
+`
+
+type SelectConversationInputByRequestParams struct {
+	ConversationID string
+	RequestID      string
+}
+
+func (q *Queries) SelectConversationInputByRequest(ctx context.Context, arg SelectConversationInputByRequestParams) (ConversationActivity, error) {
+	row := q.db.QueryRowContext(ctx, selectConversationInputByRequest, arg.ConversationID, arg.RequestID)
+	var i ConversationActivity
+	err := row.Scan(
+		&i.ID,
+		&i.ConversationID,
+		&i.TurnID,
+		&i.Sequence,
+		&i.Revision,
+		&i.Kind,
+		&i.Status,
+		&i.Summary,
+		&i.DetailJson,
+		&i.RequestID,
+		&i.ProviderItemID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.CommandOutput,
+		&i.CommandOutputTruncated,
+		&i.StreamedText,
+		&i.StreamedTextTruncated,
+		&i.BranchID,
 	)
 	return i, err
 }

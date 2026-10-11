@@ -94,15 +94,21 @@ const REMOTE_PREVIEW_UNAVAILABLE = "This link points to the remote host. Preview
 const OpenChatLink = createContext<{
 	open?: (url: string) => void;
 	openFile?: (path: string, line?: number) => void;
+	openArtifact?: (path:string) => void;
+	openFileExternal?: (path:string, source:"workspace"|"artifact")=>void;
+	artifactPaths: string[];
 	remoteHost?: boolean;
 	openSession?: (url: string) => void;
 	workspacePaths: string[];
-}>({ workspacePaths: [] });
+}>({ workspacePaths: [], artifactPaths:[] });
 const EMPTY_WORKSPACE_PATHS: string[] = [];
 
 export function ChatLinkProvider({
 	onLinkOpen,
 	onFileOpen,
+	onArtifactOpen,
+	onFileExternalOpen,
+	artifactPaths = EMPTY_WORKSPACE_PATHS,
 	remoteHost,
 	onSessionLinkOpen,
 	workspacePaths = EMPTY_WORKSPACE_PATHS,
@@ -110,14 +116,17 @@ export function ChatLinkProvider({
 }: {
 	onLinkOpen?: (url: string) => void;
 	onFileOpen?: (path: string, line?: number) => void;
+	onArtifactOpen?: (path:string)=>void;
+	onFileExternalOpen?: (path:string,source:"workspace"|"artifact")=>void;
+	artifactPaths?: string[];
 	remoteHost?: boolean;
 	onSessionLinkOpen?: (url: string) => void;
 	workspacePaths?: string[];
 	children: ReactNode;
 }) {
 	const value = useMemo(
-		() => ({ open: onLinkOpen, openFile: onFileOpen, openSession: onSessionLinkOpen, remoteHost, workspacePaths }),
-		[onLinkOpen, onFileOpen, onSessionLinkOpen, remoteHost, workspacePaths],
+		() => ({ open: onLinkOpen, openFile: onFileOpen, openArtifact:onArtifactOpen,openFileExternal:onFileExternalOpen,artifactPaths, openSession: onSessionLinkOpen, remoteHost, workspacePaths }),
+		[onLinkOpen, onFileOpen, onArtifactOpen,onFileExternalOpen,artifactPaths,onSessionLinkOpen, remoteHost, workspacePaths],
 	);
 	return <OpenChatLink.Provider value={value}>{children}</OpenChatLink.Provider>;
 }
@@ -410,29 +419,36 @@ function MermaidFence({ code }: { code: string }) {
 }
 
 function InlineCode({ children }: { children?: ReactNode }) {
-	const { openFile: onFileOpen, workspacePaths } = useContext(OpenChatLink);
+	const { openFile: onFileOpen, openArtifact:onArtifactOpen,openFileExternal:onFileExternalOpen,workspacePaths,artifactPaths,remoteHost } = useContext(OpenChatLink);
 	const insideLink = useContext(InsideMarkdownLink);
 	const text = typeof children === "string" ? children : undefined;
-	const filePath = text && onFileOpen ? findWorkspaceFilePath(text, workspacePaths) : undefined;
+	const workspacePath = text && onFileOpen ? findWorkspaceFilePath(text, workspacePaths) : undefined;
+	const artifactPath = text && onArtifactOpen ? findWorkspaceFilePath(text, artifactPaths) : undefined;
+	const filePath = workspacePath && artifactPath ? undefined : workspacePath ?? artifactPath;
+	const source=artifactPath ? "artifact" : "workspace";
 	const code = (
 		<code className="rounded bg-surface px-[5px] py-[2px] font-mono text-[11.5px] text-markdown-code">
 			{children}
 		</code>
 	);
-	if (!filePath || !onFileOpen || insideLink) return code;
+	if (!filePath || insideLink) return code;
 	return (
-		<button
-			type="button"
-			onClick={() => {
+		<a
+			href={filePath}
+			onClick={(event) => {
+				event.preventDefault();
+				if (event.metaKey && !remoteHost && onFileExternalOpen) {onFileExternalOpen(filePath,source);return;}
+				if(source==="artifact") {onArtifactOpen?.(filePath);return;}
 				const line = workspaceFileReferenceLine(text ?? "");
-				if (line == null) onFileOpen(filePath);
-				else onFileOpen(filePath, line);
+				if (line == null) onFileOpen?.(filePath);
+				else onFileOpen?.(filePath, line);
 			}}
 			aria-label={`Open ${filePath} in Files`}
-			className="inline rounded text-left transition-colors hover:bg-interactive-hover"
+			title={!remoteHost && onFileExternalOpen ? "Click to open in AO; Command-click to open in the default app" : "Open in AO"}
+			className="inline rounded text-left underline decoration-markdown-link/45 underline-offset-2 transition-colors hover:bg-interactive-hover focus-visible:outline-2 focus-visible:outline-ring"
 		>
 			{code}
-		</button>
+		</a>
 	);
 }
 

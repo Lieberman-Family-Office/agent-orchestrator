@@ -287,6 +287,8 @@ export interface CommandDetail {
 
 /** ACP form/URL elicitation projected into a durable AO activity. */
 export interface UserInputDetail {
+	persistentQuestion?: boolean;
+	providerPending?: boolean;
 	inputMode?: "form" | "url";
 	message?: string;
 	schema?: {

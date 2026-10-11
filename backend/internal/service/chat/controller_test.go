@@ -3674,6 +3674,75 @@ func TestApprovalIsStoredPendingWithProviderDecisions(t *testing.T) {
 	}
 }
 
+type cancelledQuestionProvider struct{ *steerRecorder }
+
+func (p *cancelledQuestionProvider) ResolveInput(context.Context, string, ports.ChatInputResponse) error {
+	return ports.ErrChatRequestNotPending
+}
+
+func TestQuestionSurvivesBackgroundCancellationAndAnswerIsDeliveredOnce(t *testing.T) {
+	provider := &cancelledQuestionProvider{steerRecorder: newSteerRecorder()}
+	h := newHarnessWithConversationAndStoreForHarness(t, provider, func(st *sqlite.Store) chatsvc.Store { return st }, domain.HarnessClaudeCode)
+	ctx := context.Background()
+	turn, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "work", ClientMessageID: "question-work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: turn.ProviderTurnID})
+	schema := map[string]any{"type": "object", "properties": map[string]any{
+		"question_0":        map[string]any{"type": "string", "title": "Choice", "description": "Which approach?", "oneOf": []any{map[string]any{"const": "native", "title": "Native"}}},
+		"question_0_custom": map[string]any{"type": "string", "_meta": map[string]any{"_askUserQuestionCustomAnswer": map[string]any{"isCustomAnswer": true, "questionId": "question_0"}}},
+	}}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventInputRequested, ProviderTurnID: turn.ProviderTurnID, RequestID: "question-1", Input: &ports.ChatInputRequest{Mode: ports.ChatInputModeForm, Message: "Which approach?", Schema: schema}})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Activities) == 1 && s.Activities[0].Status == domain.ActivityStatusPending
+	})
+	update := ports.ChatUserMessage{Text: "worker finished", ClientMessageID: "question-worker-update", Origin: domain.MessageOriginAutomation}
+	if _, err := h.ctrl.SteerOrSend(ctx, update, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(provider.steers()) != 1 {
+		t.Fatal("background update did not reach agent")
+	}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventInputResolved, RequestID: "question-1"}, ports.ChatEvent{Kind: ports.ChatEventActivityStarted, ProviderTurnID: turn.ProviderTurnID, ProviderItemID: "after-question-cancel", ActivityKind: domain.ActivityKindSystem, ActivityStatus: domain.ActivityStatusRunning, Summary: "cancellation projected"})
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		for _, activity := range s.Activities {
+			if activity.Summary == "cancellation projected" {
+				return true
+			}
+		}
+		return false
+	})
+	for _, activity := range snapshot.Activities {
+		if activity.RequestID == "question-1" && activity.Status != domain.ActivityStatusPending {
+			t.Fatalf("background cancellation removed unanswered question: %+v", activity)
+		}
+	}
+	for _,invalid:=range []ports.ChatInputResponse{{Action:ports.ChatInputActionAccept},{Action:ports.ChatInputActionAccept,Content:map[string]any{"question_0":"invented"}},{Action:ports.ChatInputActionAccept,Content:map[string]any{"unknown":"native"}}} {
+		if err:=h.ctrl.ResolveInput(ctx,"question-1",invalid);!errors.Is(err,ports.ErrChatDecisionNotOffered) {t.Fatalf("invalid delayed answer accepted: %v",err)}
+	}
+	answer := ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"question_0": "native"}}
+	if err := h.ctrl.ResolveInput(ctx, "question-1", answer); err != nil {
+		t.Fatalf("answer after cancellation: %v", err)
+	}
+	if err := h.ctrl.ResolveInput(ctx, "question-1", answer); err != nil {
+		t.Fatalf("safe duplicate answer: %v", err)
+	}
+	if err:=h.ctrl.ResolveInput(ctx,"question-1",ports.ChatInputResponse{Action:ports.ChatInputActionAccept,Content:map[string]any{"question_0_custom":"different"}});!errors.Is(err,domain.ErrClientMessageConflict) {t.Fatalf("answered question changed: %v",err)}
+	steers := provider.steers()
+	if len(steers) != 2 || steers[1].msg.Origin != domain.MessageOriginHuman || !strings.Contains(steers[1].msg.Text, "Which approach?") || !strings.Contains(steers[1].msg.Text, "native") {
+		t.Fatalf("question answer attribution or idempotency failed: %+v", steers)
+	}
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		for _, a := range s.Activities {
+			if a.RequestID == "question-1" {
+				return a.Status == domain.ActivityStatusResolved
+			}
+		}
+		return false
+	})
+}
+
 func TestResolvingOneOfMultipleApprovalsKeepsWaitingInput(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()

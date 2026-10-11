@@ -1134,6 +1134,18 @@ describe("ChatWorkspace timeline", () => {
 		).not.toBeInTheDocument();
 	});
 
+	it("keeps a detached question answerable across a new running turn", () => {
+		const snapshot=withUserInput("pending");
+		const question=snapshot.items.find(item=>item.kind==="activity" && item.activityKind==="user_input");
+		if(question?.kind!=="activity") throw new Error("question fixture missing");
+		question.detail={...question.detail,persistentQuestion:true,providerPending:false};
+		snapshot.turns=snapshot.turns.map(turn=>({...turn,state:"completed" as const}));
+		snapshot.turns.push({id:"next-turn",state:"running",requestedAt:"2026-10-11T12:00:00Z"});
+		render(<ChatWorkspace snapshot={snapshot} onResolveInput={vi.fn()} />);
+		expect(screen.getByRole("group",{name:"Agent question"})).toBeInTheDocument();
+		expect(screen.getByText("The original tool call ended. Your answer will be sent as a new human message.")).toBeInTheDocument();
+	});
+
 	it("leaves nothing behind once a question is answered", () => {
 		render(<ChatWorkspace snapshot={withUserInput("completed")} onResolveInput={vi.fn()} />);
 

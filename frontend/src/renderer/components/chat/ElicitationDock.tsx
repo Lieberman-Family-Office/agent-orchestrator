@@ -52,6 +52,9 @@ export function ElicitationDock({
 			data-testid="elicitation-dock"
 			className="elicitation-dock overflow-hidden rounded-[var(--radius-chat-composer)] border border-border-strong bg-surface shadow-sm"
 		>
+			{activity.detail?.persistentQuestion && activity.detail?.providerPending === false ? (
+				<p className="px-3 pt-2 text-xs text-muted-foreground">The original tool call ended. Your answer will be sent as a new human message.</p>
+			) : null}
 			{activity.detail?.inputMode === "url" ? (
 				<URLRequest activity={activity} disabled={submitting || unavailable} onResolve={resolve} />
 			) : (

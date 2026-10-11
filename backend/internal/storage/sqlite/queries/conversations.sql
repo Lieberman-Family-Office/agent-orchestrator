@@ -1190,6 +1190,35 @@ WHERE conversation_id = sqlc.arg(conversation_id)
   AND request_id = sqlc.arg(request_id)
   AND status = 'pending';
 
+-- name: SelectConversationInputByRequest :one
+SELECT a.* FROM conversation_activities a
+LEFT JOIN conversation_turns t ON t.id = a.turn_id
+JOIN conversations c ON c.id = a.conversation_id
+WHERE a.conversation_id = ? AND a.request_id = ? AND a.kind = 'user_input'
+  AND a.branch_id = c.active_branch_id
+  AND (a.turn_id IS NULL OR (t.rolled_back_at IS NULL AND t.state <> 'cancelled'))
+ORDER BY a.sequence DESC LIMIT 1;
+
+-- Pending clarification remains actionable independently of the history page.
+-- name: ListPersistentConversationQuestions :many
+SELECT a.* FROM conversation_activities a
+JOIN conversations c ON c.id = a.conversation_id
+LEFT JOIN conversation_turns t ON t.id = a.turn_id
+WHERE a.conversation_id = ? AND a.branch_id = c.active_branch_id
+  AND a.kind = 'user_input' AND a.status = 'pending'
+  AND json_extract(CASE WHEN json_valid(a.detail_json) THEN a.detail_json ELSE '{}' END, '$.persistentQuestion') = 1
+  AND (a.turn_id IS NULL OR (t.rolled_back_at IS NULL AND t.state <> 'cancelled'))
+ORDER BY a.sequence;
+
+-- A cancelled question callback is not a cancelled human decision.
+-- name: DetachPersistentConversationQuestion :execrows
+UPDATE conversation_activities
+SET detail_json = json_patch(detail_json, '{"providerPending":false}'),
+    revision = revision + 1, updated_at = sqlc.arg(updated_at)
+WHERE conversation_id = sqlc.arg(conversation_id) AND request_id = sqlc.arg(request_id)
+  AND kind = 'user_input' AND status = 'pending'
+  AND json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.persistentQuestion') = 1;
+
 -- name: HasPendingConversationInteractions :one
 SELECT EXISTS (
     SELECT 1
@@ -1197,6 +1226,8 @@ SELECT EXISTS (
     WHERE conversation_id = ?
       AND kind IN ('approval', 'user_input')
       AND status = 'pending'
+      AND NOT (kind = 'user_input' AND COALESCE(json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.persistentQuestion'), 0) = 1
+               AND json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.providerPending') = 0)
 );
 
 -- Any approval still pending when a controller dies can never be answered: the
@@ -1212,7 +1243,8 @@ WHERE conversation_id = ? AND kind = 'approval' AND status = 'pending';
 -- name: FailPendingConversationInputs :exec
 UPDATE conversation_activities
 SET status = 'failed', revision = revision + 1, updated_at = ?
-WHERE conversation_id = ? AND kind = 'user_input' AND status = 'pending';
+WHERE conversation_id = ? AND kind = 'user_input' AND status = 'pending'
+  AND COALESCE(json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.persistentQuestion'), 0) <> 1;
 
 -- A project conversation can move to a new orchestrator while the old provider
 -- stream is still closing. Settle only requests owned by turns from that old
@@ -1223,6 +1255,7 @@ SET status = 'failed', revision = revision + 1, updated_at = sqlc.arg(updated_at
 WHERE conversation_activities.conversation_id = sqlc.arg(target_conversation_id)
   AND kind IN ('approval', 'user_input')
   AND status = 'pending'
+  AND NOT (kind = 'user_input' AND COALESCE(json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.persistentQuestion'), 0) = 1)
   AND turn_id IN (
     SELECT id
     FROM conversation_turns
@@ -1236,6 +1269,7 @@ SET status = 'failed', revision = revision + 1, updated_at = sqlc.arg(updated_at
 WHERE conversation_activities.conversation_id = sqlc.arg(conversation_id)
   AND kind IN ('approval', 'user_input')
   AND status = 'pending'
+  AND NOT (kind = 'user_input' AND COALESCE(json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.persistentQuestion'), 0) = 1)
   AND conversation_activities.turn_id IN (
     SELECT conversation_turns.id FROM conversation_turns
     WHERE conversation_turns.conversation_id = sqlc.arg(conversation_id)
