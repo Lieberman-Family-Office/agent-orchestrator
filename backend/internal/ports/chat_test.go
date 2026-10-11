@@ -27,6 +27,53 @@ func TestChatProviderFailureNormalizesProviderCopy(t *testing.T) {
 	}
 }
 
+func TestPersistentQuestionBindsEveryCustomAnswer(t *testing.T) {
+	question := map[string]any{"type": "string", "oneOf": []any{map[string]any{"const": "native"}}}
+	custom := map[string]any{"type": "string", "_meta": map[string]any{"_askUserQuestionCustomAnswer": map[string]any{"isCustomAnswer": true, "questionId": "question_0"}}}
+	for _, tc := range []struct {
+		name       string
+		properties map[string]any
+		persistent bool
+	}{
+		{"complete", map[string]any{"question_0": question, "question_0_custom": custom}, true},
+		{"orphan custom", map[string]any{"question_0_custom": custom}, false},
+		{"wrong binding", map[string]any{"question_1": question, "question_1_custom": custom}, false},
+		{"unmarked custom", map[string]any{"question_0": question, "question_0_custom": map[string]any{"type": "string"}}, false},
+		{"extra consent field", map[string]any{"question_0": question, "question_0_custom": custom, "permission": map[string]any{"type": "boolean"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := ChatInputRequest{Mode: ChatInputModeForm, Schema: map[string]any{"type": "object", "properties": tc.properties}}
+			if got := request.PersistentQuestion(); got != tc.persistent {
+				t.Fatalf("persistent=%v want=%v", got, tc.persistent)
+			}
+		})
+	}
+	request := ChatInputRequest{Mode: ChatInputModeForm, Schema: map[string]any{"type": "object", "properties": map[string]any{"question_0": question, "question_0_custom": custom}}}
+	for _, tc := range []struct {
+		name    string
+		content map[string]any
+		valid   bool
+	}{
+		{"offered", map[string]any{"question_0": "native"}, true},
+		{"custom", map[string]any{"question_0_custom": "my answer"}, true},
+		{"empty", map[string]any{}, false},
+		{"blank custom", map[string]any{"question_0_custom": " "}, false},
+		{"unoffered", map[string]any{"question_0": "invented"}, false},
+		{"unknown custom", map[string]any{"question_0": "native", "other_custom": "answer"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := request.ValidateQuestionResponse(ChatInputResponse{Action: ChatInputActionAccept, Content: tc.content})
+			if (err == nil) != tc.valid {
+				t.Fatalf("valid=%v error=%v", tc.valid, err)
+			}
+		})
+	}
+	request.Mode = ChatInputModeURL
+	if request.PersistentQuestion() {
+		t.Fatal("URL consent classified as a persistent question")
+	}
+}
+
 func TestMissingCapabilitiesForPermissions(t *testing.T) {
 	caps := ChatCapabilities{
 		ChatCapabilityStreaming: true,

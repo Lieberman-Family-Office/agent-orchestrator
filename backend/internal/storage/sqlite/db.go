@@ -4,6 +4,7 @@
 package sqlite
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"embed"
@@ -297,6 +298,9 @@ func migrate(db *sql.DB) error {
 	if err := goose.SetDialect("sqlite3"); err != nil {
 		return fmt.Errorf("set goose dialect: %w", err)
 	}
+	if err := repairCustom0134MigrationHistory(db); err != nil {
+		return fmt.Errorf("repair custom 0.13.4 migration history: %w", err)
+	}
 	if err := repairRenumberedAgentInstallJobsMigrationHistory(db); err != nil {
 		return fmt.Errorf("repair renumbered agent-install-jobs migration history: %w", err)
 	}
@@ -362,6 +366,97 @@ func migrate(db *sql.DB) error {
 		return fmt.Errorf("run migrations: %w", err)
 	}
 	return reconcileSchema(db)
+}
+
+// repairCustom0134MigrationHistory supersedes the installed custom 190/191
+// identities with 195/196 before applying upstream's distinct 190/191 schema.
+// The custom SQL bodies are unchanged. Ambiguous or partial schema is refused.
+func repairCustom0134MigrationHistory(db *sql.DB) error {
+	var exists int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name='goose_db_version' AND type='table'`).Scan(&exists); err != nil || exists == 0 {
+		return err
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, migration := range []struct {
+		old, next                       int
+		file, presence, valid, upstream string
+	}{
+		{190, 195, "0195_project_revision.sql",
+			`SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name='revision'`,
+			`SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name='revision' AND upper(type)='INTEGER' AND "notnull"=1 AND dflt_value='0' AND pk=0`,
+			`SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='hibernated_at'`},
+		{191, 196, "0196_interrupt_and_send.sql",
+			`SELECT COUNT(*) FROM pragma_table_info('conversation_turns') WHERE name IN ('interrupt_target_provider_turn_id','interrupt_delivered')`,
+			`SELECT COUNT(*) FROM pragma_table_info('conversation_turns') WHERE "notnull"=1 AND pk=0 AND ((name='interrupt_target_provider_turn_id' AND upper(type)='TEXT' AND dflt_value="''") OR (name='interrupt_delivered' AND upper(type)='BOOLEAN' AND upper(dflt_value)='FALSE'))`,
+			`SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='branch_state'`},
+	} {
+		var present, valid, upstream, old, next int
+		if err := tx.QueryRow(migration.presence).Scan(&present); err != nil {
+			return err
+		}
+		if present == 0 {
+			continue
+		}
+		want := migration.next - 194
+		if err := tx.QueryRow(migration.valid).Scan(&valid); err != nil {
+			return err
+		}
+		if present != want || valid != want {
+			return fmt.Errorf("custom migration %d has incomplete or incompatible columns", migration.old)
+		}
+		if migration.old == 190 {
+			var schema string
+			if err := tx.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='projects'`).Scan(&schema); err != nil {
+				return err
+			}
+			if !strings.Contains(strings.Join(strings.Fields(schema), " "), "CHECK (typeof(revision) = 'integer' AND revision >= 0)") {
+				return errors.New("custom project revision constraint is incompatible")
+			}
+			body, err := migrationsFS.ReadFile("migrations/" + migration.file)
+			if err != nil {
+				return err
+			}
+			for _, name := range []string{"projects_revision_guard", "projects_revision_update"} {
+				start := bytes.Index(body, []byte("CREATE TRIGGER "+name+"\n"))
+				if start < 0 {
+					return fmt.Errorf("custom migration lacks trigger %s", name)
+				}
+				expected := strings.TrimSpace(strings.Split(string(body)[start:], "-- +goose StatementEnd")[0])
+				var actual string
+				if err := tx.QueryRow(`SELECT sql FROM sqlite_master WHERE type='trigger' AND name=? AND tbl_name='projects'`, name).Scan(&actual); err != nil {
+					return fmt.Errorf("read custom trigger %s: %w", name, err)
+				}
+				if strings.Join(strings.Fields(strings.TrimSuffix(actual, ";")), " ") != strings.Join(strings.Fields(strings.TrimSuffix(expected, ";")), " ") {
+					return fmt.Errorf("custom trigger %s is incompatible", name)
+				}
+			}
+		}
+		for _, item := range []struct {
+			version int
+			value   *int
+		}{{migration.old, &old}, {migration.next, &next}} {
+			if err := tx.QueryRow(`SELECT COALESCE((SELECT is_applied FROM goose_db_version WHERE version_id=? ORDER BY id DESC LIMIT 1),0)`, item.version).Scan(item.value); err != nil {
+				return err
+			}
+		}
+		if next == 1 {
+			continue
+		}
+		if err := tx.QueryRow(migration.upstream).Scan(&upstream); err != nil {
+			return err
+		}
+		if old != 1 || upstream != 0 {
+			return fmt.Errorf("custom migration %d identity is ambiguous", migration.old)
+		}
+		if _, err := tx.Exec(`UPDATE goose_db_version SET version_id=? WHERE version_id=?`, migration.next, migration.old); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // repairRenumberedCueMigrationHistory preserves preview Cue databases that
@@ -1246,6 +1341,19 @@ func repairRenumberedChatMigrationHistory(db *sql.DB) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Earlier dev builds used 0179-0181 for hibernation. Move that physical
+	// schema to 0190 so main's sender metadata, startup steps, and artifacts apply.
+	if _, err := tx.Exec(`
+UPDATE goose_db_version SET version_id = 190
+WHERE is_applied = 1
+  AND EXISTS (SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'hibernated_at')
+  AND ((version_id = 179 AND NOT EXISTS (SELECT 1 FROM pragma_table_info('conversation_messages') WHERE name = 'sender_session_id'))
+    OR (version_id = 180 AND NOT EXISTS (SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'provision_steps'))
+    OR (version_id = 181 AND NOT EXISTS (SELECT 1 FROM pragma_table_info('sessions') WHERE name IN ('artifact_dir', 'startup_cue_json'))))
+  AND NOT EXISTS (SELECT 1 FROM goose_db_version WHERE version_id = 190)`); err != nil {
+		return err
+	}
+
 	legacyApplied := false
 	for oldVersion := int64(52); oldVersion <= 65; oldVersion++ {
 		var applied int
@@ -2103,9 +2211,12 @@ func reconcileHarnessConstraint(db *sql.DB) error {
 	needsOMP := !strings.Contains(schema, "'omp'")
 	needsGemini := !strings.Contains(schema, "'gemini'")
 	needsUnreal := !strings.Contains(schema, "'unreal-agent'")
+	needsCodewhale := !strings.Contains(schema, "'codewhale'")
 	needsMiMo := !strings.Contains(schema, "'mimo-code'")
 	needsDeepSeek := !strings.Contains(schema, "'deepseek-harness'")
-	if !needsMuse && !needsKimchi && !needsPrimeAgent && !needsOMP && !needsGemini && !needsUnreal && !needsMiMo && !needsDeepSeek {
+	needsOpenHands := !strings.Contains(schema, "'openhands'")
+	needsCommandCode := !strings.Contains(schema, "'command-code'")
+	if !needsMuse && !needsKimchi && !needsPrimeAgent && !needsOMP && !needsGemini && !needsUnreal && !needsCodewhale && !needsMiMo && !needsDeepSeek && !needsOpenHands && !needsCommandCode {
 		return nil
 	}
 	if _, err := db.Exec(`PRAGMA writable_schema = ON`); err != nil {
@@ -2198,6 +2309,27 @@ func reconcileHarnessConstraint(db *sql.DB) error {
 		// instead of enumerating the shapes repaired above.
 		repairs = append(repairs, replacement{"'fake'))", "'deepseek-harness', 'fake'))"})
 	}
+	if needsOpenHands {
+		// Migration 0192 rewrites the current constraint variants by exact
+		// string. A database that skipped an earlier harness migration matches
+		// none of them, so it reaches this repair with the harness list still
+		// missing entries; goose has already run, so nothing else adds this
+		// harness. Every variant ends with the retained 'fake' fixture harness,
+		// so anchor there instead of enumerating the shapes repaired above.
+		// This runs after the DeepSeek repair, so a database missing both gets
+		// 'deepseek-harness', 'openhands', 'fake' in that order.
+		repairs = append(repairs, replacement{"'fake'))", "'openhands', 'fake'))"})
+	}
+	if needsCodewhale {
+		repairs = append(repairs, replacement{"'fake'))", "'codewhale', 'fake'))"})
+	}
+	if needsCommandCode {
+		// Migration 0194 rewrites the constraint by anchoring on the retained
+		// 'fake' fixture harness, for the same reason as DeepSeek above. A
+		// database that skipped an earlier harness migration reaches this repair
+		// without Command Code, so anchor there instead of enumerating shapes.
+		repairs = append(repairs, replacement{"'fake'))", "'command-code', 'fake'))"})
+	}
 	for _, r := range repairs {
 		if _, err := db.Exec(
 			`UPDATE sqlite_master
@@ -2240,6 +2372,15 @@ WHERE type = 'table' AND name = 'sessions'`,
 	}
 	if !strings.Contains(schema, "'deepseek-harness'") {
 		return fmt.Errorf("schema repair: sessions harness constraint is missing DeepSeek Harness and did not match known pre-DeepSeek schema")
+	}
+	if !strings.Contains(schema, "'codewhale'") {
+		return fmt.Errorf("schema repair: sessions harness constraint is missing Codewhale")
+	}
+	if !strings.Contains(schema, "'openhands'") {
+		return fmt.Errorf("schema repair: sessions harness constraint is missing OpenHands and did not match known pre-OpenHands schema")
+	}
+	if !strings.Contains(schema, "'command-code'") {
+		return fmt.Errorf("schema repair: sessions harness constraint is missing Command Code and did not match known pre-Command-Code schema")
 	}
 	return nil
 }

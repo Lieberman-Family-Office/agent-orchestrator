@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/store"
 )
@@ -472,6 +474,89 @@ func TestActivityStreamedTextStopsChangingAfterTruncation(t *testing.T) {
 	}
 }
 
+func TestPersistentQuestionLookupMatchesVisibleBranchLineage(t *testing.T) {
+	for _, cutoff := range []int64{0, 1} {
+		t.Run(fmt.Sprint(cutoff), func(t *testing.T) {
+			s, session, conversation := conversationFixture(t)
+			ctx := context.Background()
+			question := domain.ConversationActivity{ID: "ancestor-question", Kind: domain.ActivityKindUserInput, Status: domain.ActivityStatusPending, RequestID: "ancestor-request", Detail: []byte(`{"persistentQuestion":true,"providerPending":false}`)}
+			if err := s.UpsertActivity(ctx, conversation, "", question, histClock); err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := s.LoadConversationSnapshot(ctx, conversation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.CreateAndActivateConversationBranch(ctx, session, domain.ConversationBranch{ID: "child", ConversationID: conversation, ParentBranchID: snapshot.ActiveBranch.ID, ForkAfterSequence: cutoff, ProviderConversationID: "child-provider", ProviderScopeID: "child"}, "gen-2", histClock.Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.UpsertActivity(ctx, conversation, "", domain.ConversationActivity{ID: "child-update", Kind: domain.ActivityKindSystem, Status: domain.ActivityStatusCompleted, Summary: "newer worker update"}, histClock.Add(2*time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			_, lookupErr := s.ConversationInput(ctx, conversation, question.RequestID)
+			page, err := s.LoadConversationSnapshotPage(ctx, conversation, 0, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			visible := false
+			for _, activity := range page.Activities {
+				visible = visible || activity.RequestID == question.RequestID
+			}
+			if cutoff == 1 && (lookupErr != nil || !visible) {
+				t.Fatalf("inherited question not answerable and visible: visible=%v error=%v", visible, lookupErr)
+			}
+			if cutoff == 0 && (!errors.Is(lookupErr, ports.ErrChatRequestNotPending) || visible) {
+				t.Fatalf("excluded question crossed fork cutoff: visible=%v error=%v", visible, lookupErr)
+			}
+		})
+	}
+}
+
+func TestPersistentQuestionReplayPreservesOneResolvedAnswer(t *testing.T) {
+	s, _, conversation := conversationFixture(t)
+	ctx := context.Background()
+	question := domain.ConversationActivity{ID: "question-first", Kind: domain.ActivityKindUserInput, Status: domain.ActivityStatusPending, RequestID: "stable-request", Detail: []byte(`{"persistentQuestion":true,"providerPending":true}`)}
+	if err := s.UpsertActivity(ctx, conversation, "", question, histClock); err != nil {
+		t.Fatal(err)
+	}
+	question.ID = "question-replay"
+	if err := s.UpsertActivity(ctx, conversation, "", question, histClock.Add(time.Second)); err != nil {
+		t.Fatalf("parked request replay: %v", err)
+	}
+	if err := s.ResolveApproval(ctx, conversation, question.RequestID, `{"action":"accept","content":{"question_0":"native"}}`, histClock.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertActivity(ctx, conversation, "", question, histClock.Add(3*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	activity, err := s.ConversationInput(ctx, conversation, question.RequestID)
+	if err != nil || activity.Status != domain.ActivityStatusResolved || !strings.Contains(string(activity.Detail), `"native"`) {
+		t.Fatalf("replay changed resolved answer: activity=%+v error=%v", activity, err)
+	}
+	snapshot, err := s.LoadConversationSnapshot(ctx, conversation)
+	if err != nil || len(snapshot.Activities) != 1 {
+		t.Fatalf("duplicate question activity: activities=%+v error=%v", snapshot.Activities, err)
+	}
+}
+
+func TestEndedQuestionCallbackDetachesWithoutResolving(t *testing.T) {
+	s, _, conversation := conversationFixture(t)
+	ctx := context.Background()
+	if err := s.UpsertActivity(ctx, conversation, "", domain.ConversationActivity{ID: "ended-question", Kind: domain.ActivityKindUserInput, Status: domain.ActivityStatusPending, RequestID: "ended-request", Detail: []byte(`{"persistentQuestion":true,"providerPending":true}`)}, histClock); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FailPendingInputs(ctx, conversation, histClock.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	activity, err := s.ConversationInput(ctx, conversation, "ended-request")
+	var detail struct {
+		ProviderPending bool `json:"providerPending"`
+	}
+	if err != nil || json.Unmarshal(activity.Detail, &detail) != nil || activity.Status != domain.ActivityStatusPending || detail.ProviderPending {
+		t.Fatalf("ended callback left unanswerable question: activity=%+v error=%v", activity, err)
+	}
+}
+
 func TestPersistentQuestionRemainsInLivePageWhileBackgroundHistoryGrows(t *testing.T) {
 	s, session, conversation := conversationFixture(t)
 	ctx := context.Background()
@@ -564,6 +649,12 @@ func TestProjectConversationPageStartsAtCurrentContextReset(t *testing.T) {
 	}, histClock.Add(2*time.Second)); err != nil {
 		t.Fatalf("append old activity: %v", err)
 	}
+	if err := s.UpsertActivity(ctx, conversation.ID, "", domain.ConversationActivity{
+		ID: "old-question", Kind: domain.ActivityKindUserInput, Status: domain.ActivityStatusPending,
+		RequestID: "old-question-request", Detail: []byte(`{"persistentQuestion":true,"providerPending":false}`),
+	}, histClock.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
 
 	secondRecord := sampleRecord("project-reset")
 	secondRecord.Kind = domain.KindOrchestrator
@@ -587,6 +678,9 @@ func TestProjectConversationPageStartsAtCurrentContextReset(t *testing.T) {
 	if len(pending.Messages) != 0 || len(pending.Activities) != 0 || len(pending.Turns) != 0 || pending.HasMoreBefore {
 		t.Fatalf("pending reset page = messages %#v activities %#v turns %#v hasMore %v, want empty",
 			pending.Messages, pending.Activities, pending.Turns, pending.HasMoreBefore)
+	}
+	if _, err := s.ConversationInput(ctx, conversation.ID, "old-question-request"); !errors.Is(err, ports.ErrChatRequestNotPending) {
+		t.Fatalf("hidden question remained answerable after owner reset: %v", err)
 	}
 	if err := s.UpsertActivity(ctx, conversation.ID, "", domain.ConversationActivity{
 		ID: "context-reset", Kind: domain.ActivityKindSystem, Status: domain.ActivityStatusCompleted,

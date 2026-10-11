@@ -178,7 +178,7 @@ func approvalToolDetail(tool acpsdk.ToolCallUpdate, activityKind domain.Activity
 		"subjectKind": string(activityKind),
 	}
 	if tool.RawInput != nil {
-		detail["input"] = tool.RawInput
+		detail["input"] = cappedInput(tool.RawInput)
 	}
 	if claude := nestedMap(tool.Meta, "claudeCode"); claude != nil {
 		copyDetail(detail, claude, "toolName", "providerToolName")
@@ -270,6 +270,7 @@ func (c *conversation) requestInput(
 	close(parked.ready)
 	if hasAccepted && accepted.Kind == persistentInteractionInput {
 		c.emit(persistentInteractionEvent(accepted))
+		parked.resolved = true
 		parked.result <- *accepted.Input
 	}
 
@@ -278,16 +279,20 @@ func (c *conversation) requestInput(
 	case response := <-parked.result:
 		return response, nil
 	case <-ctx.Done():
-		c.discardInput(requestID)
-		if !c.providerDetaching() {
-			c.emit(ports.ChatEvent{Kind: ports.ChatEventInputResolved, RequestID: requestID})
-		}
-		return ports.ChatInputResponse{Action: ports.ChatInputActionCancel}, nil
 	case <-timer:
-		c.discardInput(requestID)
-		c.emit(ports.ChatEvent{Kind: ports.ChatEventInputResolved, RequestID: requestID})
-		return ports.ChatInputResponse{Action: ports.ChatInputActionCancel}, nil
 	}
+	parked.mu.Lock()
+	if parked.resolved {
+		parked.mu.Unlock()
+		return <-parked.result, nil
+	}
+	parked.resolved = true
+	c.discardInput(requestID)
+	parked.mu.Unlock()
+	if !c.providerDetaching() {
+		c.emit(ports.ChatEvent{Kind: ports.ChatEventInputResolved, RequestID: requestID})
+	}
+	return ports.ChatInputResponse{Action: ports.ChatInputActionCancel}, nil
 }
 
 func (c *conversation) providerDetaching() bool {
@@ -318,31 +323,29 @@ func (c *conversation) ResolveInput(
 		return err
 	}
 	c.mu.Lock()
-	request, ok := c.pendingInputs[requestID]
-	if !ok {
-		c.mu.Unlock()
+	request := c.pendingInputs[requestID]
+	c.mu.Unlock()
+	if request == nil {
+		return ports.ErrChatRequestNotPending
+	}
+	request.mu.Lock()
+	defer request.mu.Unlock()
+	if request.resolved {
 		return ports.ErrChatRequestNotPending
 	}
 	if err := validateInputResponse(request.request, response); err != nil {
-		c.mu.Unlock()
 		return err
 	}
-	delete(c.pendingInputs, requestID)
-	c.mu.Unlock()
 	command := persistentInteractionCommand{
 		RequestID: requestID, Kind: persistentInteractionInput, Input: &response,
 	}
 	eventID, err := c.recordPersistentInteraction(ctx, command)
 	if err != nil {
-		c.mu.Lock()
-		if !c.closed {
-			c.pendingInputs[requestID] = request
-		}
-		c.mu.Unlock()
 		return err
 	}
 	command.EventID = eventID
-
+	request.resolved = true
+	c.discardInput(requestID)
 	c.emit(persistentInteractionEvent(command))
 	request.result <- response
 	return nil
@@ -756,14 +759,17 @@ func (c *conversation) mergeToolUpdate(update *acpsdk.SessionToolCallUpdate) *to
 }
 
 func (c *conversation) toolEvent(turnID string, tool *toolState, completed bool) ports.ChatEvent {
-	output := toolOutputText(tool.rawOutput)
+	output := toolOutputText(withoutImageData(tool.rawOutput))
 	if tool.terminalOutput != "" {
 		output = tool.terminalOutput
 	}
 	activityKind := activityKindFromTool(tool.kind)
+	// The detail is rewritten on every tool update and carried by every snapshot,
+	// so a page an agent hands html_render and the screenshot html_preview hands
+	// back are not stored whole.
 	detailMap := map[string]any{
 		"protocol": "acp", "toolKind": tool.kind, "locations": tool.locations,
-		"input": tool.rawInput, "output": output, "content": tool.content,
+		"input": cappedInput(tool.rawInput), "output": output, "content": contentWithoutImageData(tool.content),
 	}
 	if activityKind == domain.ActivityKindFileChange {
 		files := make([]map[string]any, 0)
@@ -848,6 +854,72 @@ func acpFilePatch(path string, oldText *string, newText string) string {
 		lines = append(lines, "+"+line)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// cappedInput keeps a tool's input only while it fits the tool payload cap,
+// as the Codex driver does for MCP arguments.
+func cappedInput(raw any) any {
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	return commanddetail.TruncatedJSON(encoded)
+}
+
+// imageStub stands in for an image block. Its base64 data would be stored as
+// text and printed as text when the row is expanded; bytes is its length.
+func imageStub(mimeType any, data string) map[string]any {
+	return map[string]any{"type": "image", "mimeType": mimeType, "bytes": len(data)}
+}
+
+// contentWithoutImageData keeps a tool's content blocks, text included, and
+// replaces each image block with imageStub.
+func contentWithoutImageData(content []acpsdk.ToolCallContent) []any {
+	if content == nil {
+		return nil
+	}
+	out := make([]any, len(content))
+	for i, item := range content {
+		if item.Content != nil && item.Content.Content.Image != nil {
+			image := item.Content.Content.Image
+			out[i] = map[string]any{"type": "content", "content": imageStub(image.MimeType, image.Data)}
+			continue
+		}
+		out[i] = item
+	}
+	return out
+}
+
+// withoutImageData replaces every image block in a decoded JSON value with
+// imageStub: MCP's {type:"image", data, mimeType} and the Anthropic
+// {type:"image", source:{type:"base64", media_type, data}} that
+// claude-agent-acp passes through as rawOutput.
+func withoutImageData(value any) any {
+	switch v := value.(type) {
+	case []any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = withoutImageData(item)
+		}
+		return out
+	case map[string]any:
+		if v["type"] == "image" {
+			if data, ok := v["data"].(string); ok {
+				return imageStub(v["mimeType"], data)
+			}
+			if source, ok := v["source"].(map[string]any); ok {
+				if data, ok := source["data"].(string); ok {
+					return imageStub(source["media_type"], data)
+				}
+			}
+		}
+		out := make(map[string]any, len(v))
+		for key, item := range v {
+			out[key] = withoutImageData(item)
+		}
+		return out
+	}
+	return value
 }
 
 // toolOutputText translates ACP's provider-defined rawOutput into AO's neutral

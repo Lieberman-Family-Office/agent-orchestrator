@@ -8,7 +8,7 @@
  */
 
 import { AlertTriangle, CheckCircle2, Loader2, X } from "lucide-react";
-import { memo, useEffect, useRef, type ReactNode } from "react";
+import { memo, useEffect, useMemo, useRef, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import {
 	findActiveAgentSwitch,
@@ -18,6 +18,8 @@ import {
 } from "../../hooks/useAgentSwitches";
 import { useObservedAgentSwitchLifecycle } from "../../hooks/useObservedAgentSwitchLifecycle";
 import { useAgentSwitchPresentationVisibility, useAgentSwitchRouteVisibility } from "../../hooks/useAgentSwitchVisibility";
+import { useQuery } from "@tanstack/react-query";
+import { agentModelsQueryOptions } from "../../hooks/useAgentModelsQuery";
 import { useSwitchAgentState } from "../../hooks/useSwitchAgent";
 import {
 	useConversation,
@@ -47,7 +49,9 @@ import type { ConversationSnapshot } from "../../types/conversation";
 import type { TerminalTarget } from "../../types/terminal";
 import type { AgentSwitchSummary, WorkspaceSession } from "../../types/workspace";
 import { AgentSwitchProgressTrack } from "../AgentSwitchProgressTrack";
+import { useUiStore } from "../../stores/ui-store";
 import { ChatWorkspace } from "./ChatWorkspace";
+import { startingConversationSnapshot } from "./OrchestratorStartingChat";
 import { hasProviderPermissionMode } from "./TurnSettingsBar";
 
 export interface ConversationWorkState {
@@ -129,6 +133,7 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 	agentResuming,
 	controllerResumeError,
 	newWorkDisabled,
+	arriving,
 	onConversationWorkChange,
 }: {
 	session: WorkspaceSession;
@@ -183,6 +188,8 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 	controllerResumeError?: string;
 	/** An interface handoff fences new agent work while current-turn decisions remain available. */
 	newWorkDisabled?: boolean;
+	/** A switch from the terminal is under way and the conversation is not readable yet. */
+	arriving?: boolean;
 	/** Reports accepted Chat work that must inform an interface-switch policy choice. */
 	onConversationWorkChange?: (state: ConversationWorkState) => void;
 }) {
@@ -232,8 +239,12 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 					: [],
 			),
 		);
+		const queuedTurnIds = new Set(snapshot.turns.filter((turn) => turn.state === "queued").map((turn) => turn.id));
 		for (const echo of localEchos) {
-			if (echo.turnId && durableHumanTurnIds.has(echo.turnId)) acknowledgeLocalEcho?.(echo.turnId);
+			if (
+				echo.turnId && durableHumanTurnIds.has(echo.turnId) &&
+				!(echo.backgroundWake && queuedTurnIds.has(echo.turnId))
+			) acknowledgeLocalEcho?.(echo.turnId);
 		}
 	}, [acknowledgeLocalEcho, localEchos, snapshot]);
 	useEffect(() => {
@@ -350,11 +361,24 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 	);
 	// Only asked for once the conversation is actually readable: the catalog comes
 	// from the live controller, so there is nothing to fetch before then.
-	const { models } = useConversationModels(
+	const { models: controllerModels } = useConversationModels(
 		session.id,
 		Boolean(controllerCatalogsEnabled && catalogsEnabled && snapshot) && !hasProviderModel,
 		hostId,
 	);
+	// Claude's live list is family aliases; the new-task picker's catalog carries the versions.
+	const isClaude = snapshot?.harness === "claude-code";
+	const claudeCatalog = useQuery({ ...agentModelsQueryOptions("claude-code", "", hostId), enabled: isClaude }).data;
+	const models = useMemo(() => {
+		if (!isClaude || !claudeCatalog?.models.length) return controllerModels;
+		return claudeCatalog.models
+			.filter((model) => model.id.toLowerCase() !== "default")
+			.map((model) => ({
+				id: model.id,
+				displayName: model.label || model.id,
+				default: Boolean(model.isDefault),
+			}));
+	}, [isClaude, claudeCatalog, controllerModels]);
 	const { skills } = useConversationSkills(
 		session.id,
 		Boolean(controllerCatalogsEnabled && catalogsEnabled && snapshot),
@@ -441,11 +465,28 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 		switchPresentation?.lockAgentTerminal && !switchPresentation.allowSourceInput,
 	);
 	const renderShellFallback = Boolean(shellTarget && session);
+	// A switch from the terminal shows the chat before the daemon has a
+	// conversation to read. The starting snapshot stands in for the whole
+	// arrival, even over a cached transcript, so history appears once and fades
+	// in instead of flashing, hiding, and reappearing as the controller restarts.
+	const optimisticArrival = Boolean(arriving) && !renderShellFallback;
+	const optimisticChat = (session.kind === "orchestrator" && isLoading && !renderShellFallback) || optimisticArrival;
 	const renderSnapshot =
-		snapshot ??
+		(optimisticArrival
+			? { ...startingConversationSnapshot(session.id, session.provider), controller: { state: "stopped" as const } }
+			: snapshot) ??
+		(optimisticChat ? startingConversationSnapshot(session.id, session.provider) : undefined) ??
 		(renderShellFallback
 			? unavailableConversationSnapshot(session)
 			: undefined);
+	// Keep the project marked as starting until its controller is ready, so
+	// sidebar actions cannot launch a duplicate orchestrator.
+	useEffect(() => {
+		if (session.kind !== "orchestrator" || session.provisionState === "provisioning") return;
+		if (isLoading && !renderShellFallback) return;
+		if (session.provisionState !== "failed" && !targetChatControllerReady && !renderShellFallback && !error && !unavailable) return;
+		useUiStore.getState().setProjectProvisioning(session.workspaceId, false, hostId);
+	}, [error, hostId, isLoading, renderShellFallback, session.kind, session.provisionState, session.workspaceId, targetChatControllerReady, unavailable]);
 	const visibilityPresentationKind = agentSwitchVisibilityPresentationKind(shownSwitchPresentation);
 	useAgentSwitchPresentationVisibility({
 		localRouteKey: `session/${uiSessionId}`,
@@ -461,7 +502,7 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 		),
 	});
 
-	if (isLoading && !renderShellFallback) {
+	if (isLoading && !renderShellFallback && !optimisticChat) {
 		return (
 			<Centered>
 				<Loader2 aria-hidden="true" className="size-4 animate-spin text-muted-foreground" />
@@ -474,11 +515,11 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 	// run Chat is a state to explain rather than an error to spin on. A compatible
 	// session may switch interfaces, but retrying this failed controller by itself
 	// cannot change the answer.
-	if (unavailable && !renderShellFallback) {
+	if (unavailable && !renderShellFallback && !optimisticArrival) {
 		return (
 			<Centered>
 				<AlertTriangle aria-hidden="true" className="size-4 text-warning" />
-				<strong className="text-sm text-foreground">Conversation unavailable</strong>
+				<strong className="text-xs text-foreground">Conversation unavailable</strong>
 				<p className="max-w-sm text-center text-xs leading-relaxed text-muted-foreground">
 					{unavailable.message}
 				</p>
@@ -489,7 +530,7 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 		);
 	}
 
-	if (error || !renderSnapshot) {
+	if ((error && !optimisticArrival) || !renderSnapshot) {
 		return (
 			<Centered>
 				<AlertTriangle aria-hidden="true" className="size-4 text-destructive" />
@@ -502,7 +543,7 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 
 	return (
 		<div className="relative h-full min-h-0">
-			{refreshError ? <p role="alert" className="px-4 py-2 text-sm text-destructive">{refreshError}</p> : null}
+			{refreshError ? <p role="alert" className="px-4 py-2 text-xs text-destructive">{refreshError}</p> : null}
 			<ChatWorkspace
 				key={uiSessionId}
 				uiSessionId={uiSessionId}
@@ -541,15 +582,29 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 				auxiliaryTabOrder={auxiliaryTabOrder}
 				onAuxiliaryTabOrderChange={onAuxiliaryTabOrderChange}
 				controllerTransitioning={controllerTransitioning}
+				loadingQuietly={optimisticChat && !optimisticArrival && session.provisionState !== "provisioning"}
 				agentResuming={agentResuming}
 				hasOlder={hasOlder}
 				loadingOlder={isLoadingOlder}
 				onLoadOlder={loadOlder}
 				busy={commands.busy}
-				onSend={(text, attachments, clientMessageId) =>
-					commands.send({ text, attachments, clientMessageId })}
-				onInterruptSend={can(renderSnapshot, "interrupt_send") ? (text, attachments, clientMessageId) =>
-					commands.send({ text, attachments, clientMessageId, interruptAndSend: true }) : undefined}
+				onInterruptSend={can(renderSnapshot, "interrupt_send") ? (text, attachments, clientMessageId,excerpts) =>
+					commands.send({ text, attachments, clientMessageId, interruptAndSend: true,
+						excerpts: excerpts?.map((excerpt) => ({conversationId:excerpt.conversationId,messageId:excerpt.messageId,revision:excerpt.revision,text:excerpt.text})),
+					}) : undefined}
+				excerptsEnabled
+				onSend={(text, attachments, clientMessageId, excerpts) =>
+					commands.send({
+						text,
+						attachments,
+						clientMessageId,
+						excerpts: excerpts?.map((excerpt) => ({
+							conversationId: excerpt.conversationId,
+							messageId: excerpt.messageId,
+							revision: excerpt.revision,
+							text: excerpt.text,
+						})),
+					})}
 				commandError={commands.error}
 				onDecide={commands.resolve}
 				onResolveInput={commands.resolveInput}
@@ -557,11 +612,12 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 				onResumeAgent={() => {
 					void commands.resumeAgent().catch(() => {});
 				}}
-				resumingAgent={commands.resumingAgent}
+				resumingAgent={commands.resumingAgent || (renderSnapshot.controller.state === "hibernated" && controllerBusy)}
 				resumeError={commands.resumeError ?? controllerResumeError}
 				onOpenShell={onOpenShell}
 				openingShell={openingShell}
 				shellError={shellError}
+				settingsReady={!optimisticChat && (targetChatControllerReady || agentResuming) && (!can(renderSnapshot, "config_options") || configOptions.loaded)}
 				models={models}
 				onChooseSettings={hasProviderMode ? undefined : commands.chooseSettings}
 				onRememberPermissions={can(renderSnapshot, "config_options") && !configOptions.loaded
@@ -572,7 +628,7 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 				configOptions={configOptions.options}
 				onChooseConfigOption={configOptions.setOption}
 				configOptionPending={configOptions.pending || commands.choosingSettings}
-				configOptionError={configOptions.error}
+				configOptionError={controllerCatalogsEnabled ? configOptions.error : undefined}
 				onCompact={commands.compact}
 				compacting={commands.compacting}
 				compactUnavailable={commands.compactUnavailable}
@@ -712,21 +768,8 @@ function ChatAgentSwitchStatus({
 
 function unavailableConversationSnapshot(session: WorkspaceSession): ConversationSnapshot {
 	return {
-		conversationId: session.id,
-		sessionId: session.id,
-		harness: session.provider,
-		mode: "chat",
+		...startingConversationSnapshot(session.id, session.provider),
 		controller: { state: "stopped", error: "Conversation unavailable" },
-		latestSequence: 0,
-		oldestSequence: 0,
-		hasMoreBefore: false,
-		activeBranchId: "branch-root",
-		branchPoints: [],
-		settings: {},
-		mcpServers: [],
-		capabilities: [],
-		turns: [],
-		items: [],
 	};
 }
 

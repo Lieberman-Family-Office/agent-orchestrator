@@ -219,9 +219,15 @@ func (c *conversation) applyPersistentInteraction(command persistentInteractionC
 				c.mu.Unlock()
 				return
 			}
-			delete(c.pendingInputs, command.RequestID)
 			c.mu.Unlock()
 			<-request.ready
+			request.mu.Lock()
+			defer request.mu.Unlock()
+			if request.resolved {
+				return
+			}
+			request.resolved = true
+			c.discardInput(command.RequestID)
 			c.emit(persistentInteractionEvent(command))
 			request.result <- *command.Input
 			return

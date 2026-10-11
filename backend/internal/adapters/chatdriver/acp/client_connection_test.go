@@ -19,6 +19,38 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
+func TestInputCancellationAndAnswerHaveOneOutcome(t *testing.T) {
+	request := ports.ChatInputRequest{Mode: ports.ChatInputModeForm, Schema: map[string]any{"type": "object", "properties": map[string]any{"choice": map[string]any{"type": "string"}}}}
+	answer := ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"choice": "retained"}}
+	for range 100 {
+		conv := &conversation{pendingInputs: make(map[string]*parkedInput), events: make(chan ports.ChatEvent, 8)}
+		ctx, cancel := context.WithCancel(context.Background())
+		result := make(chan ports.ChatInputResponse, 1)
+		go func() {
+			response, err := conv.requestInput(ctx, "question", request)
+			if err != nil {
+				response.Action = "error"
+			}
+			result <- response
+		}()
+		<-conv.events
+		start := make(chan struct{})
+		resolved := make(chan error, 1)
+		go func() { <-start; resolved <- conv.ResolveInput(context.Background(), "question", answer) }()
+		go func() { <-start; cancel() }()
+		close(start)
+		err := <-resolved
+		response := <-result
+		if err == nil && response.Action != ports.ChatInputActionAccept {
+			t.Fatalf("acknowledged answer was lost to cancellation: %+v", response)
+		}
+		if err != nil && (!errors.Is(err, ports.ErrChatRequestNotPending) || response.Action != ports.ChatInputActionCancel) {
+			t.Fatalf("outcome disagrees: error=%v response=%+v", err, response)
+		}
+		cancel()
+	}
+}
+
 func TestExtensionMethodReaderRoutesOnlyConfiguredLegacyMethodsThroughSDK(t *testing.T) {
 	clientToAgentR, clientToAgentW := io.Pipe()
 	agentToClientR, agentToClientW := io.Pipe()

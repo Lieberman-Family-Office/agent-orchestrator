@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -334,9 +335,14 @@ type ChatResumeConfig struct {
 	ProviderIDsScoped      bool
 	SessionID              domain.SessionID
 	ProviderConversationID string
-	DataDir                string
-	WorkspacePath          string
-	Env                    map[string]string
+	// FreshIfMissing lets a driver that had to reload ProviderConversationID
+	// start a fresh provider conversation when the provider reports it does not
+	// exist. Callers set it only with durable proof that the conversation never
+	// started. The returned conversation then reports the new id.
+	FreshIfMissing bool
+	DataDir        string
+	WorkspacePath  string
+	Env            map[string]string
 	// See ChatStartConfig.PrepareEnv.
 	PrepareEnv func(context.Context) (map[string]string, error)
 	// Model is optional; empty keeps the provider conversation's current model.
@@ -372,16 +378,42 @@ type ChatMCPServerConfig struct {
 // ChatInternalReplayResourceURI is reserved for AO's reconstructed edit context.
 const ChatInternalReplayResourceURI = "ao://conversation/edit-replay"
 
+// ChatExcerptResourceURIPrefix identifies AO-verified transcript excerpts. The
+// daemon resolves these from durable messages; clients never supply the resource
+// text directly.
+const ChatExcerptResourceURIPrefix = "ao://conversation-excerpt/"
+
+// ChatExcerptReference points at selected text in one durable transcript
+// message. Revision makes stale selections fail closed when streaming updates
+// replace the source text before the user sends their draft.
+type ChatExcerptReference struct {
+	ConversationID string `json:"conversationId"`
+	MessageID      string `json:"messageId"`
+	Revision       int64  `json:"revision"`
+	Text           string `json:"text"`
+}
+
+// ChatExcerptContext is the server-verified context delivered for one selected
+// transcript range. The paired turn is retained so a short selection can be
+// understood without relying on hidden provider history.
+type ChatExcerptContext struct {
+	Reference        ChatExcerptReference `json:"reference"`
+	SelectedText     string               `json:"selectedText"`
+	UserMessage      string               `json:"userMessage"`
+	AssistantMessage string               `json:"assistantMessage"`
+}
+
 // ChatContent is structured prompt context. Text remains on ChatUserMessage so
 // the durable transcript has an ordinary readable message; these blocks enrich
 // what the provider receives without leaking protocol DTOs above the adapter.
 type ChatContent struct {
-	Type     string `json:"type"`
-	Data     string `json:"data,omitempty"`
-	MIMEType string `json:"mimeType,omitempty"`
-	URI      string `json:"uri,omitempty"`
-	Name     string `json:"name,omitempty"`
-	Text     string `json:"text,omitempty"`
+	Type     string              `json:"type"`
+	Data     string              `json:"data,omitempty"`
+	MIMEType string              `json:"mimeType,omitempty"`
+	URI      string              `json:"uri,omitempty"`
+	Name     string              `json:"name,omitempty"`
+	Text     string              `json:"text,omitempty"`
+	Excerpt  *ChatExcerptContext `json:"excerpt,omitempty"`
 	// Internal distinguishes AO-owned prompt context from a user attachment.
 	// Public request DTOs never expose this bit; it is durable so edit/retry and
 	// snapshot reconstruction can hide only content AO actually synthesized.
@@ -419,6 +451,8 @@ type ChatUserMessage struct {
 	// ClientPayloadHash identifies the original request before AO adds reports
 	// or other server-owned context. It is internal, never supplied by a client.
 	ClientPayloadHash string
+	// Excerpts are verified transcript selections attached to this user message.
+	Excerpts []ChatExcerptReference
 	// Origin records the timeline attribution and delivery source. Automation
 	// shares the queue with the user and can never resolve an approval.
 	Origin domain.MessageOrigin
@@ -718,6 +752,14 @@ type (
 	ChatSkillLister interface {
 		ListSkills(ctx context.Context) ([]ChatSkill, error)
 	}
+	// ChatSandboxNetwork is implemented by a conversation whose provider runs
+	// the agent in a sandbox that can withhold network access. AO's own tools
+	// that load agent pages must not give the agent more network than that.
+	ChatSandboxNetwork interface {
+		// SandboxAllowsNetwork reports whether the agent can reach the network
+		// under the turn's permission mode; empty means the mode it launched with.
+		SandboxAllowsNetwork(turnMode PermissionMode) bool
+	}
 	// ChatUsageReporter reads the account's quota position on demand, for the
 	// cases where waiting for the next notification is too late to be useful.
 	ChatUsageReporter interface {
@@ -843,19 +885,53 @@ type ChatInputRequest struct {
 
 // PersistentQuestion identifies Claude's question form, never tool or URL consent.
 func (r ChatInputRequest) PersistentQuestion() bool {
-	if r.Mode != ChatInputModeForm {
+	if r.Mode != ChatInputModeForm || r.URL != "" || r.Schema["type"] != "object" {
 		return false
 	}
 	properties, _ := r.Schema["properties"].(map[string]any)
-	for _, raw := range properties {
-		property, _ := raw.(map[string]any)
-		meta, _ := property["_meta"].(map[string]any)
-		question, _ := meta["_askUserQuestionCustomAnswer"].(map[string]any)
-		if question["isCustomAnswer"] == true {
-			return true
+	if len(properties) == 0 || len(properties)%2 != 0 {
+		return false
+	}
+	for name, raw := range properties {
+		property, ok := raw.(map[string]any)
+		if !ok || !strings.HasPrefix(name, "question_") {
+			return false
+		}
+		if strings.HasSuffix(name, "_custom") {
+			questionID := strings.TrimSuffix(name, "_custom")
+			meta, _ := property["_meta"].(map[string]any)
+			binding, _ := meta["_askUserQuestionCustomAnswer"].(map[string]any)
+			if property["type"] != "string" || binding["isCustomAnswer"] != true || binding["questionId"] != questionID || properties[questionID] == nil {
+				return false
+			}
+			continue
+		}
+		if _, err := strconv.ParseUint(strings.TrimPrefix(name, "question_"), 10, 32); err != nil || properties[name+"_custom"] == nil {
+			return false
+		}
+		enum := property
+		switch property["type"] {
+		case "string":
+		case "array":
+			enum, _ = property["items"].(map[string]any)
+		default:
+			return false
+		}
+		options, _ := enum["oneOf"].([]any)
+		if options == nil {
+			options, _ = enum["anyOf"].([]any)
+		}
+		if len(options) == 0 {
+			return false
+		}
+		for _, rawOption := range options {
+			option, _ := rawOption.(map[string]any)
+			if text, ok := option["const"].(string); !ok || strings.TrimSpace(text) == "" {
+				return false
+			}
 		}
 	}
-	return false
+	return true
 }
 
 // ValidateQuestionResponse checks delayed answers against the stored question options.
@@ -925,10 +1001,7 @@ func (r ChatInputRequest) ValidateQuestionResponse(response ChatInputResponse) e
 			if !ok {
 				return ErrChatDecisionNotOffered
 			}
-			if len(options) == 0 {
-				if !strings.HasSuffix(name, "_custom") {
-					return ErrChatDecisionNotOffered
-				}
+			if strings.HasSuffix(name, "_custom") {
 				continue
 			}
 			offered := false
@@ -1041,6 +1114,7 @@ const (
 	ChatControllerReady      ChatControllerState = "ready"
 	ChatControllerBusy       ChatControllerState = "busy"
 	ChatControllerRecovering ChatControllerState = "recovering"
+	ChatControllerHibernated ChatControllerState = "hibernated"
 	ChatControllerStopped    ChatControllerState = "stopped"
 )
 
@@ -1226,6 +1300,15 @@ type ChatProviderPreserver interface {
 // destruction must do more than detach the controller.
 type ChatProviderTerminator interface {
 	Terminate() error
+}
+
+// ChatProviderHibernator stops the controller and provider process while
+// retaining the native conversation for a later Resume.
+type ChatProviderHibernator interface {
+	// CanHibernate checks provider-owned work that can outlive a settled turn.
+	// An error must leave the provider running.
+	CanHibernate(ctx context.Context) (bool, error)
+	Hibernate() error
 }
 
 // ChatLiveReconnector identifies attachment to the same initialized provider
