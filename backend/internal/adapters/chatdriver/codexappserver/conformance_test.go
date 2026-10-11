@@ -190,6 +190,11 @@ func TestGeneratedProtocolMatchesTheInstalledProvider(t *testing.T) {
 		}
 	}
 	for name := range generated {
+		if name == "thread/rollback" && live["thread/revert"] {
+			// Rollback explicitly handles unknown legacy methods through revert.
+			// TestRollbackUsesRevertOnlyForAnUnsupportedLegacyMethod owns that contract.
+			continue
+		}
 		if !live[name] {
 			extra = append(extra, name)
 		}

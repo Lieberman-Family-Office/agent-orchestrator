@@ -495,6 +495,16 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 	now := s.now()
 	var resetBoundary domain.ConversationActivity
 	freshProjectContext := scope == domain.ConversationScopeProject && cfg.ProviderConversationID == ""
+	if freshProjectContext && s.sessions != nil {
+		record, found, readErr := s.sessions.GetSession(ctx, cfg.SessionID)
+		if readErr != nil {
+			return nil, fmt.Errorf("read initial project controller: %w", readErr)
+		}
+		if found && record.ProvisionState.IsProvisioning() && record.Metadata.ControllerGeneration == "" && record.Metadata.ProviderConversationID == "" {
+			// This owner's queued opening brief is intake, not a previous context to reset.
+			freshProjectContext = false
+		}
+	}
 	if freshProjectContext {
 		detail, marshalErr := json.Marshal(map[string]string{
 			"event":  "context.reset",

@@ -342,7 +342,19 @@ func (c *conversation) Rollback(ctx context.Context, providerTurnID string) erro
 		"threadId": c.threadID,
 		"numTurns": discard,
 	}, nil); err != nil {
-		return asRefusal(fmt.Errorf("thread/rollback: %w", err))
+		var rpcErr *rpcError
+		unsupported := errors.As(err, &rpcErr) && (rpcErr.Code == -32601 ||
+			(rpcErr.Code == -32600 && strings.HasPrefix(rpcErr.Message, "Invalid request: unknown variant `thread/rollback`, expected one of ")))
+		if !unsupported {
+			return asRefusal(fmt.Errorf("thread/rollback: %w", err))
+		}
+		// Current Codex removes the named turn inclusively through beforeTurnId.
+		// Retry only a proven unknown method, never a refusal or transport error.
+		if err := c.conn.request(ctx, "thread/revert", map[string]any{
+			"threadId": c.threadID, "beforeTurnId": providerTurnID,
+		}, nil); err != nil {
+			return asRefusal(fmt.Errorf("thread/revert: %w", err))
+		}
 	}
 	return nil
 }

@@ -188,6 +188,44 @@ func TestRefreshHistoryPerformsANewThreadRead(t *testing.T) {
 // The provider takes a COUNT from the end of the thread, not a turn id, so the whole
 // correctness of rollback rests on turning the named turn into the right number.
 // Naming the middle of three turns must discard that turn and the one after it.
+func TestRollbackUsesRevertOnlyForAnUnsupportedLegacyMethod(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		code     int
+		message  string
+		fallback bool
+	}{
+		{"removed", -32600, "Invalid request: unknown variant `thread/rollback`, expected one of `thread/revert`", true},
+		{"method not found", -32601, "Method not found", true},
+		{"active turn refusal", -32600, "Cannot rollback while a turn is in progress.", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conv, srv := openConversation(t)
+			srv.reply("thread/read", threadWithTurns)
+			srv.replyError("thread/rollback", tc.code, tc.message)
+			srv.reply("thread/revert", `{}`)
+			err := conv.Rollback(context.Background(), "turn-b")
+			if (err == nil) != tc.fallback {
+				t.Fatalf("fallback=%v error=%v", tc.fallback, err)
+			}
+			if !tc.fallback {
+				if srv.sentMethod("thread/revert") {
+					t.Fatal("refusal triggered a second destructive request")
+				}
+				return
+			}
+			frame := srv.awaitFrame(func(f frame) bool { return f.Method == "thread/revert" })
+			var params struct {
+				ThreadID     string `json:"threadId"`
+				BeforeTurnID string `json:"beforeTurnId"`
+			}
+			if err := json.Unmarshal(frame.Params, &params); err != nil || params.ThreadID != "thread-1" || params.BeforeTurnID != "turn-b" {
+				t.Fatalf("revert params=%+v error=%v", params, err)
+			}
+		})
+	}
+}
+
 func TestRollbackCountsTurnsFromTheNamedOneToTheEnd(t *testing.T) {
 	conv, srv := openConversation(t)
 	srv.reply("thread/read", threadWithTurns)
