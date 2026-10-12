@@ -793,6 +793,30 @@ func TestPersistentACPRejectsMalformedEnvelopeWithoutBlockingNextNotification(t 
 	}
 }
 
+func TestPersistentACPStreamingAdmissionRejectsPartialEnvelopes(t *testing.T) {
+	const valid = `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"accepted"}}}}`
+	rejected := strings.Replace(valid, "accepted", "rejected", 1)
+	for _, invalid := range []string{
+		rejected + ` {}`,
+		strings.TrimSuffix(rejected, "}") + `,"unfinished":`,
+		strings.TrimSuffix(rejected, "}") + `,"error":7}`,
+		strings.TrimSuffix(rejected, "}") + `,"method":7}`,
+		strings.TrimSuffix(rejected, "}") + `,"JSONRPC":7}`,
+	} {
+		t.Run(invalid, func(t *testing.T) {
+			conv, host := replayBoundaryConversation(t)
+			go func() {
+				_, _ = fmt.Fprintln(host, invalid)
+				_, _ = fmt.Fprintln(host, valid)
+			}()
+			event := nextEvent(t, conv.Events())
+			if event.Kind != ports.ChatEventMessageDelta || event.Delta != "accepted" {
+				t.Fatalf("partial envelope emitted output or blocked the following notification: %+v", event)
+			}
+		})
+	}
+}
+
 func TestPersistentACPPreservesSDKAcceptedEmptyUpdatePayloads(t *testing.T) {
 	for _, update := range []string{"", `,"update":null`, `,"update":{"sessionUpdate":"future_update","opaque":{"value":9007199254740993}}`, `,"_META":{"providerOpaque":{"value":9007199254740993},"ao.localNotificationID":"untrusted"}`} {
 		for _, id := range []string{"", `"id":1,`, `"id":null,`} {

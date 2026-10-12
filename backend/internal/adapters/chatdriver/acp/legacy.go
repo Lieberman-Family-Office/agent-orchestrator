@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -67,7 +68,6 @@ type legacyACPEnvelope struct {
 	JSONRPC string               `json:"jsonrpc"`
 	ID      *json.RawMessage     `json:"id,omitempty"`
 	Method  string               `json:"method,omitempty"`
-	Params  json.RawMessage      `json:"params,omitempty"`
 	Result  json.RawMessage      `json:"result,omitempty"`
 	Error   *acpsdk.RequestError `json:"error,omitempty"`
 }
@@ -94,7 +94,8 @@ func (t *legacyACPTransport) forward(source io.Reader, destination *io.PipeWrite
 		line, err := reader.ReadBytes('\n')
 		// Decode once for interception and SDK-compatible notification admission.
 		var notification legacyACPEnvelope
-		decoded := json.Unmarshal(line, &notification) == nil
+		// Only successful temporary decodes are used; legacy wire semantics stay intact.
+		decoded := jsonv2.Unmarshal(line, &notification, json.DefaultOptionsV1(), json.ReportErrorsWithLegacySemantics(false)) == nil
 		var intercepted bool
 		if decoded {
 			intercepted = t.interceptEnvelope(notification)
