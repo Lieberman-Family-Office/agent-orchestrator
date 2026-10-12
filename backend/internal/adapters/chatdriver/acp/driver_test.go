@@ -1123,6 +1123,7 @@ type fakeAgent struct {
 	setConfig           []acpsdk.SessionConfigOption
 	setCalls            int
 	steering            bool
+	workerSafeBoundary  bool
 	steerText           string
 	steerPrompt         []acpsdk.ContentBlock
 	steerMeta           map[string]any
@@ -1273,7 +1274,7 @@ func (a *fakeAgent) Initialize(_ context.Context, params acpsdk.InitializeReques
 	}
 	meta := map[string]any(nil)
 	if a.steering {
-		meta = map[string]any{"steering": map[string]any{"supported": true}}
+		meta = map[string]any{"steering": map[string]any{"supported": true, "aoWorkerSafeBoundary": a.workerSafeBoundary}}
 	}
 	defaultCaps := acpsdk.AgentCapabilities{
 		SessionCapabilities: acpsdk.SessionCapabilities{Resume: &acpsdk.SessionResumeCapabilities{}},
@@ -3772,7 +3773,8 @@ func awaitSkillCount(t *testing.T, lister ports.ChatSkillLister, want int) []por
 
 func TestACPDriverMapsAdvertisedSteeringOntoAO(t *testing.T) {
 	agent := &fakeAgent{
-		steering: true,
+		steering:           true,
+		workerSafeBoundary: true,
 		capabilities: &acpsdk.AgentCapabilities{
 			PromptCapabilities: acpsdk.PromptCapabilities{Image: true},
 			SessionCapabilities: acpsdk.SessionCapabilities{
@@ -3827,6 +3829,35 @@ func TestACPDriverMapsAdvertisedSteeringOntoAO(t *testing.T) {
 	steering, _ := meta["steering"].(map[string]any)
 	if steering["idleBehavior"] != "promptRequired" {
 		t.Fatalf("steering meta = %#v", meta)
+	}
+
+	if _, err := conv.Steer(context.Background(), "turn-1", ports.ChatUserMessage{Text: "worker finished", Origin: domain.MessageOriginAutomation, SenderSessionID: "worker-54"}); err != nil {
+		t.Fatalf("worker steer: %v", err)
+	}
+	agent.mu.Lock()
+	workerMeta := agent.steerMeta
+	agent.mu.Unlock()
+	workerSteering, _ := workerMeta["steering"].(map[string]any)
+	if workerSteering["priority"] != "next" || workerSteering["senderSessionId"] != "worker-54" {
+		t.Fatalf("worker update lacks safe-boundary provenance: %#v", workerMeta)
+	}
+	if _, present := steering["priority"]; present {
+		t.Fatal("explicit human steering must retain the provider's immediate behavior")
+	}
+	conv.workerSafeBoundary = false
+	if _, err := conv.Steer(context.Background(), "turn-1", ports.ChatUserMessage{Text: "unsupported worker update", Origin: domain.MessageOriginAutomation, SenderSessionID: "worker-54"}); !errors.Is(err, ports.ErrChatTurnNotSteerable) {
+		t.Fatalf("unpatched Claude bridge must not silently cancel tools: %v", err)
+	}
+	conv.harness = domain.HarnessOpenCode
+	if _, err := conv.Steer(context.Background(), "turn-1", ports.ChatUserMessage{Text: "other provider update", Origin: domain.MessageOriginAutomation, SenderSessionID: "worker-54"}); err != nil {
+		t.Fatalf("non-Claude steering changed: %v", err)
+	}
+	agent.mu.Lock()
+	otherMeta := agent.steerMeta
+	agent.mu.Unlock()
+	otherSteering, _ := otherMeta["steering"].(map[string]any)
+	if _, present := otherSteering["priority"]; present {
+		t.Fatal("Claude-only delivery metadata sent to another provider")
 	}
 
 	agent.mu.Lock()

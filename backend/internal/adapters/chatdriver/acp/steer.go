@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
@@ -49,11 +50,19 @@ func (c *conversation) Steer(
 		return ports.ChatTurnRef{}, ports.ErrChatNoSteerableTurn
 	}
 
+	steering := map[string]any{"idleBehavior": "promptRequired"}
+	if c.harness == domain.HarnessClaudeCode && msg.Origin == domain.MessageOriginAutomation && msg.SenderSessionID != "" {
+		if !c.workerSafeBoundary {
+			return ports.ChatTurnRef{}, fmt.Errorf("%w: safe worker steering is unavailable", ports.ErrChatTurnNotSteerable)
+		}
+		steering["priority"] = "next"
+		steering["senderSessionId"] = msg.SenderSessionID
+	}
 	raw, err := c.conn.CallExtension(ctx, steeringMethod, map[string]any{
 		"sessionId": sessionID,
 		"prompt":    prompt,
 		"_meta": map[string]any{
-			"steering": map[string]any{"idleBehavior": "promptRequired"},
+			"steering": steering,
 		},
 	})
 	if err != nil {

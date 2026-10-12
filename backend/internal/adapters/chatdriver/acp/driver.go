@@ -538,6 +538,7 @@ func (d *Driver) initialize(
 	conv := newConversation(
 		proc, d.log, cfg.ProviderScopeID, d.cfg.ClientExtension, d.cfg.ClientExtensionAliases,
 	)
+	conv.harness = d.cfg.Harness
 	conv.onAuthRejected = d.cfg.OnAuthRejected
 	conv.promptResponseFailure = d.cfg.PromptResponseFailure
 	conv.hibernationCheck = d.cfg.CanHibernate
@@ -560,6 +561,8 @@ func (d *Driver) initialize(
 				return nil, acpsdk.InitializeResponse{}, nil, fmt.Errorf("%w: %w", ports.ErrChatDriverIncompatible, err)
 			}
 		}
+		steering, _ := init.Meta["steering"].(map[string]any)
+		conv.workerSafeBoundary, _ = steering["aoWorkerSafeBoundary"].(bool)
 		return conv, init, state, nil
 	}
 
@@ -611,6 +614,8 @@ func (d *Driver) initialize(
 			return nil, acpsdk.InitializeResponse{}, nil, fmt.Errorf("%w: %w", ports.ErrChatDriverIncompatible, err)
 		}
 	}
+	steering, _ := init.Meta["steering"].(map[string]any)
+	conv.workerSafeBoundary, _ = steering["aoWorkerSafeBoundary"].(bool)
 	return conv, init, nil, nil
 }
 

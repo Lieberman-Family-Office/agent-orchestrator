@@ -93,11 +93,13 @@ type conversation struct {
 	proc            *process
 	log             *slog.Logger
 	providerScopeID string
+	harness         domain.AgentHarness
 
 	mu                 sync.Mutex
 	sessionID          string
 	reportedSessionID  string
 	capabilities       ports.ChatCapabilities
+	workerSafeBoundary bool
 	prepared           *preparedTurn
 	activeTurn         string
 	settlingTurn       string

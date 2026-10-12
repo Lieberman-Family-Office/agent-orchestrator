@@ -151,6 +151,38 @@ export function patchClaudeHibernationCheck(adapterPath) {
 	return true;
 }
 
+// Worker updates are peer input at the next safe boundary, not human interrupts.
+// ponytail: This pinned bridge patch must be replaced with upstream support when available.
+export function patchClaudeWorkerSteering(adapterPath) {
+	const source = readFileSync(adapterPath, "utf8");
+	if (source.includes("// AO: worker safe-boundary steering.")) return false;
+	const validation = "    return {\n        sessionId,\n        prompt: prompt,";
+	const priority = "userMessage.priority = STEER_PRIORITY;";
+	const capability = "steering: {\n                    supported: true,";
+	for (const marker of [validation, priority, capability]) {
+		if (source.split(marker).length !== 2) {
+			throw new Error("claude-agent-acp no longer matches AO's worker steering patch");
+		}
+	}
+	const validateWorker = `    // AO: worker safe-boundary steering.
+    if (steering?.priority !== undefined || steering?.senderSessionId !== undefined) {
+        if (steering?.priority !== "next" || typeof steering.senderSessionId !== "string" || !steering.senderSessionId.trim()) {
+            throw RequestError.invalidParams(undefined, "invalid worker steering metadata");
+        }
+    }
+`;
+	const delivery = `const workerSteering = params._meta?.steering;
+        userMessage.priority = workerSteering?.priority === "next" ? "next" : STEER_PRIORITY;
+        if (workerSteering?.priority === "next") {
+            userMessage.origin = { kind: "peer", from: workerSteering.senderSessionId };
+        }`;
+	writeFileSync(adapterPath, source
+		.replace(validation, validateWorker + validation)
+		.replace(priority, delivery)
+		.replace(capability, capability + "\n                    aoWorkerSafeBoundary: true,"));
+	return true;
+}
+
 export function pruneNodeDistribution(nodeRoot) {
 	// The Unix archives expose npm/corepack as bin/ symlinks into lib/. Remove
 	// the entry points before their targets so packagers never see dangling
