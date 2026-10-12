@@ -60,8 +60,17 @@ function initializeMessage(message) {
                             case "init": break;
  }
 }
+async function activateFixture(turn) {
+            session.activeTurn = turn;
+}
+async function teardownFixture(sessionId) {
+        await this.cancel({ sessionId });
+}
 async function cancelFixture() {
         session.cancelled = true;
+ for (const uuid of session.activeTurn?.steeredEchoes ?? []) {
+                this.trackOrphanCommand(session, uuid, "pending");
+ }
  const receipt = await session.query.interrupt();
  return receipt;
 }
@@ -113,7 +122,7 @@ return { parseSteerRequest, agent, initialized, handleAskUserQuestion: questionB
 	assert.equal(pushed[1].priority, "next", "ordinary human guidance must not cancel a running tool");
 	assert.equal(pushed[1].origin, undefined, "human guidance must not become worker input");
 	assert.equal(initialized.steering.aoHumanSafeBoundary, true);
-	assert.equal(initialized.steering.aoGuidanceStopFence, 2);
+	assert.equal(initialized.steering.aoGuidanceStopFence, 3);
 	await agent.steer(parseSteerRequest({ sessionId: "test", prompt: "ledger receipt", _meta: { steering: { priority: "next" } } }));
 	assert.equal(pushed[2].priority, "next");
 	assert.equal(pushed[2].origin, undefined);
@@ -238,7 +247,7 @@ return { parseSteerRequest, agent, initialized, handleAskUserQuestion: questionB
 			const waitingGuidance = new Set();
 			const locallyQueuedGuidance = [];
 			const stopTurn = { settled: false };
-			const stopSession = { aoInterruptCancelQueued: true, msgLifecycleV1: lifecycle, turnQueue: [stopTurn], activeTurn: stopTurn, input: { push: message => { locallyQueuedGuidance.push(message); waitingGuidance.add(message.uuid); } }, query: { interrupt, request: async request => {
+			const stopSession = { aoInterruptCancelQueued: true, msgLifecycleV1: lifecycle, turnQueue: [stopTurn], activeTurn: stopTurn, input: { push: message => { message.aoWritten = true; locallyQueuedGuidance.push(message); waitingGuidance.add(message.uuid); } }, query: { interrupt, request: async request => {
 				stopRequests.push(request);
 				const cancelled = request.cancel_queued === true ? [...waitingGuidance] : [];
 				for (const uuid of cancelled) waitingGuidance.delete(uuid);
@@ -258,6 +267,19 @@ return { parseSteerRequest, agent, initialized, handleAskUserQuestion: questionB
 			assert.equal(stopSession.aoWorkerSteering.size, 0);
 			assert.equal(stopSession.orphanCommands?.size ?? 0, 0, "cancelled guidance left orphan debt that could swallow the next result");
 			assert.equal(stopSession.pendingOrphanResults ?? 0, 0, "count-lane cancellation left phantom result debt");
+			await prototype.cancel.call(stopBridge, { sessionId: "test" });
+			assert.equal(stopSession.orphanCommands?.size ?? 0, 0, "repeated Stop recreated retired guidance debt");
+			assert.equal(stopSession.pendingOrphanResults ?? 0, 0, "repeated Stop recreated count-lane debt");
+			const dispatchedMessage = { uuid: "already-dispatched", aoWritten: true };
+			const dispatchedTurn = { settled: false, steeredEchoes: new Set([dispatchedMessage.uuid]) };
+			const backlogSession = { aoInterruptCancelQueued: true, msgLifecycleV1: lifecycle, turnQueue: [dispatchedTurn], activeTurn: dispatchedTurn, aoPendingGuidance: new Map([[dispatchedMessage.uuid, dispatchedMessage]]), query: { interrupt, request: async () => ({ response: { still_queued: [], cancelled: [] } }) } };
+			const backlogBridge = Object.assign(Object.create(prototype), { sessions: { test: backlogSession } });
+			await prototype.cancel.call(backlogBridge, { sessionId: "test" });
+			if (lifecycle) assert.equal(backlogSession.orphanCommands.get(dispatchedMessage.uuid), "pending", "queue emptiness retired debt without cancellation-fate evidence");
+			else assert.equal(backlogSession.pendingOrphanResults, 1, "queue emptiness retired already-dispatched count debt");
+			await prototype.cancel.call(backlogBridge, { sessionId: "test" });
+			if (lifecycle) assert.equal(backlogSession.orphanCommands.size, 1, "repeated Stop changed dispatch-backlog map debt");
+			else assert.equal(backlogSession.pendingOrphanResults, 1, "repeated Stop doubled dispatched-guidance debt");
 			const streamSource = sdkSource.match(/async streamInput\(e\)\{[\s\S]*?\}waitForFirstResult\(/)?.[0].replace(/waitForFirstResult\($/, "");
 			assert.ok(streamSource, "pinned SDK streaming input changed");
 			const streamInput = new Function("ce", "Se", "Yn", `return (${streamSource.replace("async streamInput", "async function")});`)(() => {}, JSON.stringify, Error);
@@ -271,7 +293,7 @@ return { parseSteerRequest, agent, initialized, handleAskUserQuestion: questionB
 			stopSession.aoInterruptCancelQueued = false;
 			await assert.rejects(prototype.steer.call(stopBridge, { sessionId: "test", prompt: [{ type: "text", text: "unsupported native CLI" }], _meta: { steering: { priority: "next" } } }), /atomic Stop support/);
 			stopSession.aoInterruptCancelQueued = true;
-			for (const badReceipt of [{}, { still_queued: ["survivor"] }]) {
+			for (const badReceipt of [{}, { still_queued: ["survivor"], cancelled: [] }, { still_queued: [123], cancelled: [] }, { still_queued: [null], cancelled: [] }, { still_queued: [{}], cancelled: [] }, { still_queued: [], cancelled: [123] }]) {
 				stopSession.queryClosed = false;
 				stopSession.cancelled = false;
 				stopSession.query.request = async () => ({ response: badReceipt });
@@ -279,11 +301,19 @@ return { parseSteerRequest, agent, initialized, handleAskUserQuestion: questionB
 				stopSession.query.close = () => { closed = true; };
 				stopSession.settingsManager = { dispose() {} };
 				stopSession.input.end = () => {};
-				await assert.rejects(prototype.cancel.call(stopBridge, { sessionId: "test" }), /did not confirm/);
+				await assert.rejects(prototype.cancel.call(stopBridge, { sessionId: "test" }), /did not confirm|malformed native Stop receipt/);
 				assert.equal(stopSession.queryClosed, true, "unproven Stop left the native query open");
 				assert.equal(closed, true, "unproven Stop did not close the query process");
 				await assert.rejects(prototype.steer.call(stopBridge, { sessionId: "test", prompt: [{ type: "text", text: "after failed Stop" }], _meta: { steering: { priority: "next" } } }), /session.*ended/i);
 			}
+			const teardownAbort = new AbortController();
+			stopSession.queryClosed = false;
+			stopSession.abortController = teardownAbort;
+			stopSession.query.request = async () => ({ response: { still_queued: [null], cancelled: [] } });
+			stopBridge.logger = { error() {} };
+			await prototype.teardownSession.call(stopBridge, "test");
+			assert.equal(teardownAbort.signal.aborted, true, "failed Stop bypassed teardown abort");
+			assert.equal(stopBridge.sessions.test, undefined, "failed Stop bypassed session removal");
 			}
 			console.log("PASS: pinned bridge keeps human guidance noninterrupting and preserves pending human questions; worker-only deferral and explicit Stop retain semantics");
 		} finally {
