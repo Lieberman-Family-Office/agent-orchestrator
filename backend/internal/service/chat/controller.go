@@ -3028,7 +3028,8 @@ func (c *Controller) project() {
 	c.mu.Lock()
 	c.state = ports.ChatControllerStopped
 	suppressStoppedActivity := c.suppressStoppedActivity
-	preserveProvider := c.preserveProviderOnStop || retainedProvider()
+	c.preserveProviderOnStop = c.preserveProviderOnStop || retainedProvider()
+	preserveProvider := c.preserveProviderOnStop
 	hibernating := c.handoff == controllerHandoffHibernate
 	c.mu.Unlock()
 	// Hibernate admitted no running work, but Send can append an optimistic

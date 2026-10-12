@@ -248,6 +248,17 @@ type recoveryDetachedConversation struct {
 
 func (c *recoveryDetachedConversation) ProviderRetained() bool { return c.retained.Load() }
 
+type recoveryStopConversation struct {
+	*recoveryDetachedConversation
+}
+
+func (c *recoveryStopConversation) Terminate() error {
+	// Recovery already consumed the adapter's closeOnce. Terminate cannot
+	// destroy its retained host, even though closing the stream completes.
+	c.retained.Store(true)
+	return c.Close()
+}
+
 type liveReconnectedConversation struct{ *nativeHistoryConversation }
 
 func (c *liveReconnectedConversation) ReconnectedLive() bool { return true }
@@ -5452,6 +5463,111 @@ func TestServiceStopTerminatesPersistentConversation(t *testing.T) {
 	}
 	if !provider.terminated.Load() {
 		t.Fatal("explicit session stop detached persistent conversation instead of terminating it")
+	}
+}
+
+func TestExplicitStopShutsRetainedHostAfterRecoveryRace(t *testing.T) {
+	for _, notification := range []string{"explicit", "unmarked", "omitted"} {
+		t.Run(notification, func(t *testing.T) {
+			provider := &recoveryStopConversation{recoveryDetachedConversation: &recoveryDetachedConversation{terminatingConversation: &terminatingConversation{fakeConversation: newFakeConversation()}}}
+			h := newHarnessWithConversation(t, provider)
+			running, err := h.ctrl.Send(context.Background(), ports.ChatUserMessage{Text: "running at detach", ClientMessageID: "stop-recovery-work"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: running.ProviderTurnID})
+			h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				return len(s.Turns) == 1 && s.Turns[0].State == domain.TurnStateRunning
+			})
+			if _, err := h.ctrl.Send(context.Background(), ports.ChatUserMessage{Text: "queued at detach", ClientMessageID: "stop-recovery-queue"}); err != nil {
+				t.Fatal(err)
+			}
+			if notification != "omitted" {
+				provider.onClose = func() {
+					provider.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: ports.ChatControllerStopped, ProviderRetained: notification == "explicit"})
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := h.svc.Stop(ctx, testSession); err != nil {
+				t.Fatalf("explicit Stop: %v", err)
+			}
+			if h.hostStops.Load() != 1 {
+				t.Fatalf("Stop missed retained host or shut it twice: calls=%d", h.hostStops.Load())
+			}
+			if provider.terminated.Load() {
+				t.Fatal("fixture must exercise already-consumed adapter closeOnce")
+			}
+			snapshot, err := h.st.LoadConversationSnapshot(context.Background(), h.ctrl.ConversationID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			states := turnStateByText(t, snapshot)
+			if states["running at detach"] == domain.TurnStateRunning || states["queued at detach"] == domain.TurnStateQueued {
+				t.Fatalf("explicit Stop left live durable work: %+v", states)
+			}
+		})
+	}
+}
+
+func TestExplicitStopDoesNotCleanRetainedWorkAfterHostShutdownFailure(t *testing.T) {
+	provider := &recoveryStopConversation{recoveryDetachedConversation: &recoveryDetachedConversation{terminatingConversation: &terminatingConversation{fakeConversation: newFakeConversation()}}}
+	st := openStore(t)
+	var calls atomic.Int32
+	var retrySucceeds atomic.Bool
+	var ids atomic.Int32
+	svc := chatsvc.New(chatsvc.Options{Store: st, Sessions: st, Drivers: fakeRegistry{driver: fakeDriver{conv: provider}}, Log: slog.New(slog.DiscardHandler), NewID: func() string { return fmt.Sprintf("failed-host-stop-%d", ids.Add(1)) }, StopProviderHost: func(context.Context, domain.SessionID) error {
+		calls.Add(1)
+		if retrySucceeds.Load() {
+			return nil
+		}
+		return errors.New("host shutdown failed")
+	}})
+	ctrl, err := svc.Start(context.Background(), chatsvc.StartConfig{SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex, WorkspacePath: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn, err := ctrl.Send(context.Background(), ports.ChatUserMessage{Text: "retained running", ClientMessageID: "host-fail-work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: turn.ProviderTurnID})
+	awaitStoreSnapshot(t, st, ctrl.ConversationID(), func(s store.ConversationSnapshot) bool {
+		return len(s.Turns) == 1 && s.Turns[0].State == domain.TurnStateRunning
+	})
+	if err := svc.Stop(context.Background(), testSession); err == nil {
+		t.Fatal("failed host shutdown reported success")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("host shutdown calls=%d", calls.Load())
+	}
+	snapshot, err := st.LoadConversationSnapshot(context.Background(), ctrl.ConversationID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if states := turnStateByText(t, snapshot); states["retained running"] != domain.TurnStateRunning {
+		t.Fatalf("failed host shutdown destroyed retained ownership: %+v", states)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := svc.Controller(testSession); errors.Is(err, chatsvc.ErrNoController) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	retrySucceeds.Store(true)
+	if err := svc.Stop(context.Background(), testSession); err != nil {
+		t.Fatalf("successful host shutdown retry: %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("one host shutdown per Stop attempt, calls=%d", calls.Load())
+	}
+	snapshot, err = st.LoadConversationSnapshot(context.Background(), ctrl.ConversationID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if states := turnStateByText(t, snapshot); states["retained running"] == domain.TurnStateRunning {
+		t.Fatalf("successful retry left live durable work: %+v", states)
 	}
 }
 

@@ -1492,11 +1492,22 @@ func (s *Service) Stop(ctx context.Context, id domain.SessionID) error {
 		var stopErr error
 		if s.stopProviderHost != nil {
 			stopErr = s.stopProviderHost(ctx, id)
+			if stopErr == nil && s.sessions != nil {
+				record, found, readErr := s.sessions.GetSession(ctx, id)
+				stopErr = readErr
+				if found && readErr == nil {
+					conversation, conversationErr := s.store.ConversationForSession(ctx, id)
+					if conversationErr == nil {
+						_, stopErr = s.store.CleanupOwnedControllerWork(ctx, id, conversation.ID, record.Metadata.ControllerGeneration, s.now())
+					} else if !errors.Is(conversationErr, domain.ErrNoConversation) {
+						stopErr = conversationErr
+					}
+				}
+			}
 		}
 		return errors.Join(stopErr, s.clearHibernation(ctx, id))
 	}
 	controller.mu.Lock()
-	preserved := controller.preserveProviderOnStop
 	hibernating := controller.handoff == controllerHandoffHibernate
 	controller.mu.Unlock()
 	var hostErr error
@@ -1506,11 +1517,24 @@ func (s *Service) Stop(ctx context.Context, id domain.SessionID) error {
 		hostErr = s.stopProviderHost(ctx, id)
 	}
 	err := errors.Join(hostErr, controller.Terminate(ctx))
-	if preserved && !hibernating && s.stopProviderHost != nil {
-		// Close may already have retired this handle (for example after a failed
-		// projection). Explicit Stop targets current session ownership under the
-		// start/stop gate; a stale handle's Terminate must not target a replacement.
-		err = errors.Join(err, s.stopProviderHost(ctx, id))
+	// Recovery may consume the adapter closeOnce while Stop waits for its stream.
+	// Read actual retention after Terminate under this owner's start/stop gate.
+	controller.mu.Lock()
+	preserved := controller.preserveProviderOnStop
+	controller.mu.Unlock()
+	if preserver, ok := controller.conv.(ports.ChatProviderPreserver); ok && preserver.PreservesProviderOnClose() {
+		if reporter, ok := controller.conv.(ports.ChatProviderRetentionReporter); ok {
+			preserved = preserved || reporter.ProviderRetained()
+		}
+	}
+	if preserved && !hibernating {
+		// Close may already have retired this handle. Stop targets this owner
+		// under its start/stop gate, never a concurrently started replacement.
+		if s.stopProviderHost == nil {
+			err = errors.Join(err, errors.New("retained provider shutdown is unavailable"))
+		} else {
+			err = errors.Join(err, s.stopProviderHost(ctx, id))
+		}
 	}
 
 	// Keep the only handle to a controller whose event stream has not ended. A
@@ -1519,8 +1543,8 @@ func (s *Service) Stop(ctx context.Context, id domain.SessionID) error {
 	// generation so a concurrent replacement can never be deleted accidentally.
 	select {
 	case <-controller.stopped:
-		if hibernating {
-			// Explicit Kill consumes the queue that idle shutdown preserved.
+		if (hibernating || preserved) && err == nil {
+			// Only confirmed host shutdown permits cleanup of recovery-retained work.
 			err = errors.Join(err, controller.cleanupOwnedControllerWork(ctx, s.now()))
 		}
 		s.mu.Lock()
