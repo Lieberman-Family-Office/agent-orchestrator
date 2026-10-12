@@ -3763,9 +3763,15 @@ func TestApprovalIsStoredPendingWithProviderDecisions(t *testing.T) {
 	}
 }
 
-type cancelledQuestionProvider struct{ *steerRecorder }
+type cancelledQuestionProvider struct {
+	*steerRecorder
+	deferred bool
+}
 
 func (p *cancelledQuestionProvider) ResolveInput(context.Context, string, ports.ChatInputResponse) error {
+	if p.deferred {
+		return ports.ErrChatQuestionDeferred
+	}
 	return ports.ErrChatRequestNotPending
 }
 
@@ -3843,7 +3849,7 @@ func (p *deferredQuestionProvider) StartDeferredTurn(string) error { return nil 
 func (p *deferredQuestionProvider) DiscardDeferredTurn(string)     {}
 
 func TestDeferredQuestionAnswerWaitsForCompletion(t *testing.T) {
-	provider := &deferredQuestionProvider{&cancelledQuestionProvider{newSteerRecorder()}}
+	provider := &deferredQuestionProvider{&cancelledQuestionProvider{steerRecorder: newSteerRecorder()}}
 	h := newHarnessWithConversationAndStoreForHarness(t, provider, func(st *sqlite.Store) chatsvc.Store { return st }, domain.HarnessClaudeCode)
 	ctx := context.Background()
 	schema := map[string]any{"type": "object", "properties": map[string]any{
@@ -3908,9 +3914,10 @@ func TestFailedDelayedAnswerRetryDoesNotResolveQuestion(t *testing.T) {
 }
 
 func TestQuestionSurvivesBackgroundCancellationAndAnswerIsDeliveredOnce(t *testing.T) {
-	for _, rejected := range []bool{false, true} {
-		t.Run(fmt.Sprint(rejected), func(t *testing.T) {
-			provider := &cancelledQuestionProvider{steerRecorder: newSteerRecorder()}
+	for _, scenario := range []struct{ rejected, detachFirst bool }{{false, true}, {true, true}, {false, false}} {
+		rejected := scenario.rejected
+		t.Run(fmt.Sprint(scenario), func(t *testing.T) {
+			provider := &cancelledQuestionProvider{steerRecorder: newSteerRecorder(), deferred: !scenario.detachFirst}
 			h := newHarnessWithConversationAndStoreForHarness(t, provider, func(st *sqlite.Store) chatsvc.Store { return st }, domain.HarnessClaudeCode)
 			ctx := context.Background()
 			turn, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "work", ClientMessageID: "question-work"})
@@ -3933,7 +3940,10 @@ func TestQuestionSurvivesBackgroundCancellationAndAnswerIsDeliveredOnce(t *testi
 			if len(provider.steers()) != 1 {
 				t.Fatal("background update did not reach agent")
 			}
-			provider.emit(ports.ChatEvent{Kind: ports.ChatEventInputResolved, RequestID: "question-1"}, ports.ChatEvent{Kind: ports.ChatEventActivityStarted, ProviderTurnID: turn.ProviderTurnID, ProviderItemID: "after-question-cancel", ActivityKind: domain.ActivityKindSystem, ActivityStatus: domain.ActivityStatusRunning, Summary: "cancellation projected"})
+			if scenario.detachFirst {
+				provider.emit(ports.ChatEvent{Kind: ports.ChatEventInputResolved, RequestID: "question-1"})
+			}
+			provider.emit(ports.ChatEvent{Kind: ports.ChatEventActivityStarted, ProviderTurnID: turn.ProviderTurnID, ProviderItemID: "after-question-cancel", ActivityKind: domain.ActivityKindSystem, ActivityStatus: domain.ActivityStatusRunning, Summary: "cancellation projected"})
 			snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
 				for _, activity := range s.Activities {
 					if activity.Summary == "cancellation projected" {
@@ -3953,6 +3963,13 @@ func TestQuestionSurvivesBackgroundCancellationAndAnswerIsDeliveredOnce(t *testi
 				}
 			}
 			answer := ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"question_0": "native"}}
+			if !scenario.detachFirst {
+				provider.deferred = false
+				if err := h.ctrl.ResolveInput(ctx, "question-1", answer); !errors.Is(err, ports.ErrChatRequestNotPending) {
+					t.Fatalf("unproven not-pending must not authorize fallback: %v", err)
+				}
+				provider.deferred = true
+			}
 			if rejected {
 				provider.failWith(ports.ErrChatTurnNotSteerable)
 				if err := h.ctrl.ResolveInput(ctx, "question-1", answer); !errors.Is(err, chatsvc.ErrTurnNotSteerable) {

@@ -19,6 +19,10 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
+var errWorkerQuestionYield = errors.New("automatic worker question deferral")
+
+const workerQuestionYieldMeta = "aoWorkerQuestionYield"
+
 // AO deliberately advertises neither client-side filesystem nor terminal
 // capabilities. Claude's ACP adapter uses Claude Code's native tools inside the
 // worktree; routing those operations through Electron or the daemon would create
@@ -218,13 +222,34 @@ func (c *conversation) UnstableCreateElicitation(
 		return acpsdk.NewUnstableCreateElicitationResponseCancel(), errors.New("ACP elicitation has no mode")
 	}
 
+	workerEpoch := uint64(0)
+	if params.Form != nil {
+		if epoch, ok := params.Form.Meta["aoWorkerQuestionEpoch"].(float64); ok && !math.IsNaN(epoch) && epoch >= 0 && epoch < 1<<53 && math.Trunc(epoch) == epoch {
+			workerEpoch = uint64(epoch)
+		}
+	}
 	requestID := ""
 	if params.Form != nil {
 		requestID = stableACPRequestID(params.Form.Meta)
 	} else if params.Url != nil {
 		requestID = stableACPRequestID(params.Url.Meta)
 	}
-	response, err := c.requestInput(ctx, requestID, request)
+	var workerYield chan struct{}
+	if c.harness == domain.HarnessClaudeCode && c.workerSafeBoundary && request.PersistentQuestion() {
+		marker := params.Form.Meta[workerQuestionYieldMeta]
+		if marker == true || marker == "automatic-worker-deferral" {
+			workerYield = make(chan struct{})
+			if marker == "automatic-worker-deferral" {
+				close(workerYield)
+			}
+		}
+	}
+	response, err := c.requestInput(ctx, requestID, request, &parkedInput{workerYield: workerYield, workerEpoch: workerEpoch})
+	if errors.Is(err, errWorkerQuestionYield) {
+		result := acpsdk.NewUnstableCreateElicitationResponseCancel()
+		result.Cancel.Meta = map[string]any{workerQuestionYieldMeta: "automatic-worker-deferral"}
+		return result, nil
+	}
 	if err != nil {
 		return acpsdk.NewUnstableCreateElicitationResponseCancel(), err
 	}
@@ -243,14 +268,30 @@ func (c *conversation) requestInput(
 	ctx context.Context,
 	requestID string,
 	request ports.ChatInputRequest,
+	workerRequests ...*parkedInput,
 ) (ports.ChatInputResponse, error) {
 	if requestID == "" {
 		requestID = uuid.NewString()
 	}
-	parked := &parkedInput{
-		request: request, result: make(chan ports.ChatInputResponse, 1), ready: make(chan struct{}),
+	parked := &parkedInput{}
+	if len(workerRequests) > 0 {
+		parked = workerRequests[0]
 	}
+	parked.request = request
+	parked.result = make(chan ports.ChatInputResponse, 1)
+	parked.ready = make(chan struct{})
 	c.mu.Lock()
+	if parked.workerYield != nil {
+		select {
+		case <-parked.workerYield:
+			parked.workerYielded = true
+		default:
+			if parked.workerEpoch < c.workerYieldEpoch {
+				parked.workerYielded = true
+				close(parked.workerYield)
+			}
+		}
+	}
 	if c.closed {
 		c.mu.Unlock()
 		return ports.ChatInputResponse{Action: ports.ChatInputActionCancel}, nil
@@ -276,24 +317,72 @@ func (c *conversation) requestInput(
 	}
 
 	timer := timeAfter(approvalWait)
+	yielded := false
 	select {
 	case response := <-parked.result:
 		return response, nil
 	case <-ctx.Done():
 	case <-timer:
+	case <-parked.workerYield:
+		yielded = true
 	}
 	parked.mu.Lock()
+	// An in-flight durable acceptance owns the result until the host answers.
+	// Worker delivery must not acknowledge an answer and then discard it.
+	if yielded && ctx.Err() == nil && parked.resolving {
+		done := parked.resolveDone
+		parked.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
+		parked.mu.Lock()
+	}
 	if parked.resolved {
 		parked.mu.Unlock()
 		return <-parked.result, nil
 	}
 	parked.resolved = true
+	automatic := yielded && ctx.Err() == nil
+	if automatic {
+		c.mu.Lock()
+		if c.deferredQuestions == nil {
+			c.deferredQuestions = make(map[string]struct{})
+		}
+		c.deferredQuestions[requestID] = struct{}{}
+		c.mu.Unlock()
+	}
 	c.discardInput(requestID)
 	parked.mu.Unlock()
 	if !c.providerDetaching() {
 		c.emit(ports.ChatEvent{Kind: ports.ChatEventInputResolved, RequestID: requestID})
 	}
+	if automatic {
+		return ports.ChatInputResponse{}, errWorkerQuestionYield
+	}
 	return ports.ChatInputResponse{Action: ports.ChatInputActionCancel}, nil
+}
+
+// yieldWorkerQuestions releases only forms negotiated by the AskUserQuestion bridge.
+// Consent requests and other tools retain their existing waiting behavior.
+func (c *conversation) yieldWorkerQuestions(epoch uint64) {
+	c.mu.Lock()
+	if epoch > c.workerYieldEpoch {
+		c.workerYieldEpoch = epoch
+	}
+	requests := make([]*parkedInput, 0, len(c.pendingInputs))
+	for _, request := range c.pendingInputs {
+		requests = append(requests, request)
+	}
+	c.mu.Unlock()
+	for _, request := range requests {
+		request.mu.Lock()
+		if !request.resolved && request.workerYield != nil && !request.workerYielded && request.workerEpoch < epoch {
+			request.workerYielded = true
+			close(request.workerYield)
+		}
+		request.mu.Unlock()
+	}
 }
 
 func (c *conversation) providerDetaching() bool {
@@ -325,11 +414,19 @@ func (c *conversation) ResolveInput(
 	}
 	c.mu.Lock()
 	request := c.pendingInputs[requestID]
+	_, deferred := c.deferredQuestions[requestID]
 	c.mu.Unlock()
 	if request == nil {
+		if deferred {
+			return ports.ErrChatQuestionDeferred
+		}
 		return ports.ErrChatRequestNotPending
 	}
 	request.mu.Lock()
+	if request.workerYielded && !request.resolving && request.accepted == nil {
+		request.mu.Unlock()
+		return ports.ErrChatQuestionDeferred
+	}
 	if request.resolved || request.resolving {
 		request.mu.Unlock()
 		return ports.ErrChatRequestNotPending
@@ -339,6 +436,7 @@ func (c *conversation) ResolveInput(
 		return err
 	}
 	request.resolving = true
+	request.resolveDone = make(chan struct{})
 	persistent := c.proc != nil && c.proc.terminate != nil
 	if !persistent {
 		request.resolved = true
@@ -351,6 +449,8 @@ func (c *conversation) ResolveInput(
 	eventID, err := c.recordPersistentInteraction(ctx, command)
 	request.mu.Lock()
 	request.resolving = false
+	resolveDone := request.resolveDone
+	defer close(resolveDone)
 	if request.resolved && persistent {
 		accepted := request.accepted
 		request.mu.Unlock()

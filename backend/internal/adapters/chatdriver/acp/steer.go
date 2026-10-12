@@ -14,8 +14,10 @@ import (
 const steeringMethod = "_session/steering"
 
 type steeringResponse struct {
-	Outcome string `json:"outcome"`
-	Reason  string `json:"reason,omitempty"`
+	Outcome       string `json:"outcome"`
+	Reason        string `json:"reason,omitempty"`
+	WorkerPending bool   `json:"workerPending,omitempty"`
+	WorkerEpoch   uint64 `json:"workerEpoch,omitempty"`
 }
 
 // Steer maps AO's existing mid-turn guidance contract onto ACP's steering
@@ -74,6 +76,9 @@ func (c *conversation) Steer(
 	}
 	switch response.Outcome {
 	case "injected":
+		if steering["priority"] == "next" && response.WorkerPending {
+			c.yieldWorkerQuestions(response.WorkerEpoch)
+		}
 		return ports.ChatTurnRef{ProviderTurnID: providerTurnID}, nil
 	case "promptRequired":
 		return ports.ChatTurnRef{}, ports.ErrChatNoSteerableTurn

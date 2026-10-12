@@ -155,18 +155,25 @@ export function patchClaudeHibernationCheck(adapterPath) {
 // ponytail: This pinned bridge patch must be replaced with upstream support when available.
 export function patchClaudeWorkerSteering(adapterPath) {
 	const source = readFileSync(adapterPath, "utf8");
-	if (source.includes("// AO: worker safe-boundary steering.")) return false;
+	if (source.includes("// AO: worker safe-boundary steering v2.")) return false;
+	if (source.includes("// AO: worker safe-boundary steering.")) {
+		throw new Error("claude-agent-acp has obsolete worker steering; rebuild from the pinned package");
+	}
 	const validation = "    return {\n        sessionId,\n        prompt: prompt,";
 	const priority = "userMessage.priority = STEER_PRIORITY;";
 	const capability = "steering: {\n                    supported: true,";
-	for (const marker of [validation, priority, capability]) {
+	const questionRequest = "const createRequest = askUserQuestionsToCreateRequest(questions, sessionId, toolUseID);";
+	const questionResponse = "        const outcome = applyAskElicitationResponse(response, toolInput, questions);";
+	const lifecycle = "                    const frame = message;\n                    switch (frame.state) {";
+	const injected = 'return { outcome: "injected" };';
+	for (const marker of [validation, priority, capability, questionRequest, questionResponse, lifecycle, injected]) {
 		if (source.split(marker).length !== 2) {
 			throw new Error("claude-agent-acp no longer matches AO's worker steering patch");
 		}
 	}
-	const validateWorker = `    // AO: worker safe-boundary steering.
+	const validateWorker = `    // AO: worker safe-boundary steering v2.
     if (steering?.priority !== undefined || steering?.senderSessionId !== undefined) {
-        if (steering?.priority !== "next" || typeof steering.senderSessionId !== "string" || !steering.senderSessionId.trim()) {
+        if (steering?.priority !== "next" || typeof steering.senderSessionId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(steering.senderSessionId)) {
             throw RequestError.invalidParams(undefined, "invalid worker steering metadata");
         }
     }
@@ -175,11 +182,36 @@ export function patchClaudeWorkerSteering(adapterPath) {
         userMessage.priority = workerSteering?.priority === "next" ? "next" : STEER_PRIORITY;
         if (workerSteering?.priority === "next") {
             userMessage.origin = { kind: "peer", from: workerSteering.senderSessionId };
+            const firstText = userMessage.message.content.find(block => block.type === "text");
+            if (!firstText) {
+                throw RequestError.invalidParams(undefined, "worker steering requires text content");
+            }
+            firstText.text = '<cross-session-message from="' + workerSteering.senderSessionId + '">\\n' + firstText.text + '\\n</cross-session-message>';
+            session.aoWorkerSteeringEpoch = (session.aoWorkerSteeringEpoch ?? 0) + 1;
+            (session.aoWorkerSteering ??= new Set()).add(steeredUuid);
         }`;
 	writeFileSync(adapterPath, source
 		.replace(validation, validateWorker + validation)
 		.replace(priority, delivery)
-		.replace(capability, capability + "\n                    aoWorkerSafeBoundary: true,"));
+		.replace(injected, 'return { outcome: "injected", workerEpoch: session.aoWorkerSteeringEpoch ?? 0, workerPending: workerSteering?.priority === "next" && session.aoWorkerSteering?.has(steeredUuid) === true };')
+		.replace(capability, capability + "\n                    aoWorkerSafeBoundary: true,\n                    aoWorkerQuestionYield: true,")
+		.replace(questionRequest, questionRequest + '\n        createRequest._meta = { ...createRequest._meta, aoWorkerQuestionEpoch: this.sessions[sessionId]?.aoWorkerSteeringEpoch ?? 0, aoWorkerQuestionYield: this.sessions[sessionId]?.aoWorkerSteering?.size > 0 ? "automatic-worker-deferral" : true };')
+		.replace(questionResponse, `        if (response.action === "cancel" && response._meta?.aoWorkerQuestionYield === "automatic-worker-deferral") {
+            return {
+                behavior: "deny",
+                interrupt: false,
+                message: "AO automatically deferred this unanswered question to process a worker update. The form remains answerable. The user did not answer, skip, or request a stop. Do not infer approval or proceed with work that requires this answer.",
+            };
+        }
+` + questionResponse)
+		.replace(lifecycle, `                    const frame = message;
+                    const workerUuid = frame.command_uuid ?? frame.uuid;
+                    if (session.aoWorkerSteering?.has(workerUuid) && ["started", "completed", "discarded", "cancelled"].includes(frame.state)) {
+                        session.aoWorkerSteering.delete(workerUuid);
+                        for (const turn of session.turnQueue ?? []) turn.steeredEchoes?.delete(workerUuid);
+                    }
+                    switch (frame.state) {`)
+	);
 	return true;
 }
 

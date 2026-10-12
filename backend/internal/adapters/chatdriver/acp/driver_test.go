@@ -1274,7 +1274,7 @@ func (a *fakeAgent) Initialize(_ context.Context, params acpsdk.InitializeReques
 	}
 	meta := map[string]any(nil)
 	if a.steering {
-		meta = map[string]any{"steering": map[string]any{"supported": true, "aoWorkerSafeBoundary": a.workerSafeBoundary}}
+		meta = map[string]any{"steering": map[string]any{"supported": true, "aoWorkerSafeBoundary": a.workerSafeBoundary, "aoWorkerQuestionYield": a.workerSafeBoundary}}
 	}
 	defaultCaps := acpsdk.AgentCapabilities{
 		SessionCapabilities: acpsdk.SessionCapabilities{Resume: &acpsdk.SessionResumeCapabilities{}},
@@ -1313,7 +1313,7 @@ func (a *fakeAgent) HandleExtensionMethod(_ context.Context, method string, raw 
 	if outcome == "" {
 		outcome = "injected"
 	}
-	return steeringResponse{Outcome: outcome}, nil
+	return steeringResponse{Outcome: outcome, WorkerPending: outcome == "injected", WorkerEpoch: 1}, nil
 }
 func (a *fakeAgent) Logout(context.Context, acpsdk.LogoutRequest) (acpsdk.LogoutResponse, error) {
 	return acpsdk.LogoutResponse{}, nil
@@ -3831,8 +3831,25 @@ func TestACPDriverMapsAdvertisedSteeringOntoAO(t *testing.T) {
 		t.Fatalf("steering meta = %#v", meta)
 	}
 
+	question := make(chan ports.ChatInputResponse, 1)
+	questionCtx, cancelQuestion := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelQuestion()
+	go func() {
+		response, _ := conv.requestInput(questionCtx, "pending-question", ports.ChatInputRequest{Mode: ports.ChatInputModeForm}, &parkedInput{workerYield: make(chan struct{})})
+		question <- response
+	}()
+	for event := range conv.Events() {
+		if event.Kind == ports.ChatEventInputRequested {
+			break
+		}
+	}
 	if _, err := conv.Steer(context.Background(), "turn-1", ports.ChatUserMessage{Text: "worker finished", Origin: domain.MessageOriginAutomation, SenderSessionID: "worker-54"}); err != nil {
 		t.Fatalf("worker steer: %v", err)
+	}
+	select {
+	case <-question:
+	case <-questionCtx.Done():
+		t.Fatal("accepted worker update remained behind the unanswered question")
 	}
 	agent.mu.Lock()
 	workerMeta := agent.steerMeta

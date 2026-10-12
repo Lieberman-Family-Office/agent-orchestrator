@@ -58,13 +58,17 @@ type parkedPermission struct {
 }
 
 type parkedInput struct {
-	mu        sync.Mutex
-	resolved  bool
-	resolving bool
-	accepted  *ports.ChatInputResponse
-	request   ports.ChatInputRequest
-	result    chan ports.ChatInputResponse
-	ready     chan struct{}
+	mu            sync.Mutex
+	resolved      bool
+	resolving     bool
+	accepted      *ports.ChatInputResponse
+	resolveDone   chan struct{}
+	workerYield   chan struct{}
+	workerYielded bool
+	workerEpoch   uint64
+	request       ports.ChatInputRequest
+	result        chan ports.ChatInputResponse
+	ready         chan struct{}
 }
 
 type toolState struct {
@@ -100,6 +104,7 @@ type conversation struct {
 	reportedSessionID  string
 	capabilities       ports.ChatCapabilities
 	workerSafeBoundary bool
+	workerYieldEpoch   uint64
 	prepared           *preparedTurn
 	activeTurn         string
 	settlingTurn       string
@@ -107,6 +112,7 @@ type conversation struct {
 	interrupt          *interruptAttempt
 	pending            map[string]*parkedPermission
 	pendingInputs      map[string]*parkedInput
+	deferredQuestions  map[string]struct{}
 	accepted           map[string]persistentInteractionCommand
 	messages           map[string]string
 	thoughts           map[string]string

@@ -2452,8 +2452,15 @@ func (c *Controller) ResolveInput(
 		return releaseRefused(resolveErr)
 	}
 	if resolveErr != nil {
-		if !persistent || stored.ProviderPending || !errors.Is(resolveErr, ports.ErrChatRequestNotPending) {
+		if !persistent || !errors.Is(resolveErr, ports.ErrChatRequestNotPending) || (stored.ProviderPending && !errors.Is(resolveErr, ports.ErrChatQuestionDeferred)) {
 			return fmt.Errorf("resolve input %s: %w", requestID, resolveErr)
+		}
+		// The driver can detach before its queued event reaches the store.
+		// Only a typed automatic yield proves the original callback is fenced.
+		if stored.ProviderPending {
+			if _, err := c.store.DetachQuestion(ctx, c.conversation.ID, requestID, c.now()); err != nil {
+				return fmt.Errorf("detach input %s: %w", requestID, err)
+			}
 		}
 		if response.Action == ports.ChatInputActionAccept {
 			contextJSON, err := json.Marshal(map[string]any{"message": question.Message, "schema": question.Schema, "answers": response.Content})

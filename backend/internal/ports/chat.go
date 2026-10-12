@@ -59,6 +59,8 @@ var (
 	// replaced. Two clients looking at the same approval is normal, so one of them
 	// arriving second is an ordinary outcome and not a failure.
 	ErrChatRequestNotPending = errors.New("chat request is not pending")
+	// ErrChatQuestionDeferred proves an automatic yield fenced the unanswered callback.
+	ErrChatQuestionDeferred = fmt.Errorf("%w: question automatically deferred", ErrChatRequestNotPending)
 	// ErrChatDecisionNotOffered means the decision is not one the provider offered
 	// for that request. It must be refused and the request left pending: consent
 	// AO invented is not consent, and consuming the request on a bad decision
