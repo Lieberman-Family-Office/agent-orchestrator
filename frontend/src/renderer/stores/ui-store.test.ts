@@ -2,6 +2,25 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { rememberedFileDisplayMode, sidebarIsVisible, sidebarOccupiesLayout, useUiStore } from "./ui-store";
 import { sessionUiKey } from "../lib/hosts";
 
+describe("active-turn send mode", () => {
+	beforeEach(() => {
+		window.localStorage.clear();
+		useUiStore.setState({ chatSendMode: "steer" });
+	});
+
+	it("defaults to steering and persists the selected mode across reload", async () => {
+		expect(useUiStore.getState().chatSendMode).toBe("steer");
+		useUiStore.getState().setChatSendMode("interrupt");
+		expect(localStorage.getItem("ao.chat.sendMode")).toBe("interrupt");
+		vi.resetModules();
+		const reloaded = (await import("./ui-store")).useUiStore;
+		expect(reloaded.getState().chatSendMode).toBe("interrupt");
+		localStorage.setItem("ao.chat.sendMode", "invalid");
+		vi.resetModules();
+		expect((await import("./ui-store")).useUiStore.getState().chatSendMode).toBe("steer");
+	});
+});
+
 describe("sidebar visibility", () => {
 	beforeEach(() => {
 		window.localStorage.clear();
@@ -70,8 +89,8 @@ describe("remoteHosts flag", () => {
 		useUiStore.setState({ remoteHosts: false });
 	});
 
-	it("is off until the user turns it on", async () => {
-		expect((await bootStore()).getState().remoteHosts).toBe(false);
+	it("is on by default behind developer mode", async () => {
+		expect((await bootStore()).getState().remoteHosts).toBe(true);
 	});
 
 	it("persists the switch so the choice survives a restart", () => {
@@ -84,6 +103,11 @@ describe("remoteHosts flag", () => {
 	it("reads a stored choice back at startup", async () => {
 		window.localStorage.setItem("ao.remoteHosts", "true");
 		expect((await bootStore()).getState().remoteHosts).toBe(true);
+	});
+
+	it("honors an explicit opt-out", async () => {
+		window.localStorage.setItem("ao.remoteHosts", "false");
+		expect((await bootStore()).getState().remoteHosts).toBe(false);
 	});
 });
 
@@ -193,5 +217,58 @@ describe("workspace file open requests", () => {
 
 		useUiStore.getState().clearWorkspaceFileOpenRequest(oldNonce + 1);
 		expect(useUiStore.getState().workspaceFileOpenRequest).toBeNull();
+	});
+});
+
+const visibilityKey = "ao.chat.hideAutomationMessages";
+
+describe("automation message visibility", () => {
+	beforeEach(() => {
+		window.localStorage.clear();
+		vi.resetModules();
+		useUiStore.setState({ hideAutomationMessages: false });
+		useUiStore.getState().clearGlobalToast();
+	});
+
+	it("shows messages by default and ignores invalid stored values", async () => {
+		expect((await bootStore()).getState().hideAutomationMessages).toBe(false);
+		localStorage.setItem(visibilityKey, "not-a-boolean");
+		vi.resetModules();
+		expect((await bootStore()).getState().hideAutomationMessages).toBe(false);
+	});
+
+	it("persists hiding and revealing across a fresh module boot", async () => {
+		useUiStore.getState().setHideAutomationMessages(true);
+		expect(localStorage.getItem(visibilityKey)).toBe("true");
+		expect((await bootStore()).getState().hideAutomationMessages).toBe(true);
+		useUiStore.getState().setHideAutomationMessages(false);
+		expect(localStorage.getItem(visibilityKey)).toBe("false");
+		vi.resetModules();
+		expect((await bootStore()).getState().hideAutomationMessages).toBe(false);
+	});
+
+	it("fails open to showing messages when storage cannot be read", async () => {
+		const read = vi.spyOn(window.localStorage, "getItem").mockImplementation((key) => {
+			if (key === visibilityKey) throw new DOMException("blocked", "SecurityError");
+			return null;
+		});
+		try {
+			expect((await bootStore()).getState().hideAutomationMessages).toBe(false);
+		} finally {
+			read.mockRestore();
+		}
+	});
+
+	it("keeps the current choice usable and reports a failed write", () => {
+		const write = vi.spyOn(window.localStorage, "setItem").mockImplementation(() => {
+			throw new DOMException("full", "QuotaExceededError");
+		});
+		try {
+			expect(() => useUiStore.getState().setHideAutomationMessages(true)).not.toThrow();
+			expect(useUiStore.getState().hideAutomationMessages).toBe(true);
+			expect(useUiStore.getState().globalToast?.title).toBe("Display preference was not saved");
+		} finally {
+			write.mockRestore();
+		}
 	});
 });

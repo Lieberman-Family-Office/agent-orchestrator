@@ -7,14 +7,17 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
 const steeringMethod = "_session/steering"
 
 type steeringResponse struct {
-	Outcome string `json:"outcome"`
-	Reason  string `json:"reason,omitempty"`
+	Outcome       string `json:"outcome"`
+	Reason        string `json:"reason,omitempty"`
+	WorkerPending bool   `json:"workerPending,omitempty"`
+	WorkerEpoch   uint64 `json:"workerEpoch,omitempty"`
 }
 
 // Steer maps AO's existing mid-turn guidance contract onto ACP's steering
@@ -49,11 +52,23 @@ func (c *conversation) Steer(
 		return ports.ChatTurnRef{}, ports.ErrChatNoSteerableTurn
 	}
 
+	steering := map[string]any{"idleBehavior": "promptRequired"}
+	if c.harness == domain.HarnessClaudeCode {
+		if msg.Origin == domain.MessageOriginAutomation && msg.SenderSessionID != "" {
+			if !c.workerSafeBoundary {
+				return ports.ChatTurnRef{}, fmt.Errorf("%w: safe worker steering is unavailable", ports.ErrChatTurnNotSteerable)
+			}
+			steering["senderSessionId"] = msg.SenderSessionID
+		} else if !c.humanSafeBoundary {
+			return ports.ChatTurnRef{}, fmt.Errorf("%w: safe human steering is unavailable", ports.ErrChatTurnNotSteerable)
+		}
+		steering["priority"] = "next"
+	}
 	raw, err := c.conn.CallExtension(ctx, steeringMethod, map[string]any{
 		"sessionId": sessionID,
 		"prompt":    prompt,
 		"_meta": map[string]any{
-			"steering": map[string]any{"idleBehavior": "promptRequired"},
+			"steering": steering,
 		},
 	})
 	if err != nil {
@@ -65,6 +80,9 @@ func (c *conversation) Steer(
 	}
 	switch response.Outcome {
 	case "injected":
+		if steering["priority"] == "next" && response.WorkerPending {
+			c.yieldWorkerQuestions(response.WorkerEpoch)
+		}
 		return ports.ChatTurnRef{ProviderTurnID: providerTurnID}, nil
 	case "promptRequired":
 		return ports.ChatTurnRef{}, ports.ErrChatNoSteerableTurn

@@ -11,6 +11,18 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/httpd/apierr"
 )
 
+func TestArtifactLocationUsesSessionOwnedDirectoryOnly(t *testing.T) {
+	root := t.TempDir()
+	store := newFakeStore()
+	store.sessions["ao-1"] = domain.SessionRecord{ID: "ao-1", Metadata: domain.SessionMetadata{ArtifactDir: root}}
+	got, err := (&Service{store: store}).ArtifactLocation(context.Background(), "ao-1")
+	if err != nil || got != root {
+		t.Fatalf("artifact root: got=%q err=%v", got, err)
+	}
+	_, err = (&Service{store: store}).ArtifactLocation(context.Background(), "missing")
+	assertAPIErrorCode(t, err, "SESSION_NOT_FOUND")
+}
+
 func TestWorkspaceLocationReturnsOnlyLiveSessionWorkspace(t *testing.T) {
 	workspace := t.TempDir()
 	store := newFakeStore()

@@ -10,7 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -351,8 +353,11 @@ type Store interface {
 	UpdateSessionArtifactOutput(ctx context.Context, id domain.SessionID, artifactDir string, outputType domain.SessionOutputType) (bool, error)
 	UpdateBrowserCapabilityVerifier(ctx context.Context, id domain.SessionID, expected domain.SessionControllerOwner, verifier string) (bool, error)
 	GetSession(ctx context.Context, id domain.SessionID) (domain.SessionRecord, bool, error)
+	UpsertSessionCleanupFacts(ctx context.Context, rec domain.SessionCleanupRecord) error
+	GetSessionCleanupFacts(ctx context.Context, id domain.SessionID) (domain.SessionCleanupRecord, bool, error)
 	ListSessions(ctx context.Context, project domain.ProjectID) ([]domain.SessionRecord, error)
 	ListAllSessions(ctx context.Context) ([]domain.SessionRecord, error)
+	ListChatHibernationCandidates(ctx context.Context) ([]domain.SessionID, error)
 	// DeleteSession removes a session row only if it is still in seed state
 	// (no workspace, runtime handle, agent session id, or prompt; not
 	// terminated). Returns deleted=true when removal happened; deleted=false
@@ -462,15 +467,18 @@ type Manager struct {
 	codexOperationGate             ports.CodexOperationGate
 	startupBackgroundReconcileDone chan struct{}
 	startupBackgroundReconcileOnce sync.Once
-	statusRecoveryMu               sync.RWMutex
-	statusRecoveryFailed           bool
-	statusRecoveryRevision         uint64
-	statusRecoveries               map[domain.SessionID]statusRecovery
-	statusVerificationLimit        time.Duration
-	agentOpMu                      sync.Mutex
-	agentOperations                map[domain.SessionID]agentOperationKind
-	interfaceRecoveryMu            sync.Mutex
-	deferredInterfaceRecovery      map[domain.SessionID]string
+	// A cold Chat resume must not launch a new persistent host while startup's
+	// orphan-host sweep is using its earlier snapshot of sleeping sessions.
+	persistentHostReconcileDone <-chan struct{}
+	statusRecoveryMu            sync.RWMutex
+	statusRecoveryFailed        bool
+	statusRecoveryRevision      uint64
+	statusRecoveries            map[domain.SessionID]statusRecovery
+	statusVerificationLimit     time.Duration
+	agentOpMu                   sync.Mutex
+	agentOperations             map[domain.SessionID]agentOperationKind
+	interfaceRecoveryMu         sync.Mutex
+	deferredInterfaceRecovery   map[domain.SessionID]string
 	// switchDecisionInput opens a narrow human-only terminal lane while the
 	// source is blocked on permission during a mandatory switch.
 	switchDecisionInput map[domain.SessionID]domain.AgentSwitchID
@@ -561,6 +569,10 @@ func (m *Manager) acquireWorkspaceGate(projectID domain.ProjectID) func() {
 	return mu.Unlock
 }
 
+// Spawn rollback must release its project's gate before untimed cleanup.
+// OnceFunc makes the enclosing spawn's deferred release safe after that handoff.
+type spawnWorkspaceGateKey struct{}
+
 // SetHarnessUseGate late-binds the installer interlock after daemon wiring.
 func (m *Manager) SetHarnessUseGate(gate HarnessUseGate) {
 	m.harnessUseGate = gate
@@ -614,6 +626,13 @@ func (m *Manager) SetTerminalInputGate(gate TerminalInputGate) {
 // SetAgentReadiness completes daemon wiring before request handling begins.
 func (m *Manager) SetAgentReadiness(provider ports.AgentReadinessProvider) {
 	m.agentReadiness = provider
+}
+
+// SetPersistentHostReconcileDone fences cold Chat resumes until startup has
+// finished reaping hosts for sessions that were already hibernated on disk.
+// Daemon wiring installs the channel before opening the HTTP listener.
+func (m *Manager) SetPersistentHostReconcileDone(done <-chan struct{}) {
+	m.persistentHostReconcileDone = done
 }
 
 func (m *Manager) beginTerminalInputDrain(rec domain.SessionRecord) (lastInputAt time.Time, release func()) {
@@ -975,6 +994,9 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	// if it is unavailable for this harness or installation, fall back to TUI.
 	modeExplicitlyRequested := cfg.RequestedMode.Valid()
 	mode := m.resolveSessionMode(ctx, cfg.RequestedMode)
+	if cfg.Kind == domain.KindOrchestrator && !modeExplicitlyRequested {
+		mode = domain.SessionModeChat
+	}
 	if mode == domain.SessionModeChat {
 		if m.chat == nil {
 			if modeExplicitlyRequested {
@@ -1030,7 +1052,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		}
 	}
 
-	asyncChat := cfg.Async && mode == domain.SessionModeChat && cfg.Kind == domain.KindWorker && m.chat != nil
+	asyncChat := cfg.Async && mode == domain.SessionModeChat && m.chat != nil && (cfg.Kind == domain.KindOrchestrator || cfg.Kind == domain.KindWorker)
 
 	var prep *taskPreparation
 	if cfg.AutomationRunID == nil && cfg.Branch == "" {
@@ -1163,7 +1185,8 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 	// synchronous workspace lifecycle as before. Async Chat acquires it in its
 	// background half so the API response never waits on Git.
 	if !asyncChat {
-		releaseWorkspaceGate := m.acquireWorkspaceGate(cfg.ProjectID)
+		releaseWorkspaceGate := sync.OnceFunc(m.acquireWorkspaceGate(cfg.ProjectID))
+		ctx = context.WithValue(ctx, spawnWorkspaceGateKey{}, releaseWorkspaceGate)
 		defer releaseWorkspaceGate()
 	}
 	m.markFreshSessionStatusReady(id)
@@ -1231,11 +1254,32 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		}
 		return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrWorkspaceCreate, err)
 	}
-	// Per-project workspace provisioning: symlink shared files, then run any
-	// post-create commands (e.g. `pnpm install`) before the agent launches.
-	if err := m.provisionWorkspace(ctx, project, ws.Path); err != nil {
+	// The existing agent checkpoint distinguishes early publication from a
+	// completed promptless launch, including projects without setup commands.
+	plan := []domain.SessionProvisionStepID{domain.SessionProvisionStepAgent}
+	if len(project.Config.PostCreate) > 0 || len(project.Config.Symlinks) > 0 {
+		plan = append([]domain.SessionProvisionStepID{domain.SessionProvisionStepSetup}, plan...)
+	}
+	setupProgress := m.startProvisionProgress(ctx, id, plan)
+	if setupProgress.err != nil {
+		m.rollbackSeedSpawnWorkspace(ctx, rec, ws, workspaceProject, false, false)
+		return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrWorkspaceProvision, setupProgress.err)
+	}
+	// Publish actual adapter identity before setup can query its owning session.
+	if err := m.publishSpawnWorkspace(ctx, rec.ID, ws); err != nil {
 		m.rollbackSeedSpawnWorkspace(ctx, rec, ws, workspaceProject, false, false)
 		return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrWorkspaceProvision, err)
+	}
+	// Per-project workspace provisioning: symlink shared files, then run any
+	// post-create commands (e.g. `pnpm install`) before the agent launches.
+	if err := m.provisionWorkspace(ctx, project, rec, ws); err != nil {
+		m.rollbackSeedSpawnWorkspace(ctx, rec, ws, workspaceProject, false, false)
+		return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrWorkspaceProvision, err)
+	}
+	setupProgress.complete(ctx, domain.SessionProvisionStepSetup)
+	if setupProgress.err != nil {
+		m.rollbackSeedSpawnWorkspace(ctx, rec, ws, workspaceProject, false, false)
+		return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrWorkspaceProvision, setupProgress.err)
 	}
 
 	// CLI agents receive the prompt as text and cannot consume inline binary
@@ -1282,6 +1326,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 				return domain.SessionRecord{}, 0, 0, err
 			}
 		}
+		setupProgress.complete(ctx, domain.SessionProvisionStepAgent)
 		if cfg.ClientRequestID != "" {
 			if err := m.store.CommitClientRequestSession(ctx, id); err != nil {
 				return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrSpawnCommit, err)
@@ -1362,6 +1407,10 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		m.rollbackSeedSpawnWorkspace(ctx, rec, ws, workspaceProject, true, false)
 		return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrSpawnSupervisor, err)
 	}
+	if err := m.prepareRuntimeLaunch(ctx, agent, id, ws.Path, systemPrompt, systemPromptFile, adapterConfig, env); err != nil {
+		m.rollbackSeedSpawnWorkspace(ctx, rec, ws, workspaceProject, true, false)
+		return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrSpawnPrepare, err)
+	}
 	if err := m.lcm.PrepareLaunch(id, launchID); err != nil {
 		m.rollbackSeedSpawnWorkspace(ctx, rec, ws, workspaceProject, true, false)
 		return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrSpawnPrepareLaunch, err)
@@ -1380,6 +1429,16 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 		Env:           env,
 	})
 	if err != nil {
+		var effect ports.RuntimeEffectError
+		// ponytail: Setup completion does not prove descendant stop. Only no-setup
+		// failures with runtime-effect evidence permit later ordinary cleanup.
+		if len(plan) == 1 && errors.As(err, &effect) && (effect.EffectOutcome() == ports.RuntimeEffectNone || effect.CleanupOutcome() == ports.RuntimeCleanupSucceeded) {
+			cleanupCtx, cancel := spawnRollbackContext(ctx)
+			if _, writeErr := m.setProvisionState(cleanupCtx, id, domain.SessionProvisionFailed, "Synchronous runtime creation failed before controller publication"); writeErr != nil {
+				m.logger.Warn("spawn: record known runtime failure", "sessionID", id, "error", writeErr)
+			}
+			cancel()
+		}
 		m.rollbackSeedSpawnWorkspace(ctx, rec, ws, workspaceProject, true, false)
 		return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrRuntimeCreate, agentlaunch.RedactError(err, project.Config.Env))
 	}
@@ -1436,6 +1495,7 @@ func (m *Manager) Spawn(ctx context.Context, cfg ports.SpawnConfig) (domain.Sess
 			return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrSpawnCommit, err)
 		}
 	}
+	setupProgress.complete(ctx, domain.SessionProvisionStepAgent)
 	if cfg.ClientRequestID != "" {
 		if err := m.store.CommitClientRequestSession(ctx, id); err != nil {
 			return domain.SessionRecord{}, 0, 0, wrapSpawnStage(id, ErrSpawnCommit, err)
@@ -1483,8 +1543,15 @@ func (m *Manager) resolveAgentConfig(ctx context.Context, cfg ports.SpawnConfig,
 	if cfg.EffortOverride {
 		resolved.Effort = requested.Effort
 	}
-	if cfg.Harness != domain.HarnessCodex && cfg.Harness != domain.HarnessClaudeCode {
+	if cfg.Harness != domain.HarnessCodex && cfg.Harness != domain.HarnessClaudeCode && cfg.Harness != domain.HarnessCommandCode {
 		resolved.Effort = ""
+		return resolved, nil
+	}
+	if cfg.Harness == domain.HarnessCommandCode {
+		// Command Code's `cmd --list-models` catalog advertises no per-model
+		// effort levels, so there is nothing to validate against: forward the
+		// raw level (empty keeps the adapter default) and let `cmd --effort`
+		// reject unknown values at launch.
 		return resolved, nil
 	}
 	modelID := strings.TrimSpace(resolved.Model)
@@ -1529,6 +1596,13 @@ func (m *Manager) resolveAgentConfig(ctx context.Context, cfg ports.SpawnConfig,
 	if validateClaudeModel && selected == nil {
 		return ports.AgentConfig{}, fmt.Errorf("%w: model %q is not in the active provider catalog", ErrUnsupportedModel, modelID)
 	}
+	if selected != nil && len(selected.Efforts) == 0 && cfg.Harness == domain.HarnessClaudeCode {
+		// A family alias ("opus") carries no capabilities of its own; the CLI
+		// resolves it to the family's newest model, which the picker shows.
+		if concrete := newestClaudeFamilyModel(catalog.Models, modelID); concrete != nil {
+			selected = concrete
+		}
+	}
 	if modelChangedWithoutExplicitEffort {
 		if selected == nil || !containsString(selected.Efforts, base.Effort) {
 			resolved.Effort = ""
@@ -1544,6 +1618,76 @@ func (m *Manager) resolveAgentConfig(ctx context.Context, cfg ports.SpawnConfig,
 		return ports.AgentConfig{}, fmt.Errorf("%w %q for model %q", ports.ErrUnsupportedEffort, resolved.Effort, modelID)
 	}
 	return resolved, nil
+}
+
+var (
+	claudeFamilyAliases = []string{"fable", "opus", "sonnet", "haiku"}
+	claudeVersionNumber = regexp.MustCompile(`\d+`)
+	claudeVersionNoise  = regexp.MustCompile(`\(.*?\)|\[.*?\]`)
+)
+
+// newestClaudeFamilyModel returns the newest concrete catalog model of the
+// family a bare alias such as "opus" or "opus[1m]" names, or nil when alias is
+// not a family alias or the catalog has no such model.
+func newestClaudeFamilyModel(models []ports.AgentModelInfo, alias string) *ports.AgentModelInfo {
+	family := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(alias), "[1m]"))
+	if !containsString(claudeFamilyAliases, family) {
+		return nil
+	}
+	var best *ports.AgentModelInfo
+	var bestVersion []int
+	for i := range models {
+		if len(models[i].Efforts) == 0 {
+			continue
+		}
+		version := claudeFamilyVersion(models[i], family)
+		if version == nil {
+			continue
+		}
+		if best == nil || compareVersions(version, bestVersion) > 0 {
+			best, bestVersion = &models[i], version
+		}
+	}
+	return best
+}
+
+// claudeFamilyVersion reads major.minor from a model's label or ID, or nil when
+// the model is not in the family. Snapshot dates and "v1:0" suffixes are longer
+// than two digits or beyond the second number, so they are ignored.
+func claudeFamilyVersion(model ports.AgentModelInfo, family string) []int {
+	for _, text := range []string{model.Label, model.ID} {
+		lower := claudeVersionNoise.ReplaceAllString(strings.ToLower(text), "")
+		if !strings.Contains(lower, family) {
+			continue
+		}
+		var version []int
+		for _, part := range claudeVersionNumber.FindAllString(lower, -1) {
+			if len(part) <= 2 && len(version) < 2 {
+				n, _ := strconv.Atoi(part)
+				version = append(version, n)
+			}
+		}
+		if len(version) > 0 {
+			return version
+		}
+	}
+	return nil
+}
+
+func compareVersions(a, b []int) int {
+	for i := 0; i < len(a) || i < len(b); i++ {
+		var x, y int
+		if i < len(a) {
+			x = a[i]
+		}
+		if i < len(b) {
+			y = b[i]
+		}
+		if x != y {
+			return x - y
+		}
+	}
+	return 0
 }
 
 func containsString(values []string, value string) bool {
@@ -1699,7 +1843,7 @@ func (m *Manager) createSessionWorkspace(ctx context.Context, project domain.Pro
 		if projectKind == domain.ProjectKindScratch {
 			baseBranch = ""
 		}
-		ws, err := m.workspace.Create(ctx, ports.WorkspaceConfig{
+		workspaceCfg := ports.WorkspaceConfig{
 			ProjectID:     cfg.ProjectID,
 			SessionID:     id,
 			Kind:          cfg.Kind,
@@ -1708,7 +1852,13 @@ func (m *Manager) createSessionWorkspace(ctx context.Context, project domain.Pro
 			FreshBranch:   cfg.TaskPreparation != "",
 			BaseBranch:    baseBranch,
 			BaseRef:       baseRefs[filepath.Clean(project.Path)],
-		})
+		}
+		ws, err := m.workspace.Create(ctx, workspaceCfg)
+		if errors.Is(err, ports.ErrWorkspaceBranchCheckedOutElsewhere) && cfg.Kind == domain.KindOrchestrator && cfg.Branch == "" {
+			// Leave the occupied worktree intact; the adapter selects an unused suffix.
+			workspaceCfg.FreshBranch = true
+			ws, err = m.workspace.Create(ctx, workspaceCfg)
+		}
 		return ws, nil, err
 	}
 	workspaceProject, ok := m.workspace.(ports.WorkspaceProject)
@@ -1863,7 +2013,28 @@ func spawnGitSingleLine(ctx context.Context, root string, args ...string) (strin
 }
 
 func (m *Manager) destroySpawnWorkspace(ctx context.Context, ws ports.WorkspaceInfo, workspaceProject *ports.WorkspaceProjectInfo) bool {
-	var err error
+	if release, ok := ctx.Value(spawnWorkspaceGateKey{}).(func()); ok {
+		release()
+	}
+	release := m.acquireWorkspaceGate(ws.ProjectID)
+	inUse, err := m.isWorkspaceInUse(ctx, ws.ProjectID, ws.Path, ws.SessionID)
+	release()
+	if err != nil || inUse {
+		m.logger.Warn("spawn rollback: workspace ownership changed; preserving workspace", "sessionID", ws.SessionID, "error", err)
+		return false
+	}
+	if err := m.runPreRemove(ws.ProjectID, ws.Path); err != nil {
+		m.logger.Warn("spawn rollback: workspace cleanup failed; preserving workspace", "sessionID", ws.SessionID, "error", err)
+		return false
+	}
+	ctx, cancel := spawnRollbackContext(ctx)
+	defer cancel()
+	release = m.acquireWorkspaceGate(ws.ProjectID)
+	defer release()
+	if inUse, err := m.isWorkspaceInUse(ctx, ws.ProjectID, ws.Path, ws.SessionID); err != nil || inUse {
+		m.logger.Warn("spawn rollback: workspace ownership changed; preserving workspace", "sessionID", ws.SessionID, "error", err)
+		return false
+	}
 	if workspaceProject != nil {
 		if adapter, ok := m.workspace.(ports.WorkspaceProject); ok {
 			err = adapter.DestroyWorkspaceProject(ctx, *workspaceProject)
@@ -1937,9 +2108,8 @@ func (m *Manager) rollbackSeedSpawnWorkspace(ctx context.Context, rec domain.Ses
 			m.cleanupAgentWorkspace(cleanupCtx, rec, ws.Path)
 			cancel()
 		}
-		if published {
-			m.clearProvisionedWorkspace(ctx, rec.ID, ws.Path)
-		} else {
+		m.clearProvisionedWorkspace(ctx, rec.ID, ws.Path)
+		if !published {
 			m.rollbackSpawnSeedRowAfterFailure(ctx, rec.ID)
 			m.cleanupArtifactDir(rec.ID)
 		}
@@ -2224,7 +2394,8 @@ func (m *Manager) terminateWithPreservedWorkspace(ctx context.Context, id domain
 	return m.recordTermination(ctx, id, dropRestoreMarker)
 }
 
-// killTeardownBudget bounds the detached teardown Kill runs below. Sized just
+// killTeardownBudget bounds each detached teardown phase around cleanup scripts.
+// User cleanup commands have no time limit. Sized just
 // past the REST layer's default 60s request cap: long enough that a teardown
 // which was going to finish still finishes coherently after the caller has
 // given up, short enough that a genuinely wedged git or runtime call does not
@@ -2233,9 +2404,8 @@ func (m *Manager) terminateWithPreservedWorkspace(ctx context.Context, id domain
 const killTeardownBudget = 90 * time.Second
 
 // terminalIntentBudget bounds the two writes that record a kill actually
-// happened. They run on their own context because by the time Kill reaches
-// them every destructive step is already done: refusing the write because the
-// teardown budget ran out mid-unlink leaves a session dead everywhere except
+// happened. They run on their own context because the agent has already
+// stopped: refusing the write because the teardown budget ran out leaves a session dead everywhere except
 // the row the UI reads, and `ao session cleanup` only walks terminated rows, so
 // nothing can reach it afterwards (#5463). Short, because these are two small
 // local writes, not the git and runtime calls the teardown budget exists for.
@@ -2248,32 +2418,42 @@ const terminalIntentBudget = 15 * time.Second
 func (m *Manager) recordTermination(ctx context.Context, id domain.SessionID, dropRestoreMarker bool) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminalIntentBudget)
 	defer cancel()
+	var markerErr error
 	if dropRestoreMarker {
-		if err := m.store.DeleteSessionWorktrees(ctx, id); err != nil {
-			m.logger.Warn("kill: delete restore marker failed", "sessionID", id, "error", err)
-		}
+		markerErr = m.store.DeleteSessionWorktrees(ctx, id)
 	}
 	if err := m.lcm.MarkTerminated(ctx, id); err != nil {
-		return fmt.Errorf("kill %s: %w", id, err)
+		return fmt.Errorf("kill %s: %w", id, errors.Join(err, markerErr))
 	}
 	m.cleanupSystemPromptDir(id)
+	if markerErr != nil {
+		return fmt.Errorf("kill %s: clear restore marker: %w", id, markerErr)
+	}
 	return nil
 }
 
-// Kill tears down the runtime and workspace, then records terminal intent with
-// the LCM. A workspace teardown refused by the worktree-remove safety
-// (uncommitted work) is never forced: Kill succeeds with freed=false,
-// signalling the workspace was preserved for later inspection/cleanup while
-// the session itself is still marked terminated.
-//
-// A session whose runtime handle or workspace path is missing (e.g. spawn
-// failed partway, handle lost after a crash) is still terminated after the
-// available destroy steps are skipped so it can be cleaned up from the
-// dashboard.
+// KillResult distinguishes accepted cleanup from a preserved workspace.
+type KillResult struct {
+	Freed          bool
+	CleanupPending bool
+}
+
+// Kill waits for workspace retirement for internal callers that depend on it.
 func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
+	result, err := m.kill(ctx, id, false)
+	return result.Freed, err
+}
+
+// RequestKill stops the agent and persists terminal intent before returning.
+// Configured cleanup commands use the daemon's existing background workers.
+func (m *Manager) RequestKill(ctx context.Context, id domain.SessionID) (KillResult, error) {
+	return m.kill(ctx, id, true)
+}
+
+func (m *Manager) kill(ctx context.Context, id domain.SessionID, backgroundCleanup bool) (KillResult, error) {
 	// Teardown deliberately stops riding the caller's context. Kill runs a
-	// sequence (stop the agent, tear the controller down, drop the worktree,
-	// mark the row terminated) where being cancelled partway leaves a session
+	// sequence (stop the agent, tear the controller down, mark the row
+	// terminated, drop the worktree) where being cancelled partway leaves a session
 	// that is dead in every way except the one the UI reads: the row still says
 	// alive while its agent is gone. That is exactly what a caller-side timeout
 	// (the REST layer caps a request at cfg.RequestTimeout) or a closed browser
@@ -2287,28 +2467,36 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 	ctx, cancelTeardown := context.WithTimeout(context.WithoutCancel(ctx), budget)
 	defer cancelTeardown()
 	if err := m.cancelAsyncChatSpawn(ctx, id); err != nil {
-		return false, fmt.Errorf("kill %s: cancel provisioning: %w", id, err)
+		return KillResult{}, fmt.Errorf("kill %s: cancel provisioning: %w", id, err)
 	}
 
 	if err := m.beginAgentOperation(ctx, id, agentOperationKill); err != nil {
 		if errors.Is(err, errAgentOperationInProgress) {
 			err = ErrSwitchInProgress
 		}
-		return false, fmt.Errorf("kill %s: %w", id, err)
+		return KillResult{}, fmt.Errorf("kill %s: %w", id, err)
 	}
-	defer m.endAgentOperation(id, agentOperationKill)
+	releaseOperation := func() { m.endAgentOperation(id, agentOperationKill) }
+	defer func() {
+		if releaseOperation != nil {
+			releaseOperation()
+		}
+	}()
 
 	if active, err := m.hasActiveInterfaceTransition(ctx, id); err != nil {
-		return false, fmt.Errorf("kill %s: interface transition: %w", id, err)
+		return KillResult{}, fmt.Errorf("kill %s: interface transition: %w", id, err)
 	} else if active {
-		return false, fmt.Errorf("kill %s: %w", id, ErrInterfaceTransitionInProgress)
+		return KillResult{}, fmt.Errorf("kill %s: %w", id, ErrInterfaceTransitionInProgress)
 	}
 	rec, ok, err := m.store.GetSession(ctx, id)
 	if err != nil {
-		return false, fmt.Errorf("kill %s: %w", id, err)
+		return KillResult{}, fmt.Errorf("kill %s: %w", id, err)
 	}
 	if !ok {
-		return false, nil // already gone: benign race
+		return KillResult{}, nil // already gone: benign race
+	}
+	if uncertainWorkspaceLaunch(rec) || (rec.ProvisionState.WithDefault() == domain.SessionProvisionReady && unfinishedWorkspaceSetup(rec)) {
+		return KillResult{}, fmt.Errorf("kill %s: %w", id, ErrWorkspaceWriterStopUnproven)
 	}
 	m.stopPreviewBestEffort(ctx, id)
 	m.destroyBrowserBestEffort(ctx, id)
@@ -2318,19 +2506,19 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 	var workspaceProjectRows []ports.WorkspaceRepoInfo
 	workspaceProject := false
 	if rows, ok, rowErr := m.workspaceProjectRows(ctx, rec); rowErr != nil {
-		return false, fmt.Errorf("kill %s: workspace rows: %w", id, rowErr)
+		return KillResult{}, fmt.Errorf("kill %s: workspace rows: %w", id, rowErr)
 	} else if ok {
 		workspaceProjectRows = rows
 		workspaceProject = true
 	}
 	if err := m.terminateNativeSession(ctx, rec); err != nil {
-		return false, fmt.Errorf("kill %s: native session: %w", id, err)
+		return KillResult{}, fmt.Errorf("kill %s: native session: %w", id, err)
 	}
 	// Attachments are deliberately ignored by git, so stash cannot preserve
 	// legacy worktree-only files. Import them before any controller or worktree
 	// teardown; a failed import leaves the live session intact.
 	if err := m.importAttachments(ctx, rec); err != nil {
-		return false, fmt.Errorf("kill %s: preserve attachments: %w", id, err)
+		return KillResult{}, fmt.Errorf("kill %s: preserve attachments: %w", id, err)
 	}
 
 	// Exactly one controller exists, so exactly one gets torn down. A chat
@@ -2347,11 +2535,11 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 		// closes before the PID exits, so a hung host reads as gone. Terminating
 		// then would leave a possibly-live agent with no row pointing at it.
 		if err := m.runtime.Destroy(ctx, handle); err != nil {
-			return false, fmt.Errorf("kill %s: runtime: %w", id, err)
+			return KillResult{}, fmt.Errorf("kill %s: runtime: %w", id, err)
 		}
 	}
 	if err := m.terminateReviewer(ctx, id, "cancelled by worker session termination"); err != nil {
-		return false, fmt.Errorf("kill %s: reviewer: %w", id, err)
+		return KillResult{}, fmt.Errorf("kill %s: reviewer: %w", id, err)
 	}
 	// Gate shut any shell terminal scoped to this session BEFORE the worktree
 	// goes away: an open shell whose cwd is that directory can otherwise
@@ -2360,22 +2548,74 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 	// one in the same race window. A runtime that cannot be confirmed dead
 	// stops Kill here — same shape as a dirty-workspace refusal — rather than
 	// letting the worktree disappear out from under it.
+	var releaseTerminals func()
+	defer func() {
+		if releaseTerminals != nil {
+			releaseTerminals()
+		}
+	}()
 	if ws.Path != "" {
 		release, err := m.beginShellTerminalTeardown(ctx, id)
 		if err != nil {
 			// Same shape as the dirty-workspace refusal below: the worktree is
 			// left alone and the session is still terminated.
-			return false, m.terminateWithPreservedWorkspace(ctx, id, nil, true)
+			return KillResult{}, m.terminateWithPreservedWorkspace(ctx, id, nil, true)
 		}
-		if release != nil {
-			defer release()
-		}
+		releaseTerminals = release
 	}
 	freed := false
+	if ws.Path != "" {
+		// Persist terminal intent before user commands can wait indefinitely.
+		// Workspace-project rows remain inventory for a later cleanup retry.
+		if err := m.recordTermination(ctx, id, !workspaceProject); err != nil {
+			return KillResult{}, err
+		}
+		if backgroundCleanup {
+			project, err := m.loadProject(ctx, rec.ProjectID)
+			if err != nil {
+				return KillResult{}, err
+			}
+			if project.Kind.WithDefault() != domain.ProjectKindScratch && len(project.Config.PreRemove) > 0 {
+				if err := m.recordWorkspaceCleanup(ctx, rec, domain.DispositionPending, ""); err != nil {
+					return KillResult{}, err
+				}
+				// cleanupOne takes its own terminal guard. Keep the agent-operation
+				// guard throughout so neither restore nor retry can overlap this job.
+				if releaseTerminals != nil {
+					releaseTerminals()
+					releaseTerminals = nil
+				}
+				releaseOp := releaseOperation
+				releaseOperation = nil
+				m.runInBackground(func() {
+					defer releaseOp()
+					_, reason := m.cleanupOne(m.backgroundContext, rec, ws)
+					if reason == "" && workspaceProject {
+						if err := m.recordTermination(m.backgroundContext, id, true); err != nil {
+							reason = "workspace teardown failed"
+							m.logger.Warn("clear cleanup restore marker", "sessionID", id, "error", err)
+						}
+					}
+					if err := m.recordWorkspaceCleanupResult(m.backgroundContext, rec, reason); err != nil {
+						m.logger.Error("record background workspace cleanup", "sessionID", id, "error", err)
+					}
+				})
+				return KillResult{CleanupPending: true}, nil
+			}
+		}
+		if err := m.runPreRemove(rec.ProjectID, ws.Path); err != nil {
+			return KillResult{}, err
+		}
+		// Give workspace removal its own budget after untimed user commands.
+		cancelTeardown()
+		var cancelWorkspace context.CancelFunc
+		ctx, cancelWorkspace = context.WithTimeout(context.WithoutCancel(ctx), budget)
+		defer cancelWorkspace()
+	}
 	if workspaceProject {
 		reclaim, err := m.destroyWorkspaceProjectRows(ctx, workspaceProjectRows)
 		if err != nil {
-			return false, m.terminateWithPreservedWorkspace(ctx, id, err, false)
+			return KillResult{}, m.terminateWithPreservedWorkspace(ctx, id, err, false)
 		}
 		freed = reclaim != ""
 		if freed {
@@ -2383,7 +2623,7 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 		}
 	} else if ws.Path != "" {
 		if err := m.workspace.Destroy(ctx, ws); err != nil {
-			return false, m.terminateWithPreservedWorkspace(ctx, id, err, true)
+			return KillResult{}, m.terminateWithPreservedWorkspace(ctx, id, err, true)
 		}
 		freed = true
 		m.cleanupAgentWorkspace(ctx, rec, ws.Path)
@@ -2392,10 +2632,12 @@ func (m *Manager) Kill(ctx context.Context, id domain.SessionID) (bool, error) {
 	// resurrecting a killed session (#2319). For workspace projects it must
 	// happen after teardown reads the rows; dirty-preserved rows return above
 	// and are left as non-restorable inventory.
-	if err := m.recordTermination(ctx, id, true); err != nil {
-		return false, err
+	if ws.Path == "" || workspaceProject {
+		if err := m.recordTermination(ctx, id, true); err != nil {
+			return KillResult{}, err
+		}
 	}
-	return freed, nil
+	return KillResult{Freed: freed}, nil
 }
 
 // RetireForReplacement terminates a live orchestrator and releases its branch
@@ -2420,6 +2662,9 @@ func (m *Manager) RetireForReplacement(ctx context.Context, id domain.SessionID)
 	}
 	if !ok || rec.IsTerminated {
 		return nil
+	}
+	if uncertainWorkspaceLaunch(rec) || unfinishedWorkspaceSetup(rec) {
+		return fmt.Errorf("retire replacement %s: %w", id, ErrWorkspaceWriterStopUnproven)
 	}
 	m.stopPreviewBestEffort(ctx, id)
 	m.destroyBrowserBestEffort(ctx, id)
@@ -2482,6 +2727,12 @@ func (m *Manager) RetireForReplacement(ctx context.Context, id domain.SessionID)
 			return fmt.Errorf("retire replacement %s: runtime: %w", id, err)
 		}
 	}
+	if err := m.recordTermination(ctx, rec.ID, true); err != nil {
+		return err
+	}
+	m.runReplacementPreRemove(rec.ID, rec.ProjectID, ws.Path)
+	ctx, cancelWorkspace := context.WithTimeout(context.WithoutCancel(ctx), killTeardownBudget)
+	defer cancelWorkspace()
 	if err := m.workspace.ForceDestroy(ctx, ws); err != nil {
 		if staleWorkspace {
 			m.logger.Warn("retire replacement: stale workspace cleanup failed", "sessionID", id, "path", ws.Path, "error", err)
@@ -2489,12 +2740,6 @@ func (m *Manager) RetireForReplacement(ctx context.Context, id domain.SessionID)
 		return fmt.Errorf("retire replacement %s: force destroy: %w", id, err)
 	}
 	m.cleanupAgentWorkspace(ctx, rec, ws.Path)
-	if err := m.store.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
-		return fmt.Errorf("retire replacement %s: clear restore markers: %w", id, err)
-	}
-	if err := m.lcm.MarkTerminated(ctx, rec.ID); err != nil {
-		return fmt.Errorf("retire replacement %s: mark terminated: %w", id, err)
-	}
 	return nil
 }
 
@@ -2560,6 +2805,12 @@ func (m *Manager) retireWorkspaceProjectForReplacement(ctx context.Context, rec 
 			return fmt.Errorf("retire replacement %s: runtime: %w", rec.ID, err)
 		}
 	}
+	if err := m.recordTermination(ctx, rec.ID, false); err != nil {
+		return err
+	}
+	m.runReplacementPreRemove(rec.ID, rec.ProjectID, rec.Metadata.WorkspacePath)
+	ctx, cancelWorkspace := context.WithTimeout(context.WithoutCancel(ctx), killTeardownBudget)
+	defer cancelWorkspace()
 	for i := len(rows) - 1; i >= 0; i-- {
 		if err := m.workspace.ForceDestroy(ctx, workspaceInfoFromRepoInfo(rows[i])); err != nil {
 			if staleRepos[rows[i].RepoName] {
@@ -2571,9 +2822,6 @@ func (m *Manager) retireWorkspaceProjectForReplacement(ctx context.Context, rec 
 	m.cleanupAgentWorkspace(ctx, rec, rec.Metadata.WorkspacePath)
 	if err := m.store.DeleteSessionWorktrees(ctx, rec.ID); err != nil {
 		return fmt.Errorf("retire replacement %s: clear restore markers: %w", rec.ID, err)
-	}
-	if err := m.lcm.MarkTerminated(ctx, rec.ID); err != nil {
-		return fmt.Errorf("retire replacement %s: mark terminated: %w", rec.ID, err)
 	}
 	return nil
 }
@@ -2608,6 +2856,9 @@ func (m *Manager) RestoreWithMode(ctx context.Context, id domain.SessionID) (Res
 		return RestoreResult{}, fmt.Errorf("restore %s: %w", id, err)
 	}
 	defer releaseHarness()
+	if uncertainWorkspaceLaunch(rec) || unfinishedWorkspaceSetup(rec) {
+		return RestoreResult{}, fmt.Errorf("restore %s: %w", id, ErrWorkspaceWriterStopUnproven)
+	}
 	if !rec.IsTerminated {
 		return RestoreResult{}, fmt.Errorf("restore %s: %w", id, ErrNotRestorable)
 	}
@@ -2739,11 +2990,95 @@ func (m *Manager) recordAgentExited(ctx context.Context, rec domain.SessionRecor
 	return m.lcm.ApplyActivitySignal(ctx, rec.ID, signal)
 }
 
+// HibernateIdleChats releases eligible Chat provider processes. The chat
+// service rechecks turn completion and controller quiescence under its send lock.
+func (m *Manager) HibernateIdleChats(ctx context.Context) error {
+	ids, err := m.store.ListChatHibernationCandidates(ctx)
+	if err != nil {
+		return fmt.Errorf("list chats for hibernation: %w", err)
+	}
+	var errs []error
+	for _, id := range ids {
+		err := m.hibernateEligibleChat(ctx, id)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("hibernate chat %s: %w", id, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (m *Manager) hibernateEligibleChat(ctx context.Context, id domain.SessionID) error {
+	hibernator, ok := m.chat.(interface {
+		HibernateChat(context.Context, domain.SessionID) (bool, error)
+	})
+	if !ok {
+		return nil
+	}
+	operationCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if err := m.beginAgentOperation(operationCtx, id, agentOperationHibernate); err != nil {
+		if errors.Is(err, errAgentOperationInProgress) {
+			return nil
+		}
+		return err
+	}
+	defer m.endAgentOperation(id, agentOperationHibernate)
+	active, err := m.hasActiveInterfaceTransition(operationCtx, id)
+	if err != nil || active {
+		return err
+	}
+	_, err = hibernator.HibernateChat(operationCtx, id)
+	return err
+}
+
+// WakeHibernatedChat waits for an in-flight hibernation or wake, then resumes
+// the native provider conversation when there is no live Chat controller. This
+// also retries a failed wake after its durable marker was cleared.
+func (m *Manager) WakeHibernatedChat(ctx context.Context, id domain.SessionID) error {
+	waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		m.agentOpMu.Lock()
+		operation := m.agentOperations[id]
+		m.agentOpMu.Unlock()
+		if operation == agentOperationHibernate || operation == agentOperationResume {
+			select {
+			case <-waitCtx.Done():
+				return waitCtx.Err()
+			case <-ticker.C:
+				continue
+			}
+		}
+		rec, found, err := m.store.GetSession(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return ErrNotFound
+		}
+		if rec.HibernatedAt == nil && m.chat != nil && m.chat.HasLiveChatController(id) {
+			return nil
+		}
+		_, err = m.ResumeAgentWithMode(ctx, id)
+		if errors.Is(err, ErrResumeInProgress) {
+			m.agentOpMu.Lock()
+			operation = m.agentOperations[id]
+			m.agentOpMu.Unlock()
+			if operation == agentOperationHibernate || operation == agentOperationResume {
+				continue
+			}
+		}
+		return err
+	}
+}
+
 // ResumeAgentWithMode replaces an exited agent inside its still-live session.
 // Unlike RestoreWithMode, it preserves the existing worktree and terminal
 // identity and never changes the durable terminated flag as an intermediate
 // step.
-func (m *Manager) ResumeAgentWithMode(ctx context.Context, id domain.SessionID) (RestoreResult, error) {
+func (m *Manager) ResumeAgentWithMode(ctx context.Context, id domain.SessionID) (result RestoreResult, err error) {
 	if err := m.beginAgentResume(ctx, id); err != nil {
 		return RestoreResult{}, fmt.Errorf("resume agent %s: %w", id, err)
 	}
@@ -2764,6 +3099,13 @@ func (m *Manager) ResumeAgentWithMode(ctx context.Context, id domain.SessionID) 
 	}
 	if !ok {
 		return RestoreResult{}, fmt.Errorf("resume agent %s: %w", id, ErrNotFound)
+	}
+	if rec.HibernatedAt != nil && m.persistentHostReconcileDone != nil {
+		select {
+		case <-m.persistentHostReconcileDone:
+		case <-ctx.Done():
+			return RestoreResult{}, fmt.Errorf("resume agent %s: wait for persistent host reconciliation: %w", id, ctx.Err())
+		}
 	}
 	m.asyncChatSpawnsMu.Lock()
 	_, starting := m.asyncChatSpawns[id]
@@ -2786,6 +3128,9 @@ func (m *Manager) ResumeAgentWithMode(ctx context.Context, id domain.SessionID) 
 	if rec.ProvisionState.IsProvisioning() {
 		return RestoreResult{}, fmt.Errorf("resume agent %s: %w", id, ErrResumeInProgress)
 	}
+	if uncertainWorkspaceLaunch(rec) || (rec.ProvisionState.WithDefault() == domain.SessionProvisionReady && unfinishedWorkspaceSetup(rec)) {
+		return RestoreResult{}, fmt.Errorf("resume agent %s: %w", id, ErrWorkspaceWriterStopUnproven)
+	}
 	if rec.ProvisionState == domain.SessionProvisionFailed {
 		result, handedOff, err := m.retryFailedChatSpawn(ctx, rec, releaseHarness)
 		if handedOff {
@@ -2794,7 +3139,7 @@ func (m *Manager) ResumeAgentWithMode(ctx context.Context, id domain.SessionID) 
 		}
 		return result, err
 	}
-	if m.SessionStatusReadiness(rec) == "unavailable" {
+	if rec.HibernatedAt == nil && m.SessionStatusReadiness(rec) == "unavailable" {
 		m.beginStatusRecovery(id)
 		recoveryCtx, cancel := context.WithTimeout(ctx, m.statusVerificationLimit)
 		defer cancel()
@@ -2818,6 +3163,35 @@ func (m *Manager) ResumeAgentWithMode(ctx context.Context, id domain.SessionID) 
 		// existing durable-exited precondition.
 		if mode != domain.SessionModeChat || m.chat == nil {
 			return RestoreResult{}, fmt.Errorf("resume agent %s: %w", id, ErrAgentNotExited)
+		}
+	}
+	if rec.HibernatedAt != nil {
+		store, ok := m.store.(interface {
+			SetSessionHibernated(context.Context, domain.SessionID, int64, *time.Time) (bool, error)
+		})
+		if !ok {
+			return RestoreResult{}, fmt.Errorf("resume agent %s: hibernation store unavailable", id)
+		}
+		// A failed launch stays stopped. Keep its native identity for the existing
+		// Resume action instead of hiding the failure behind a sleep marker.
+		for range 3 {
+			if rec.HibernatedAt == nil {
+				break
+			}
+			_, clearErr := store.SetSessionHibernated(ctx, id, rec.Revision, nil)
+			if clearErr != nil {
+				return RestoreResult{}, fmt.Errorf("resume agent %s: clear hibernation: %w", id, clearErr)
+			}
+			rec, err = m.getRecord(ctx, id)
+			if err != nil {
+				return RestoreResult{}, err
+			}
+			if rec.IsTerminated {
+				return RestoreResult{}, fmt.Errorf("resume agent %s: %w", id, ErrTerminated)
+			}
+		}
+		if rec.HibernatedAt != nil {
+			return RestoreResult{}, fmt.Errorf("resume agent %s: hibernation state changed: %w", id, ErrResumeInProgress)
 		}
 	}
 	return m.resumeAgentRecordWithPolicy(ctx, "resume agent", rec, false, false)
@@ -2891,6 +3265,9 @@ func (m *Manager) relaunchSessionWithPolicy(
 }
 
 func (m *Manager) relaunchSessionWithPolicyAndGeneration(ctx context.Context, operation string, rec domain.SessionRecord, project domain.ProjectRecord, ws ports.WorkspaceInfo, restartHandle *ports.RuntimeHandle, forceFresh, requireNativeHistory bool, reservedGeneration string, historyPolicy domain.SessionInterfaceTransitionHistoryPolicy) (RestoreResult, error) {
+	if uncertainWorkspaceLaunch(rec) || unfinishedWorkspaceSetup(rec) {
+		return RestoreResult{}, fmt.Errorf("%s %s: %w", operation, rec.ID, ErrWorkspaceWriterStopUnproven)
+	}
 	// Relaunch dispatches from the currently committed persisted mode, never from
 	// a caller hint. The interface-transition coordinator changes that fact only
 	// after stopping the old controller, then reuses this ordinary restore path.
@@ -2911,7 +3288,7 @@ func (m *Manager) relaunchSessionWithPolicyAndGeneration(ctx context.Context, op
 	}
 	// Recompute standing instructions, then reapply the durable finalized inbound
 	// handoff for this exact native conversation when one exists.
-	systemPrompt, err := m.buildSystemPrompt(ctx, rec.Kind, rec.ProjectID, rec.ID)
+	systemPrompt, err := m.buildSystemPrompt(ctx, rec.Kind, rec.ProjectID, rec.ID, false)
 	if err != nil {
 		return RestoreResult{}, fmt.Errorf("%s %s: system prompt: %w", operation, rec.ID, err)
 	}
@@ -3006,6 +3383,10 @@ func (m *Manager) relaunchSessionWithPolicyAndGeneration(ctx context.Context, op
 	if err != nil {
 		m.cleanupSystemPromptDir(rec.ID)
 		return RestoreResult{}, fmt.Errorf("%s %s: supervisor: %w", operation, rec.ID, err)
+	}
+	if err := m.prepareRuntimeLaunch(ctx, agent, rec.ID, ws.Path, systemPrompt, systemPromptFile, agentConfig, env); err != nil {
+		m.cleanupSystemPromptDir(rec.ID)
+		return RestoreResult{}, fmt.Errorf("%s %s: runtime preparation: %w", operation, rec.ID, err)
 	}
 	if err := m.lcm.PrepareLaunch(rec.ID, launchID); err != nil {
 		m.cleanupSystemPromptDir(rec.ID)
@@ -3161,6 +3542,9 @@ func (m *Manager) SaveAndTeardownAll(ctx context.Context) error {
 // ForceDestroy; if either capture or the DB write fails, ForceDestroy is
 // not called.
 func (m *Manager) saveAndTeardownOne(ctx context.Context, rec domain.SessionRecord) error {
+	if uncertainWorkspaceLaunch(rec) || unfinishedWorkspaceSetup(rec) {
+		return fmt.Errorf("save %s: %w", rec.ID, ErrWorkspaceWriterStopUnproven)
+	}
 	// Gate shut this session's scoped shell terminals before either branch
 	// below force-removes its worktree. SaveAndTeardownAll only reaches here for
 	// a session with a real workspace, so there is always a worktree to protect.
@@ -3241,6 +3625,12 @@ func (m *Manager) saveAndTeardownOne(ctx context.Context, rec domain.SessionReco
 // worktree, preserving conversation identity when recovery fails. Startup uses
 // checkSessionHealth instead so missing agents stay stopped.
 func (m *Manager) reconcileLive(ctx context.Context, rec domain.SessionRecord) error {
+	if (uncertainWorkspaceLaunch(rec) || unfinishedWorkspaceSetup(rec)) && rec.ProvisionState.WithDefault() == domain.SessionProvisionReady {
+		return fmt.Errorf("reconcile %s: %w", rec.ID, ErrWorkspaceWriterStopUnproven)
+	}
+	if rec.HibernatedAt != nil {
+		return nil
+	}
 	project, err := m.loadProject(ctx, rec.ProjectID)
 	if err != nil {
 		return err
@@ -3469,9 +3859,9 @@ func (m *Manager) ReconcileStartupSafety(ctx context.Context) error {
 			}
 		}
 	}
-	// An asynchronous spawn lives in one daemon's memory. Anything still
-	// "starting" after a restart has no one left to finish it, so say so rather
-	// than leaving a session that spins forever.
+	// An asynchronous spawn lives in one daemon's memory. After a restart its
+	// Go operation cannot finish, though setup shells may survive. Record the
+	// interruption without reclaiming or replaying an unfinished setup writer.
 	if err == nil {
 		m.startupProvisioningRetries, err = m.failInterruptedProvisioningRecords(ctx, recs)
 		if err != nil {
@@ -3516,7 +3906,7 @@ func (m *Manager) ReconcileBackground(ctx context.Context) (resultErr error) {
 			continue
 		}
 		if _, err := m.setProvisionState(ctx, id, domain.SessionProvisionFailed,
-			"AO restarted before this session finished starting"); err != nil {
+			interruptedProvisioningError); err != nil {
 			m.logger.Warn("reconcile: interrupted session start retry failed", "sessionID", id, "error", err)
 		}
 	}
@@ -3545,7 +3935,7 @@ func (m *Manager) reconcileLivePass(ctx context.Context, recs []domain.SessionRe
 	candidates := make([]domain.SessionRecord, 0, len(recs))
 	ids := make([]domain.SessionID, 0, len(recs))
 	for _, rec := range recs {
-		if rec.IsTerminated || rec.IsTaskPreparation || rec.ProvisionState.WithDefault() != domain.SessionProvisionReady {
+		if rec.IsTerminated || rec.IsTaskPreparation || rec.HibernatedAt != nil || rec.ProvisionState.WithDefault() != domain.SessionProvisionReady {
 			continue
 		}
 		candidates = append(candidates, rec)
@@ -3660,6 +4050,19 @@ func (m *Manager) restoreAllSession(ctx context.Context, rec domain.SessionRecor
 	if len(rows) == 0 {
 		return
 	}
+	recreated := false
+	for _, row := range rows {
+		path := row.WorktreePath
+		if path == "" {
+			path = rec.Metadata.WorkspacePath
+		}
+		missing, statErr := workspacePathMissing(path)
+		if statErr != nil {
+			m.logger.Error("restore-all: inspect workspace failed", "sessionID", rec.ID, "error", statErr)
+			return
+		}
+		recreated = recreated || missing
+	}
 
 	// Step 1: ensure the worktree exists. workspace.Restore re-creates it
 	// if it was removed by SaveAndTeardownAll.
@@ -3733,6 +4136,12 @@ func (m *Manager) restoreAllSession(ctx context.Context, rec domain.SessionRecor
 			}
 		}
 	}
+	if recreated {
+		if err := m.provisionWorkspace(ctx, project, rec, ws); err != nil {
+			m.logger.Error("restore-all: setup recreated workspace failed", "sessionID", rec.ID, "error", err)
+			return
+		}
+	}
 
 	// Step 3: relaunch the agent in the restored workspace.
 	if _, err := m.relaunchRestoredSession(ctx, rec, project, ws); err != nil {
@@ -3796,6 +4205,10 @@ func (m *Manager) markSessionWorktreesActive(ctx context.Context, rows []domain.
 
 func (m *Manager) restoreSessionWorkspace(ctx context.Context, project domain.ProjectRecord, rec domain.SessionRecord) (ports.WorkspaceInfo, error) {
 	if projectKindForSession(project, rec.ProjectID) != domain.ProjectKindWorkspace {
+		recreated, err := workspacePathMissing(rec.Metadata.WorkspacePath)
+		if err != nil {
+			return ports.WorkspaceInfo{}, err
+		}
 		ws, err := m.workspace.Restore(ctx, ports.WorkspaceConfig{
 			ProjectID:     rec.ProjectID,
 			SessionID:     rec.ID,
@@ -3812,11 +4225,24 @@ func (m *Manager) restoreSessionWorkspace(ctx context.Context, project domain.Pr
 		if err := m.restoreAttachments(ctx, rec.ID, ws); err != nil {
 			return ports.WorkspaceInfo{}, fmt.Errorf("restore attachments: %w", err)
 		}
+		if recreated {
+			if err := m.provisionWorkspace(ctx, project, rec, ws); err != nil {
+				return ports.WorkspaceInfo{}, fmt.Errorf("setup recreated workspace: %w", err)
+			}
+		}
 		return ws, nil
 	}
 	rows, err := m.workspaceProjectRestoreRows(ctx, project, rec)
 	if err != nil {
 		return ports.WorkspaceInfo{}, err
+	}
+	recreated := false
+	for _, row := range rows {
+		missing, statErr := workspacePathMissing(row.Path)
+		if statErr != nil {
+			return ports.WorkspaceInfo{}, statErr
+		}
+		recreated = recreated || missing
 	}
 	root, err := m.restoreWorkspaceProjectRows(ctx, rows)
 	if err != nil {
@@ -3831,7 +4257,20 @@ func (m *Manager) restoreSessionWorkspace(ctx context.Context, project domain.Pr
 	if err := m.restoreAttachments(ctx, rec.ID, ws); err != nil {
 		return ports.WorkspaceInfo{}, fmt.Errorf("restore attachments: %w", err)
 	}
+	if recreated {
+		if err := m.provisionWorkspace(ctx, project, rec, ws); err != nil {
+			return ports.WorkspaceInfo{}, fmt.Errorf("setup recreated workspace: %w", err)
+		}
+	}
 	return ws, nil
+}
+
+func workspacePathMissing(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	}
+	return false, err
 }
 
 func (m *Manager) workspaceProjectRestoreRows(ctx context.Context, project domain.ProjectRecord, rec domain.SessionRecord) ([]ports.WorkspaceRepoInfo, error) {
@@ -4600,27 +5039,46 @@ func (m *Manager) Cleanup(ctx context.Context, project domain.ProjectID) (Cleanu
 // check timely: Spawn and Restore hold the same gate while they allocate a
 // workspace and commit metadata, so isWorkspaceInUse cannot race with an
 // in-progress spawn that has not yet written WorkspacePath to the store.
+// User commands run outside the gate; cleanupOne rechecks ownership under it
+// before removal.
 // Returns an empty reason when the workspace was reclaimed; a non-empty
 // reason means it was left alone this run and the reclaim value is undefined.
 func (m *Manager) cleanupWorkspaceUnderGate(ctx context.Context, rec domain.SessionRecord, ws ports.WorkspaceInfo) (ports.WorkspaceReclaim, string) {
-	release := m.acquireWorkspaceGate(rec.ProjectID)
-	defer release()
-
-	inUse, err := m.isWorkspaceInUse(ctx, rec.ProjectID, ws.Path)
-	if err != nil {
-		m.logger.Warn("cleanup: workspace ownership check failed", "sessionID", rec.ID, "projectID", rec.ProjectID, "error", err)
+	// A preceding session's cleanup commands can outlive the request deadline.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), killTeardownBudget)
+	defer cancel()
+	if err := m.beginAgentOperation(ctx, rec.ID, agentOperationKill); err != nil {
+		if errors.Is(err, errAgentOperationInProgress) {
+			return ports.WorkspaceReclaimRemoved, "workspace cleanup is already running"
+		}
 		return ports.WorkspaceReclaimRemoved, "workspace teardown failed"
 	}
-	if inUse {
-		return ports.WorkspaceReclaimRemoved, "workspace in use by a live session"
+	defer m.endAgentOperation(rec.ID, agentOperationKill)
+	facts, tracked, err := m.store.GetSessionCleanupFacts(ctx, rec.ID)
+	if err != nil {
+		m.logger.Error("read workspace cleanup facts", "sessionID", rec.ID, "error", err)
+		return ports.WorkspaceReclaimRemoved, "workspace teardown failed"
 	}
-	return m.cleanupOne(ctx, rec, ws)
+	tracked = tracked && facts.SessionGeneration == rec.CleanupGeneration
+	if tracked {
+		if err := m.recordWorkspaceCleanup(ctx, rec, domain.DispositionPending, ""); err != nil {
+			return ports.WorkspaceReclaimRemoved, "workspace teardown failed"
+		}
+	}
+	reclaim, reason := m.cleanupOne(ctx, rec, ws)
+	if tracked {
+		if err := m.recordWorkspaceCleanupResult(ctx, rec, reason); err != nil {
+			m.logger.Error("record retried workspace cleanup", "sessionID", rec.ID, "error", err)
+			return reclaim, "workspace teardown failed"
+		}
+	}
+	return reclaim, reason
 }
 
 // isWorkspaceInUse reports whether any non-terminated session in the project
 // references the given workspace path. Must be called under the project's
 // workspace gate; see cleanupWorkspaceUnderGate for the full invariant.
-func (m *Manager) isWorkspaceInUse(ctx context.Context, projectID domain.ProjectID, workspacePath string) (bool, error) {
+func (m *Manager) isWorkspaceInUse(ctx context.Context, projectID domain.ProjectID, workspacePath string, except domain.SessionID) (bool, error) {
 	if workspacePath == "" {
 		return false, nil
 	}
@@ -4628,8 +5086,13 @@ func (m *Manager) isWorkspaceInUse(ctx context.Context, projectID domain.Project
 	if err != nil {
 		return false, err
 	}
-	live := liveWorkspacePaths(recs)
-	return live[normalizeWorkspacePath(workspacePath)], nil
+	for _, rec := range recs {
+		if rec.ID != except && !rec.IsTerminated && rec.Metadata.WorkspacePath != "" &&
+			normalizeWorkspacePath(rec.Metadata.WorkspacePath) == normalizeWorkspacePath(workspacePath) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // cleanupOne reclaims one terminated session's workspace, gating shut any
@@ -4641,6 +5104,22 @@ func (m *Manager) isWorkspaceInUse(ctx context.Context, projectID domain.Project
 // call) — most commonly because a scoped shell terminal could not be
 // confirmed closed, so reclaiming would pull the ground out from under it.
 func (m *Manager) cleanupOne(ctx context.Context, rec domain.SessionRecord, ws ports.WorkspaceInfo) (ports.WorkspaceReclaim, string) {
+	if uncertainWorkspaceLaunch(rec) || unfinishedWorkspaceSetup(rec) {
+		return ports.WorkspaceReclaimRemoved, "prior setup writer stop is unproven; preserve workspace for manual recovery"
+	}
+	{
+		release := m.acquireWorkspaceGate(rec.ProjectID)
+
+		inUse, err := m.isWorkspaceInUse(ctx, rec.ProjectID, ws.Path, "")
+		release()
+		if err != nil {
+			m.logger.Warn("cleanup: workspace ownership check failed", "sessionID", rec.ID, "projectID", rec.ProjectID, "error", err)
+			return ports.WorkspaceReclaimRemoved, "workspace teardown failed"
+		}
+		if inUse {
+			return ports.WorkspaceReclaimRemoved, "workspace in use by a live session"
+		}
+	}
 	release, closeErr := m.beginShellTerminalTeardown(ctx, rec.ID)
 	if closeErr != nil {
 		m.logger.Warn("cleanup: shell terminal still open", "sessionID", rec.ID, "error", closeErr)
@@ -4652,6 +5131,20 @@ func (m *Manager) cleanupOne(ctx context.Context, rec domain.SessionRecord, ws p
 	if err := m.importAttachments(ctx, rec); err != nil {
 		m.logger.Warn("cleanup: attachment preservation failed", "sessionID", rec.ID, "error", err)
 		return ports.WorkspaceReclaimRemoved, "attachment preservation failed"
+	}
+	if err := m.runPreRemove(rec.ProjectID, ws.Path); err != nil {
+		m.logger.Warn("cleanup: workspace script failed; preserving workspace", "sessionID", rec.ID, "error", err)
+		return ports.WorkspaceReclaimRemoved, cleanupSkipReason(err)
+	}
+	ctx, cancelWorkspace := context.WithTimeout(m.backgroundContext, killTeardownBudget)
+	defer cancelWorkspace()
+	releaseWorkspaceGate := m.acquireWorkspaceGate(rec.ProjectID)
+	defer releaseWorkspaceGate()
+	if inUse, err := m.isWorkspaceInUse(ctx, rec.ProjectID, ws.Path, ""); err != nil {
+		m.logger.Warn("cleanup: workspace ownership check failed", "sessionID", rec.ID, "error", err)
+		return ports.WorkspaceReclaimRemoved, "workspace teardown failed"
+	} else if inUse {
+		return ports.WorkspaceReclaimRemoved, "workspace in use by a live session"
 	}
 
 	if rows, ok, rowErr := m.workspaceProjectRows(ctx, rec); rowErr != nil {
@@ -4692,6 +5185,13 @@ func (m *Manager) cleanupOne(ctx context.Context, rec domain.SessionRecord, ws p
 // it flows to the API response and CLI output, and teardown errors embed
 // internal filesystem paths.
 func cleanupSkipReason(err error) string {
+	var step *cleanupStepError
+	if errors.As(err, &step) {
+		return step.Error()
+	}
+	if errors.Is(err, ErrCleanupScript) {
+		return "workspace cleanup script failed"
+	}
 	if errors.Is(err, ports.ErrWorkspaceDirty) {
 		return "workspace has uncommitted changes"
 	}
@@ -4712,23 +5212,6 @@ func (m *Manager) cleanupRecords(ctx context.Context, project domain.ProjectID) 
 		return m.store.ListAllSessions(ctx)
 	}
 	return m.store.ListSessions(ctx, project)
-}
-
-// liveWorkspacePaths returns the set of normalized workspace paths still
-// occupied by a non-terminated session. Cleanup consults it so a terminated
-// session that shares a persistent worktree with a live successor is skipped
-// rather than reclaimed.
-func liveWorkspacePaths(recs []domain.SessionRecord) map[string]bool {
-	live := make(map[string]bool)
-	for _, rec := range recs {
-		if rec.IsTerminated {
-			continue
-		}
-		if p := rec.Metadata.WorkspacePath; p != "" {
-			live[normalizeWorkspacePath(p)] = true
-		}
-	}
-	return live
 }
 
 // normalizeWorkspacePath canonicalizes a workspace path for set membership so
@@ -4963,7 +5446,7 @@ func appendAttachmentReferences(prompt string, refs []string) string {
 // empty input box rather than receiving an auto-generated kickoff turn.
 func (m *Manager) buildSpawnTexts(ctx context.Context, cfg ports.SpawnConfig, sessionID domain.SessionID) (prompt, systemPrompt string, err error) {
 	prompt = buildPrompt(cfg)
-	systemPrompt, err = m.buildSystemPrompt(ctx, cfg.Kind, cfg.ProjectID, sessionID)
+	systemPrompt, err = m.buildSystemPrompt(ctx, cfg.Kind, cfg.ProjectID, sessionID, domain.NormalizeSessionMode(cfg.RequestedMode) == domain.SessionModeChat)
 	if err != nil {
 		return "", "", err
 	}
@@ -4974,7 +5457,9 @@ func (m *Manager) buildSpawnTexts(ctx context.Context, cfg ports.SpawnConfig, se
 // given kind from current store state. Restore recomputes them through here
 // rather than persisting them, so a restored worker points at the orchestrator
 // that is active now, not the one from its original spawn.
-func (m *Manager) buildSystemPrompt(ctx context.Context, kind domain.SessionKind, projectID domain.ProjectID, sessionID domain.SessionID) (string, error) {
+// buildSystemPrompt assembles the standing instructions. chat says whether the
+// agent runs as a chat session, the only mode with the html tools and ao render.
+func (m *Manager) buildSystemPrompt(ctx context.Context, kind domain.SessionKind, projectID domain.ProjectID, sessionID domain.SessionID, chat bool) (string, error) {
 	project, err := m.loadProject(ctx, projectID)
 	if err != nil {
 		return "", err
@@ -5020,10 +5505,10 @@ func (m *Manager) buildSystemPrompt(ctx context.Context, kind domain.SessionKind
 			cfg.AdditionalSections = append(cfg.AdditionalSections, workspacePrompt)
 		}
 	}
-	if pointer := strings.TrimSpace(m.aoSkillPointer()); pointer != "" {
+	if pointer := strings.TrimSpace(m.aoSkillPointer(chat)); pointer != "" {
 		cfg.AdditionalSections = append(cfg.AdditionalSections, pointer)
 	}
-	if artifactPrompt := strings.TrimSpace(m.artifactPrompt(sessionID)); artifactPrompt != "" {
+	if artifactPrompt := strings.TrimSpace(m.artifactPrompt(sessionID, chat)); artifactPrompt != "" {
 		cfg.AdditionalSections = append(cfg.AdditionalSections, artifactPrompt)
 	}
 	return buildSystemPromptText(cfg), nil
@@ -5035,19 +5520,31 @@ func (m *Manager) buildSystemPrompt(ctx context.Context, kind domain.SessionKind
 // project's worktree, not just the AO repo (the only place a repo-relative
 // skills/ path would exist). The skill file carries exact flags and examples,
 // so the standing prompt stays a short pointer rather than a command dump.
-func (m *Manager) aoSkillPointer() string {
+// aoSkillPointer is the always-on AO guide pointer. The html tools and ao
+// render work only in chat sessions, so only a chat prompt names them.
+func (m *Manager) aoSkillPointer(chat bool) string {
 	dir := skillassets.Dir(m.dataDir)
 	skillFile := filepath.ToSlash(filepath.Join(dir, "SKILL.md"))
 	commandsGlob := filepath.ToSlash(filepath.Join(dir, "commands", "*.md"))
 	browserFile := filepath.ToSlash(filepath.Join(dir, "commands", "browser.md"))
 	previewFile := filepath.ToSlash(filepath.Join(dir, "commands", "preview.md"))
-	return "\n\n" + "## Using the ao CLI\n\n" +
+	renderFile := filepath.ToSlash(filepath.Join(dir, "commands", "render.md"))
+	pointer := "\n\n" + "## Using the ao CLI\n\n" +
 		"When using `ao`, read `" + skillFile + "` and only the relevant file under `" + commandsGlob + "`; do not load unrelated command guides.\n\n" +
 		"## AO desktop Browser panel\n\n" +
 		"For frontend work, read `" + previewFile + "` before previewing or starting an app. Static file targets passed to `ao preview` are relative to the session workspace root, regardless of the shell's current directory: use `ao preview README.md`, not `../README.md`. AO serves workspace files through its existing confined loopback preview; do not use `file://` or start a server just to display static files. Never create or modify `package.json` or install dependencies solely to display static files. Do not create `.ao/launch.json` unless the user asks. Automatically open the primary requested browser-displayable artifact immediately after creating or materially updating it, but do not replace an active application preview with a supporting asset. " +
 		"For page inspection or interaction, read `" + browserFile + "` and use `ao browser` from this AO session. Browser network capture is optional and off by default; follow that guide and never enable it for routine browser actions. " +
 		"Do not use Codex/host in-app browser connectors, `agent.browsers.get(\"iab\")`, or a browser MCP for the AO Browser panel: those are separate browser runtimes and cannot see or control AO's session-owned page. " +
 		"`ao browser` operates the same live page the user sees in that panel."
+	if !chat {
+		return pointer
+	}
+	return pointer + "\n\n" +
+		"## Showing pages in chat\n\n" +
+		"When a chart, table, diagram, or mockup is clearer than text, call `html_preview`, then `html_render`. " +
+		"If you cannot see them, search your tools for them. " +
+		"If you find nothing, read `" + renderFile + "` and use `ao render`. " +
+		"Do not use a built-in visualize skill."
 }
 
 func (m *Manager) workspaceProjectPrompt(ctx context.Context, kind domain.SessionKind, projectID domain.ProjectID) (string, error) {
@@ -5116,10 +5613,12 @@ func systemPromptFileRequired(harness domain.AgentHarness) bool {
 	case domain.HarnessGemini, domain.HarnessAider,
 		domain.HarnessAgy,
 		domain.HarnessAuggie,
+		domain.HarnessCommandCode,
 		domain.HarnessKiro,
 		domain.HarnessOpenCode,
 		domain.HarnessCopilot,
-		domain.HarnessVibe:
+		domain.HarnessVibe,
+		domain.HarnessOpenHands:
 		return true
 	default:
 		return false
@@ -5158,14 +5657,21 @@ func (m *Manager) cleanupArtifactDir(id domain.SessionID) {
 	}
 }
 
-func (m *Manager) artifactPrompt(id domain.SessionID) string {
+// artifactPrompt tells the agent where deliverables go. Only a chat session can
+// show a page in its thread, so only a chat prompt sends charts there.
+func (m *Manager) artifactPrompt(id domain.SessionID, chat bool) string {
 	dir := filepath.ToSlash(m.artifactDir(id))
 	if dir == "" {
 		return ""
 	}
+	inThread := ""
+	if chat {
+		inThread = "In a chat session, a chart, table, or diagram that answers a question goes in the thread with `html_render`, not into this directory. "
+	}
 	return "## Session Artifacts\n\n" +
 		"Any deliverable that is not part of a pull request — a one-pager, analysis, plan, design doc, report, or other generated file — must be written to `" + dir + "`, never into the git workspace, even temporarily. " +
 		"This applies even when a workspace-relative path like `docs/`, `docs/plans/`, or `notes/` would otherwise feel like the natural place for it: if it is not shipping in a PR, it does not belong in the workspace at all. " +
+		inThread +
 		"Keep the workspace limited to code changes that will ship in a PR. Preserve any relative asset links between files you place in the artifact directory. " +
 		"Create a separate document when the user requests a durable document or when the task needs a reviewable deliverable. Ordinary progress updates, concise final answers, and validation summaries can stay in chat or AO report notes; do not create files solely because a response is a summary, plan, analysis, or report. " +
 		"Routine test logs, command output, scratch notes, and intermediate diagnostics are working material, not deliverables. Keep them out of report attachments unless requested or needed to explain an actionable failure. Prefer one consolidated deliverable over many diagnostic files. " +
@@ -5432,11 +5938,31 @@ func HookPATH(executable func() (string, error), getenv func(string) string, pro
 // worktree exists: symlink shared files from the project repo, then run any
 // post-create commands. Either failing aborts the spawn so a half-provisioned
 // workspace never launches an agent.
-func (m *Manager) provisionWorkspace(ctx context.Context, project domain.ProjectRecord, workspacePath string) error {
-	if err := applySymlinks(project.Path, workspacePath, project.Config.Symlinks); err != nil {
+func (m *Manager) provisionWorkspace(ctx context.Context, project domain.ProjectRecord, rec domain.SessionRecord, ws ports.WorkspaceInfo) error {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return runPostCreate(ctx, workspacePath, project.Config.PostCreate, project.Config.Env)
+	if err := applySymlinks(project.Path, ws.Path, project.Config.Symlinks); err != nil {
+		return err
+	}
+	env := m.runtimeEnv(rec.ID, rec.ProjectID, rec.IssueID, project.Config.Env)
+	setProtectedEnv(env, EnvRunFile, m.runFilePath, envKeysCaseInsensitive)
+	setProtectedEnv(env, "AO_WORKSPACE_PATH", ws.Path, envKeysCaseInsensitive)
+	if err := runPostCreate(ctx, ws.Path, project.Path, project.Config.PostCreate, project.Config.Env, env); err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
+func (m *Manager) publishSpawnWorkspace(ctx context.Context, id domain.SessionID, ws ports.WorkspaceInfo) error {
+	updated, err := m.store.SetSessionProvisionedWorkspace(ctx, id, ws.Branch, ws.Path, ws.RepoPath, m.clock())
+	if err != nil {
+		return err
+	}
+	if !updated {
+		return errors.New("session no longer accepts workspace publication")
+	}
+	return ctx.Err()
 }
 
 // applySymlinks links each repo-relative path into the workspace. A source that
@@ -5492,31 +6018,42 @@ func safeRelPath(rel string) (string, error) {
 }
 
 // runPostCreate runs each post-create command in the workspace via the platform
-// shell, so OS-agnostic commands like "pnpm install" work. A non-zero exit
-// aborts the spawn with the command output.
-func runPostCreate(ctx context.Context, workspacePath string, commands []string, projectEnv map[string]string) error {
-	for _, command := range commands {
+// shell (sh on Unix, cmd on Windows). Each step has its own ten-minute
+// deadline. A non-zero exit aborts the spawn with bounded, redacted output.
+func runPostCreate(ctx context.Context, workspacePath, sourcePath string, commands []string, projectEnv, sessionEnv map[string]string) error {
+	for index, command := range commands {
 		command = strings.TrimSpace(command)
 		if command == "" {
 			continue
 		}
-		var cmd *exec.Cmd
-		if runtime.GOOS == "windows" {
-			cmd = aoprocess.CommandContext(ctx, "cmd", "/c", command)
-		} else {
-			cmd = aoprocess.CommandContext(ctx, "sh", "-c", command)
-		}
-		cmd.Dir = workspacePath
-		cmd.Env = os.Environ()
-		for key, value := range agentlaunch.MergeEnv(projectEnv, nil) {
-			cmd.Env = append(cmd.Env, key+"="+value)
-		}
-		if out, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("postCreate %q: %w: %s", agentlaunch.RedactValues(command, projectEnv), err, agentlaunch.RedactValues(strings.TrimSpace(string(out)), projectEnv))
+		stepCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		out := &setupOutput{}
+		env := agentlaunch.MergeEnv(projectEnv, sessionEnv)
+		setProtectedEnv(env, "AO_SOURCE_TREE_PATH", sourcePath, envKeysCaseInsensitive)
+		setProtectedEnv(env, "AO_WORKTREE_PATH", workspacePath, envKeysCaseInsensitive)
+		err := runWorkspaceStep(stepCtx, workspacePath, command, env, out)
+		cancel()
+		if err != nil {
+			message := agentlaunch.RedactValues(strings.TrimSpace(out.String()), projectEnv)
+			return fmt.Errorf("setup step %d failed: %w: %s", index+1, err, message)
 		}
 	}
 	return nil
 }
+
+// setupOutput retains the last 8 KiB so a noisy installer cannot grow daemon memory.
+type setupOutput struct{ tail []byte }
+
+func (o *setupOutput) Write(p []byte) (int, error) {
+	n := len(p)
+	o.tail = append(o.tail, p...)
+	if len(o.tail) > 8192 {
+		o.tail = append([]byte(nil), o.tail[len(o.tail)-8192:]...)
+	}
+	return n, nil
+}
+
+func (o *setupOutput) String() string { return string(o.tail) }
 
 // preLauncher is an optional Agent capability: a step the manager runs before
 // launch. Claude Code implements it to record workspace trust in ~/.claude.json
@@ -5524,6 +6061,15 @@ func runPostCreate(ctx context.Context, workspacePath string, commands []string,
 // pane. Adapters that don't need it simply omit the method.
 type preLauncher interface {
 	PreLaunch(ctx context.Context, cfg ports.LaunchConfig) error
+}
+
+// runtimeLaunchPreparer is an optional Agent capability for configuration that
+// must include AO's freshly assigned runtime generation. It runs after
+// superviseAgentProcess has pinned AO_RUNTIME_LAUNCH_ID and before the runtime
+// starts, so provider callbacks can carry the same stale-process fence used by
+// native AO hooks.
+type runtimeLaunchPreparer interface {
+	PrepareRuntimeLaunch(ctx context.Context, cfg ports.WorkspaceHookConfig) error
 }
 
 // workspaceCleaner is an optional Agent capability for durable agent-side state
@@ -5570,6 +6116,22 @@ func (m *Manager) prepareWorkspace(ctx context.Context, agent ports.Agent, id do
 		}
 	}
 	return nil
+}
+
+func (m *Manager) prepareRuntimeLaunch(ctx context.Context, agent ports.Agent, id domain.SessionID, workspacePath, systemPrompt, systemPromptFile string, agentConfig ports.AgentConfig, env map[string]string) error {
+	preparer, ok := agent.(runtimeLaunchPreparer)
+	if !ok {
+		return nil
+	}
+	return preparer.PrepareRuntimeLaunch(ctx, ports.WorkspaceHookConfig{
+		SessionID:        string(id),
+		WorkspacePath:    workspacePath,
+		DataDir:          m.dataDir,
+		Env:              env,
+		SystemPrompt:     systemPrompt,
+		SystemPromptFile: systemPromptFile,
+		Config:           agentConfig,
+	})
 }
 
 func (m *Manager) cleanupPreparedAgentWorkspace(ctx context.Context, agent ports.Agent, id domain.SessionID, workspacePath string, env map[string]string) {

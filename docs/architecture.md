@@ -18,6 +18,42 @@ Chat, but both controllers are never live at once. The daemon coordinates both
 modes through the same session, lifecycle, workspace, storage, and observation
 boundaries.
 
+Workspace setup publishes the adapter-returned path, branch, and repository
+before `postCreate` executes. Its `AO_*` session context is daemon-owned; project
+and inherited environment values cannot override that identity. Publication
+alone does not make the controller live or prove setup completed.
+
+A controller-free early publication with no committed launch identity is
+preserved after daemon death, including when setup is `done` or absent. Startup
+health does not remove its row, path, Git registration, or payload. The same
+incomplete client request remains refused. Resume, restore, and teardown do not
+prove that a prior setup writer stopped and must not silently reclaim or launch
+that workspace. A shell or descendant can survive daemon-only `SIGKILL`, even
+when Git reports the workspace clean. A Chat controller generation can be
+reserved before `ControllerReady`; that reservation alone is not a committed
+provider/controller identity and does not permit recovery or teardown.
+If startup cannot persist its interrupted-start failure, Kill preserves the
+published provisioning row and refuses with unproven writer-stop evidence.
+Only the current Manager that owns and joins the start may mark it cancelled;
+stale starts with no published workspace retain ordinary cancellation.
+
+A synchronous runtime creation failure with no setup stage records the existing
+failed provision state only when the runtime reports no effect or successful
+cleanup. If immediate workspace removal refuses, later cleanup can retry the
+adapter once its refusal cause clears. Dirty-workspace checks and ordinary
+Restore errors still apply. An unknown runtime effect is not completion proof.
+A retained launch that ran setup remains uncertain even when its parent shell
+returned: existing checkpoints do
+not distinguish surviving descendants, so this path keeps the manual ceiling.
+
+Recovery has a manual ceiling: identify and stop every prior setup writer,
+preserve its work, then repair or remove the incomplete launch through an
+explicit operator recovery procedure. These checkpoints do not contain native
+writer-stop evidence, so ordinary Resume is not that procedure. There is no
+automatic clean retry, execution lease, or new supervisor. Known in-process
+failed setup rollback and ordinary completed-controller recovery retain their
+existing behavior.
+
 ## Table of contents
 
 - [Mental model](#mental-model)
@@ -53,21 +89,31 @@ flowchart LR
 The only persistent session state is:
 
 - Claude and Codex TUI hook facts: the current parent turn and native subagent IDs are retained per runtime launch so activity stays active while a background subagent works. Codex also retains a successful spawn tool call until its delayed child-start hook supplies the native ID.
-- `activity_state`: What the agent last reported (`active`, `idle`,
-  `waiting_input`, `blocked`, `exited`). `waiting_input` is an agent at an
-  empty prompt awaiting its next instruction. `blocked` is an agent stopped on
-  a pending permission or approval decision. Automation must never inject input
-  into a blocked session.
-- `is_terminated`: Whether the session should be treated as over.
-- `session_mode` plus its runtime/provider handle and generation: The currently
-  committed controller epoch.
-- `session_interface_transitions`: Durable checkpoints for an in-progress or
-  completed TUI↔Chat handoff.
-- PR facts: `pr`, `pr_checks`, and `pr_comment` tables.
+- `activity_state` — What the agent last reported (`active`, `idle`, `waiting_input`, `blocked`, `exited`). In Chat, `waiting_input` means an approval, input request, or reauthentication is pending. TUI hooks can use it for an empty prompt; `blocked` means a pending permission decision. Automation must never inject input into a blocked session.
+- `hibernated_at` — A Chat provider host was deliberately stopped after a settled idle turn; its native conversation can be resumed on new work.
+- `is_terminated` — Whether the session should be treated as over
+- `session_mode` plus its runtime/provider handle and generation — The currently committed controller epoch
+- `session_interface_transitions` — Durable checkpoints for an in-progress or completed TUI↔Chat handoff
+- PR facts — `pr`, `pr_checks`, `pr_comment` tables
 
 ### What is not durable
 
 Display status like `working`, `needs_input`, `ci_failed`, `mergeable` are **computed at read time** by the service layer from the durable facts above.
+
+### Chat hibernation boundary
+
+| Agent and controller state | Hibernate? | Reason |
+| --- | --- | --- |
+| Provisioning, connecting, or recovering | No | Controller ownership or provider state is unsettled. |
+| Active or busy; queued/running turn | No | Work is in flight. |
+| Waiting for input or blocked on approval | No | A provider request is still pending. |
+| Idle after an unconfirmed turn | No | The latest prompt has no durable terminal outcome. |
+| Ready and idle after the latest primary turn settled, with the primary Chat tab open | No | A short view lease keeps the provider ready for interaction. |
+| Ready and idle after the latest primary turn settled, with no Chat view | Yes, while Developer Mode enables hibernation, if the native conversation supports resume and no transition or pending work exists | Leaving the Chat tab checks immediately; a 30-second sweep catches turns that finish later. |
+| Hibernated | Already cold | Opening the primary Chat tab, sending, or an AO relay wakes the native conversation in the background. |
+| Exited or terminated | No | Existing resume or restore behavior applies. |
+
+The daemon starts with Chat hibernation disabled; the desktop synchronizes its Developer Mode toggle when the daemon becomes ready. TUI sessions keep their runtime lifecycle. The Chat view renews its lease every 10 seconds; an abandoned lease expires after 30 seconds. A renewal only extends the lease: after a failed wake, reopening the view, sending work, or using the visible retry action can attempt native resume again. Hibernation records a process boundary, not a display status: the session's derived board status continues to use activity and PR facts.
 
 ---
 

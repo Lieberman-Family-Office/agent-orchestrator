@@ -35,13 +35,74 @@ SELECT * FROM conversations WHERE id = ? LIMIT 1;
 -- name: HasConversationTurns :one
 SELECT EXISTS (SELECT 1 FROM conversation_turns WHERE conversation_id = ?);
 
+-- Hibernation only needs the latest visible user prompt's outcome. Match the
+-- active-branch and discarded-turn filters used by SelectConversationMessages
+-- without loading the entire conversation timeline.
+-- name: LatestVisibleUserTurnSettled :one
+WITH RECURSIVE active_path(branch_id, max_sequence) AS (
+    SELECT conversations.active_branch_id, CAST(NULL AS INTEGER)
+    FROM conversations
+    WHERE conversations.id = sqlc.arg(conversation_id)
+    UNION ALL
+    SELECT branch.parent_branch_id,
+           CASE
+               WHEN path.max_sequence IS NULL THEN branch.fork_after_sequence
+               WHEN branch.fork_after_sequence < path.max_sequence THEN branch.fork_after_sequence
+               ELSE path.max_sequence
+           END
+    FROM active_path AS path
+    JOIN conversation_branches AS branch ON branch.id = path.branch_id
+    WHERE branch.parent_branch_id IS NOT NULL
+), latest_user AS (
+    SELECT turn.handled_by_session_id, turn.state, turn.completed_at
+    FROM conversation_messages AS message
+    JOIN active_path AS path ON path.branch_id = message.branch_id
+    LEFT JOIN conversation_turns AS turn ON turn.id = message.turn_id
+    WHERE message.conversation_id = sqlc.arg(conversation_id)
+      AND message.role = 'user'
+      AND (path.max_sequence IS NULL OR message.sequence <= path.max_sequence)
+      AND (message.turn_id IS NULL OR turn.id IS NULL OR (
+          turn.rolled_back_at IS NULL AND turn.promoted_to_turn_id IS NULL AND turn.state <> 'cancelled'
+      ))
+    ORDER BY message.sequence DESC
+    LIMIT 1
+)
+SELECT EXISTS (
+    SELECT 1 FROM latest_user
+    WHERE handled_by_session_id = sqlc.arg(session_id)
+      AND completed_at IS NOT NULL
+      AND state IN ('completed', 'failed', 'interrupted', 'recovered')
+);
+
 -- name: ReleaseUntouchedConversationProvider :execrows
+-- The conversation's current session is the owner. A project conversation
+-- (orchestrator) has no owning session_id, and its root branch's session_id
+-- records the orchestrator that created it, not the one that holds it now.
 UPDATE conversation_branches
 SET provider_conversation_id = '', provider_scope_id = sqlc.arg(provider_scope_id)
-WHERE conversation_branches.session_id = sqlc.arg(session_id) AND parent_branch_id IS NULL
+WHERE parent_branch_id IS NULL
   AND conversation_branches.id = (
       SELECT c.active_branch_id FROM conversations AS c
-      WHERE c.session_id = sqlc.arg(session_id) AND c.current_session_id = sqlc.arg(session_id)
+      WHERE c.current_session_id = sqlc.arg(session_id)
+        AND (c.session_id = sqlc.arg(session_id) OR (c.scope = 'project' AND c.session_id IS NULL))
+        AND c.latest_sequence = 0
+        AND NOT EXISTS (
+            SELECT 1 FROM conversation_turns WHERE conversation_id = c.id
+        )
+  );
+
+-- name: ReplaceUntouchedConversationProvider :execrows
+-- Same proof as ReleaseUntouchedConversationProvider, but rebinds the empty
+-- root to a fresh provider id and keeps its provider scope, which is part of
+-- the persistent provider host's identity.
+UPDATE conversation_branches
+SET provider_conversation_id = sqlc.arg(provider_conversation_id)
+WHERE parent_branch_id IS NULL
+  AND conversation_branches.provider_conversation_id = sqlc.arg(expected_provider_conversation_id)
+  AND conversation_branches.id = (
+      SELECT c.active_branch_id FROM conversations AS c
+      WHERE c.current_session_id = sqlc.arg(session_id)
+        AND (c.session_id = sqlc.arg(session_id) OR (c.scope = 'project' AND c.session_id IS NULL))
         AND c.latest_sequence = 0
         AND NOT EXISTS (
             SELECT 1 FROM conversation_turns WHERE conversation_id = c.id
@@ -837,6 +898,7 @@ WHERE conversation_activities.conversation_id = ?
 -- offset, so a multi-byte character here silently corrupts later queries.
 -- name: SelectNextQueuedConversationTurn :one
 SELECT conversation_turns.id,
+       conversation_turns.interrupt_target_provider_turn_id,
        conversation_messages.text,
        conversation_messages.client_message_id,
        conversation_messages.origin,
@@ -845,11 +907,75 @@ FROM conversation_turns
 JOIN conversation_messages
     ON conversation_messages.turn_id = conversation_turns.id
     AND conversation_messages.role = 'user'
+LEFT JOIN conversation_turns interrupt_target
+    ON conversation_turns.interrupt_target_provider_turn_id <> ''
+    AND interrupt_target.conversation_id = conversation_turns.conversation_id
+    AND interrupt_target.provider_turn_id = conversation_turns.interrupt_target_provider_turn_id
 WHERE conversation_turns.conversation_id = ?
   AND conversation_turns.state = 'queued'
   AND conversation_turns.promotion_started_at IS NULL
-ORDER BY conversation_turns.requested_at, conversation_turns.rowid
+  -- Manual-only worker reports must not drain automatically after an upgrade.
+  -- Match persisted batch identity and project, never human text or all automation.
+  AND NOT (conversation_messages.origin = 'automation' AND EXISTS (
+      SELECT 1 FROM reports
+      JOIN conversations ON conversations.project_id = reports.project_id
+      WHERE conversations.id = conversation_turns.conversation_id
+        AND reports.delivery_batch_id <> ''
+        AND reports.delivery_batch_id = conversation_messages.client_message_id
+  ))
+-- Safely settled target batches lead held batches and ordinary FIFO work.
+-- A newer interrupted target wins over an older batch; its members stay FIFO.
+ORDER BY CASE
+             WHEN interrupt_target.state IN ('completed', 'interrupted') AND interrupt_target.rolled_back_at IS NULL THEN 0
+             WHEN conversation_turns.interrupt_target_provider_turn_id = '' THEN 1
+             ELSE 2
+         END,
+         CASE WHEN interrupt_target.state IN ('completed', 'interrupted') AND interrupt_target.rolled_back_at IS NULL THEN interrupt_target.completed_at END DESC,
+         CASE WHEN interrupt_target.state IN ('completed', 'interrupted') AND interrupt_target.rolled_back_at IS NULL THEN interrupt_target.started_at END DESC,
+         CASE WHEN interrupt_target.state IN ('completed', 'interrupted') AND interrupt_target.rolled_back_at IS NULL THEN interrupt_target.rowid END DESC,
+         conversation_turns.requested_at, conversation_turns.rowid
 LIMIT 1;
+
+-- Reconnect recovers every accepted interrupt intent, not just the queue head.
+-- name: ListPendingConversationInterruptTurns :many
+SELECT * FROM conversation_turns
+WHERE conversation_id = ? AND state = 'queued'
+  AND promotion_started_at IS NULL AND rolled_back_at IS NULL
+  AND interrupt_target_provider_turn_id <> ''
+ORDER BY requested_at, rowid;
+
+-- Handoff cancels queue rows before provider I/O, but acceptance survives that change.
+-- name: HasAcceptedConversationInterrupt :one
+SELECT EXISTS (
+    SELECT 1 FROM conversation_turns
+    WHERE conversation_id = ? AND interrupt_target_provider_turn_id = ?
+      AND interrupt_target_provider_turn_id <> ''
+      AND interrupt_delivered = TRUE AND rolled_back_at IS NULL
+);
+
+-- Persist provider cancellation acceptance before retry can repeat it; concurrent
+-- requests accepted for this exact target share that acknowledgement.
+-- name: MarkConversationTurnInterruptDelivered :exec
+UPDATE conversation_turns SET interrupt_delivered = TRUE
+WHERE conversation_id = (SELECT target.conversation_id FROM conversation_turns target WHERE target.id = sqlc.arg(id))
+  AND interrupt_target_provider_turn_id <> ''
+  AND interrupt_target_provider_turn_id = (SELECT target.interrupt_target_provider_turn_id FROM conversation_turns target WHERE target.id = sqlc.arg(id));
+
+-- Reuse accepted cancellation of the same exact target for later requests.
+-- name: InheritConversationTurnInterruptDelivered :exec
+UPDATE conversation_turns SET interrupt_delivered = TRUE
+WHERE conversation_turns.id = ? AND EXISTS (
+    SELECT 1 FROM conversation_turns previous
+    WHERE previous.conversation_id = conversation_turns.conversation_id
+      AND previous.interrupt_target_provider_turn_id = conversation_turns.interrupt_target_provider_turn_id
+      AND previous.interrupt_delivered = TRUE
+);
+
+-- Bind an interrupt prompt in the same transaction as its durable message.
+-- name: SetConversationTurnInterruptTarget :exec
+UPDATE conversation_turns
+SET interrupt_target_provider_turn_id = ?
+WHERE id = ?;
 
 -- Claim one selected queue item before contacting the provider. execrows is the
 -- compare-and-set result: zero means the turn is absent, settled, or already being
@@ -1125,6 +1251,121 @@ WHERE conversation_id = sqlc.arg(conversation_id)
   AND request_id = sqlc.arg(request_id)
   AND status = 'pending';
 
+-- Claim exact answer bytes without resolving the question or holding a DB lock during provider I/O.
+-- name: ClaimConversationInputAnswer :execrows
+UPDATE conversation_activities
+SET detail_json = json_patch(detail_json, json_object('answerIntent', sqlc.arg(answer_json))),
+    revision = revision + 1, updated_at = sqlc.arg(updated_at)
+WHERE conversation_activities.id = sqlc.arg(activity_id) AND conversation_activities.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_activities.kind = 'user_input' AND conversation_activities.status = 'pending' AND conversation_activities.revision = sqlc.arg(expected_revision)
+  AND (json_extract(conversation_activities.detail_json, '$.answerIntent') IS NULL OR json_extract(conversation_activities.detail_json, '$.answerIntent') = sqlc.arg(answer_json))
+  AND EXISTS (
+    SELECT 1 FROM conversations c JOIN sessions s ON s.id = sqlc.arg(session_id)
+    LEFT JOIN review r ON r.id = c.current_review_id
+    WHERE c.id = conversation_activities.conversation_id AND c.active_branch_id = sqlc.arg(branch_id)
+      AND s.is_terminated = 0
+      AND ((sqlc.arg(review_id) = '' AND c.current_session_id = s.id AND s.session_mode = 'chat' AND s.controller_generation = sqlc.arg(generation))
+        OR (sqlc.arg(review_id) <> '' AND c.current_review_id = sqlc.arg(review_id) AND r.session_id = s.id AND r.interface_mode = 'chat' AND r.controller_generation = sqlc.arg(generation)))
+      AND NOT EXISTS (SELECT 1 FROM session_interface_transitions tr WHERE tr.session_id = s.id AND tr.phase NOT IN ('completed','failed','cancelled','recovery_required'))
+  );
+
+-- The answer claim remains pending if ownership changes or delivery is unproved.
+-- name: ResolveClaimedConversationInputAnswer :execrows
+UPDATE conversation_activities
+SET status = 'resolved', detail_json = json_patch(detail_json, CAST(sqlc.arg(answer_json) AS TEXT)),
+    revision = revision + 1, updated_at = sqlc.arg(updated_at)
+WHERE conversation_activities.id = sqlc.arg(activity_id) AND conversation_activities.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_activities.kind = 'user_input' AND conversation_activities.status = 'pending'
+  AND json_extract(detail_json, '$.answerIntent') = sqlc.arg(answer_json)
+  AND EXISTS (
+    SELECT 1 FROM conversations c JOIN sessions s ON s.id = sqlc.arg(session_id)
+    LEFT JOIN review r ON r.id = c.current_review_id
+    WHERE c.id = conversation_activities.conversation_id AND c.active_branch_id = sqlc.arg(branch_id)
+      AND s.is_terminated = 0
+      AND ((sqlc.arg(review_id) = '' AND c.current_session_id = s.id AND s.session_mode = 'chat' AND s.controller_generation = sqlc.arg(generation))
+        OR (sqlc.arg(review_id) <> '' AND c.current_review_id = sqlc.arg(review_id) AND r.session_id = s.id AND r.interface_mode = 'chat' AND r.controller_generation = sqlc.arg(generation)))
+      AND NOT EXISTS (SELECT 1 FROM session_interface_transitions tr WHERE tr.session_id = s.id AND tr.phase NOT IN ('completed','failed','cancelled','recovery_required'))
+  );
+
+-- A definitive refusal releases only these claimed bytes and advances a retry identity.
+-- name: ReleaseConversationInputAnswer :execrows
+UPDATE conversation_activities
+SET detail_json = json_set(json_remove(detail_json, '$.answerIntent'), '$.answerAttempt', COALESCE(json_extract(detail_json, '$.answerAttempt'), 0) + 1),
+    revision = revision + 1, updated_at = sqlc.arg(updated_at)
+WHERE conversation_activities.id = sqlc.arg(activity_id) AND conversation_activities.conversation_id = sqlc.arg(conversation_id)
+  AND kind = 'user_input' AND status = 'pending'
+  AND json_extract(detail_json, '$.answerIntent') = sqlc.arg(answer_json)
+  AND EXISTS (
+    SELECT 1 FROM conversations c JOIN sessions s ON s.id = sqlc.arg(session_id)
+    LEFT JOIN review r ON r.id = c.current_review_id
+    WHERE c.id = conversation_activities.conversation_id AND c.active_branch_id = sqlc.arg(branch_id)
+      AND s.is_terminated = 0
+      AND ((sqlc.arg(review_id) = '' AND c.current_session_id = s.id AND s.session_mode = 'chat' AND s.controller_generation = sqlc.arg(generation))
+        OR (sqlc.arg(review_id) <> '' AND c.current_review_id = sqlc.arg(review_id) AND r.session_id = s.id AND r.interface_mode = 'chat' AND r.controller_generation = sqlc.arg(generation)))
+  );
+
+-- name: SelectConversationActivityByRequest :one
+SELECT * FROM conversation_activities WHERE conversation_id = ? AND request_id = ?;
+
+-- name: ReattachPersistentConversationQuestion :exec
+UPDATE conversation_activities
+SET detail_json = json_patch(detail_json, '{"providerPending":true}'),
+    revision = revision + 1, updated_at = sqlc.arg(updated_at)
+WHERE conversation_id = sqlc.arg(conversation_id) AND request_id = sqlc.arg(request_id)
+  AND kind = 'user_input' AND status = 'pending'
+  AND json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.persistentQuestion') = 1
+  AND json_extract(detail_json, '$.providerPending') = 0;
+
+-- name: SelectConversationInputByRequest :one
+WITH RECURSIVE active_path(branch_id, max_sequence) AS (
+    SELECT active_branch_id, NULL FROM conversations WHERE id = sqlc.arg(conversation_id)
+    UNION ALL
+    SELECT branch.parent_branch_id,
+           CASE WHEN path.max_sequence IS NULL THEN branch.fork_after_sequence
+                WHEN branch.fork_after_sequence < path.max_sequence THEN branch.fork_after_sequence
+                ELSE path.max_sequence END
+    FROM active_path path JOIN conversation_branches branch ON branch.id = path.branch_id
+    WHERE branch.parent_branch_id IS NOT NULL
+)
+SELECT a.* FROM conversation_activities a
+LEFT JOIN conversation_turns t ON t.id = a.turn_id
+JOIN active_path path ON path.branch_id = a.branch_id
+WHERE a.conversation_id = sqlc.arg(conversation_id) AND a.request_id = sqlc.arg(request_id) AND a.kind = 'user_input'
+  AND (path.max_sequence IS NULL OR a.sequence <= path.max_sequence)
+  AND (a.turn_id IS NULL OR (t.rolled_back_at IS NULL AND t.state <> 'cancelled'))
+ORDER BY a.sequence DESC LIMIT 1;
+
+-- Pending clarification remains actionable independently of the history page.
+-- name: ListPersistentConversationQuestions :many
+WITH RECURSIVE active_path(branch_id, max_sequence) AS (
+    SELECT active_branch_id, NULL FROM conversations WHERE id = sqlc.arg(conversation_id)
+    UNION ALL
+    SELECT branch.parent_branch_id,
+           CASE WHEN path.max_sequence IS NULL THEN branch.fork_after_sequence
+                WHEN branch.fork_after_sequence < path.max_sequence THEN branch.fork_after_sequence
+                ELSE path.max_sequence END
+    FROM active_path path JOIN conversation_branches branch ON branch.id = path.branch_id
+    WHERE branch.parent_branch_id IS NOT NULL
+)
+SELECT a.* FROM conversation_activities a
+JOIN active_path path ON path.branch_id = a.branch_id
+LEFT JOIN conversation_turns t ON t.id = a.turn_id
+WHERE a.conversation_id = sqlc.arg(conversation_id)
+  AND (path.max_sequence IS NULL OR a.sequence <= path.max_sequence)
+  AND a.kind = 'user_input' AND a.status = 'pending'
+  AND json_extract(CASE WHEN json_valid(a.detail_json) THEN a.detail_json ELSE '{}' END, '$.persistentQuestion') = 1
+  AND (a.turn_id IS NULL OR (t.rolled_back_at IS NULL AND t.state <> 'cancelled'))
+ORDER BY a.sequence;
+
+-- A cancelled question callback is not a cancelled human decision.
+-- name: DetachPersistentConversationQuestion :execrows
+UPDATE conversation_activities
+SET detail_json = json_patch(detail_json, '{"providerPending":false}'),
+    revision = revision + 1, updated_at = sqlc.arg(updated_at)
+WHERE conversation_id = sqlc.arg(conversation_id) AND request_id = sqlc.arg(request_id)
+  AND kind = 'user_input' AND status = 'pending'
+  AND json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.persistentQuestion') = 1;
+
 -- name: HasPendingConversationInteractions :one
 SELECT EXISTS (
     SELECT 1
@@ -1132,6 +1373,8 @@ SELECT EXISTS (
     WHERE conversation_id = ?
       AND kind IN ('approval', 'user_input')
       AND status = 'pending'
+      AND NOT (kind = 'user_input' AND COALESCE(json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.persistentQuestion'), 0) = 1
+               AND json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.providerPending') = 0)
 );
 
 -- Any approval still pending when a controller dies can never be answered: the
@@ -1141,12 +1384,13 @@ UPDATE conversation_activities
 SET status = 'failed', revision = revision + 1, updated_at = ?
 WHERE conversation_id = ? AND kind = 'approval' AND status = 'pending';
 
--- A structured input request is held by an in-memory provider RPC just like an
--- approval. If that controller disappears, the old card must stop accepting
--- answers because there is no longer a provider call to receive one.
+-- A lost callback closes consent requests but detaches human questions.
+-- Retained live provider hosts do not enter this cleanup path.
 -- name: FailPendingConversationInputs :exec
 UPDATE conversation_activities
-SET status = 'failed', revision = revision + 1, updated_at = ?
+SET status = CASE WHEN json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.persistentQuestion') = 1 THEN 'pending' ELSE 'failed' END,
+    detail_json = CASE WHEN json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.persistentQuestion') = 1 THEN json_patch(detail_json, '{"providerPending":false}') ELSE detail_json END,
+    revision = revision + 1, updated_at = ?
 WHERE conversation_id = ? AND kind = 'user_input' AND status = 'pending';
 
 -- A project conversation can move to a new orchestrator while the old provider
@@ -1154,7 +1398,9 @@ WHERE conversation_id = ? AND kind = 'user_input' AND status = 'pending';
 -- session; conversation-wide cleanup would also fail the replacement's requests.
 -- name: FailPendingConversationRequestsForSession :exec
 UPDATE conversation_activities
-SET status = 'failed', revision = revision + 1, updated_at = sqlc.arg(updated_at)
+SET status = CASE WHEN kind = 'user_input' AND json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.persistentQuestion') = 1 THEN 'pending' ELSE 'failed' END,
+    detail_json = CASE WHEN kind = 'user_input' AND json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.persistentQuestion') = 1 THEN json_patch(detail_json, '{"providerPending":false}') ELSE detail_json END,
+    revision = revision + 1, updated_at = sqlc.arg(updated_at)
 WHERE conversation_activities.conversation_id = sqlc.arg(target_conversation_id)
   AND kind IN ('approval', 'user_input')
   AND status = 'pending'
@@ -1167,7 +1413,9 @@ WHERE conversation_activities.conversation_id = sqlc.arg(target_conversation_id)
 
 -- name: FailPendingReviewRequests :exec
 UPDATE conversation_activities
-SET status = 'failed', revision = revision + 1, updated_at = sqlc.arg(updated_at)
+SET status = CASE WHEN kind = 'user_input' AND json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.persistentQuestion') = 1 THEN 'pending' ELSE 'failed' END,
+    detail_json = CASE WHEN kind = 'user_input' AND json_extract(CASE WHEN json_valid(detail_json) THEN detail_json ELSE '{}' END, '$.persistentQuestion') = 1 THEN json_patch(detail_json, '{"providerPending":false}') ELSE detail_json END,
+    revision = revision + 1, updated_at = sqlc.arg(updated_at)
 WHERE conversation_activities.conversation_id = sqlc.arg(conversation_id)
   AND kind IN ('approval', 'user_input')
   AND status = 'pending'

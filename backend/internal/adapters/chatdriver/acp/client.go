@@ -1,6 +1,7 @@
 package acp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,10 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
+
+var errWorkerQuestionYield = errors.New("automatic worker question deferral")
+
+const workerQuestionYieldMeta = "aoWorkerQuestionYield"
 
 // AO deliberately advertises neither client-side filesystem nor terminal
 // capabilities. Claude's ACP adapter uses Claude Code's native tools inside the
@@ -178,7 +183,7 @@ func approvalToolDetail(tool acpsdk.ToolCallUpdate, activityKind domain.Activity
 		"subjectKind": string(activityKind),
 	}
 	if tool.RawInput != nil {
-		detail["input"] = tool.RawInput
+		detail["input"] = cappedInput(tool.RawInput)
 	}
 	if claude := nestedMap(tool.Meta, "claudeCode"); claude != nil {
 		copyDetail(detail, claude, "toolName", "providerToolName")
@@ -208,6 +213,8 @@ func (c *conversation) UnstableCreateElicitation(
 			return acpsdk.NewUnstableCreateElicitationResponseCancel(), err
 		}
 		request.Schema = schema
+		request.QuestionAgentID, _ = params.Form.Meta["aoQuestionAgentId"].(string)
+		request.QuestionParentToolUseID, _ = params.Form.Meta["aoQuestionParentToolUseId"].(string)
 	case params.Url != nil:
 		request.Mode = ports.ChatInputModeURL
 		request.Message = params.Url.Message
@@ -217,13 +224,34 @@ func (c *conversation) UnstableCreateElicitation(
 		return acpsdk.NewUnstableCreateElicitationResponseCancel(), errors.New("ACP elicitation has no mode")
 	}
 
+	workerEpoch := uint64(0)
+	if params.Form != nil {
+		if epoch, ok := params.Form.Meta["aoWorkerQuestionEpoch"].(float64); ok && !math.IsNaN(epoch) && epoch >= 0 && epoch < 1<<53 && math.Trunc(epoch) == epoch {
+			workerEpoch = uint64(epoch)
+		}
+	}
 	requestID := ""
 	if params.Form != nil {
 		requestID = stableACPRequestID(params.Form.Meta)
 	} else if params.Url != nil {
 		requestID = stableACPRequestID(params.Url.Meta)
 	}
-	response, err := c.requestInput(ctx, requestID, request)
+	var workerYield chan struct{}
+	if c.harness == domain.HarnessClaudeCode && c.workerSafeBoundary && request.PersistentQuestion() {
+		marker := params.Form.Meta[workerQuestionYieldMeta]
+		if marker == true || marker == "automatic-worker-deferral" {
+			workerYield = make(chan struct{})
+			if marker == "automatic-worker-deferral" {
+				close(workerYield)
+			}
+		}
+	}
+	response, err := c.requestInput(ctx, requestID, request, &parkedInput{workerYield: workerYield, workerEpoch: workerEpoch})
+	if errors.Is(err, errWorkerQuestionYield) {
+		result := acpsdk.NewUnstableCreateElicitationResponseCancel()
+		result.Cancel.Meta = map[string]any{workerQuestionYieldMeta: "automatic-worker-deferral"}
+		return result, nil
+	}
 	if err != nil {
 		return acpsdk.NewUnstableCreateElicitationResponseCancel(), err
 	}
@@ -242,51 +270,175 @@ func (c *conversation) requestInput(
 	ctx context.Context,
 	requestID string,
 	request ports.ChatInputRequest,
+	workerRequests ...*parkedInput,
 ) (ports.ChatInputResponse, error) {
 	if requestID == "" {
 		requestID = uuid.NewString()
 	}
-	parked := &parkedInput{
-		request: request, result: make(chan ports.ChatInputResponse, 1), ready: make(chan struct{}),
+	parked := &parkedInput{}
+	if len(workerRequests) > 0 {
+		parked = workerRequests[0]
 	}
+	parked.request = request
+	parked.result = make(chan ports.ChatInputResponse, 1)
+	parked.ready = make(chan struct{})
 	c.mu.Lock()
+	if parked.workerYield != nil {
+		select {
+		case <-parked.workerYield:
+			parked.workerYielded = true
+		default:
+			if parked.workerEpoch < c.workerYieldEpoch {
+				parked.workerYielded = true
+				close(parked.workerYield)
+			}
+		}
+	}
 	if c.closed {
 		c.mu.Unlock()
 		return ports.ChatInputResponse{Action: ports.ChatInputActionCancel}, nil
 	}
 	accepted, hasAccepted := c.accepted[requestID]
-	if hasAccepted && accepted.Kind == persistentInteractionInput {
+	if hasAccepted && (accepted.Kind == persistentInteractionInput || accepted.Kind == persistentInteractionQuestionDeferred) {
 		delete(c.accepted, requestID)
-	} else {
+	}
+	if hasAccepted && accepted.Kind == persistentInteractionQuestionDeferred && parked.workerYield != nil && !parked.workerYielded {
+		parked.workerYielded = true
+		close(parked.workerYield)
+	}
+	if !hasAccepted || accepted.Kind != persistentInteractionInput {
 		c.pendingInputs[requestID] = parked
 	}
 	turnID := c.activeTurn
 	c.mu.Unlock()
 
+	requestedEventID := ""
+	if parked.workerYield != nil {
+		requestedEventID = requestID + ":question"
+	}
 	c.emit(ports.ChatEvent{
-		Kind: ports.ChatEventInputRequested, ProviderTurnID: turnID,
+		Kind: ports.ChatEventInputRequested, ProviderEventID: requestedEventID, ProviderTurnID: turnID,
 		RequestID: requestID, Input: &request, Summary: request.Message,
 	})
 	close(parked.ready)
 	if hasAccepted && accepted.Kind == persistentInteractionInput {
 		c.emit(persistentInteractionEvent(accepted))
+		parked.resolved = true
 		parked.result <- *accepted.Input
 	}
 
 	timer := timeAfter(approvalWait)
+	yielded := false
 	select {
 	case response := <-parked.result:
 		return response, nil
 	case <-ctx.Done():
-		c.discardInput(requestID)
-		if !c.providerDetaching() {
-			c.emit(ports.ChatEvent{Kind: ports.ChatEventInputResolved, RequestID: requestID})
-		}
-		return ports.ChatInputResponse{Action: ports.ChatInputActionCancel}, nil
 	case <-timer:
-		c.discardInput(requestID)
-		c.emit(ports.ChatEvent{Kind: ports.ChatEventInputResolved, RequestID: requestID})
-		return ports.ChatInputResponse{Action: ports.ChatInputActionCancel}, nil
+	case <-parked.workerYield:
+		yielded = true
+	}
+	parked.mu.Lock()
+	// An in-flight durable acceptance owns the result until the host answers.
+	// Worker delivery must not acknowledge an answer and then discard it.
+	if yielded && ctx.Err() == nil && parked.resolving {
+		done := parked.resolveDone
+		parked.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
+		parked.mu.Lock()
+	}
+	if parked.resolved {
+		parked.mu.Unlock()
+		return <-parked.result, nil
+	}
+	if yielded && ctx.Err() == nil && parked.answerIntent != nil {
+		answer := *parked.answerIntent
+		parked.mu.Unlock()
+		// Host acceptance may have won while the human request lost its ACK.
+		// Recover that exact command, never replace it with automatic deferral.
+		recoveryCtx, cancelRecovery := context.WithTimeout(ctx, 5*time.Second)
+		err := c.ResolveInput(recoveryCtx, requestID, answer)
+		cancelRecovery()
+		if err == nil {
+			return <-parked.result, nil
+		}
+		parked.mu.Lock()
+		answered := parked.resolved && parked.accepted != nil
+		parked.mu.Unlock()
+		if answered {
+			return <-parked.result, nil
+		}
+		if ctx.Err() == nil {
+			_ = c.Close() // Detach only; the persistent host replays its winning command.
+			return ports.ChatInputResponse{}, err
+		}
+		parked.mu.Lock()
+		if parked.resolved {
+			parked.mu.Unlock()
+			return <-parked.result, nil
+		}
+	}
+	parked.resolved = true
+	automatic := yielded && ctx.Err() == nil
+	parked.mu.Unlock()
+	eventID := ""
+	if automatic {
+		// The host must retain this receipt before the native callback retires.
+		// A lost daemon must replay both the form and its typed deferral proof.
+		var err error
+		receiptCtx, cancelReceipt := context.WithTimeout(ctx, 5*time.Second)
+		eventID, err = c.recordPersistentInteraction(receiptCtx, persistentInteractionCommand{RequestID: requestID, Kind: persistentInteractionQuestionDeferred, Request: &request})
+		cancelReceipt()
+		if err != nil && ctx.Err() == nil {
+			_ = c.Close() // Failed/uncertain acceptance must reconnect for retained replay.
+			return ports.ChatInputResponse{}, err
+		}
+		if err != nil {
+			automatic = false
+		}
+	}
+	if automatic {
+		c.mu.Lock()
+		if c.deferredQuestions == nil {
+			c.deferredQuestions = make(map[string]struct{})
+		}
+		c.deferredQuestions[requestID] = struct{}{}
+		c.mu.Unlock()
+	}
+	c.discardInput(requestID)
+	if !c.providerDetaching() {
+		if automatic && eventID != "" {
+			c.emit(ports.ChatEvent{Kind: ports.ChatEventInputRequested, ProviderEventID: requestedEventID, ProviderTurnID: turnID, RequestID: requestID, Input: &request, Summary: request.Message})
+		}
+		c.emit(ports.ChatEvent{Kind: ports.ChatEventInputResolved, ProviderEventID: eventID, RequestID: requestID})
+	}
+	if automatic {
+		return ports.ChatInputResponse{}, errWorkerQuestionYield
+	}
+	return ports.ChatInputResponse{Action: ports.ChatInputActionCancel}, nil
+}
+
+// yieldWorkerQuestions releases only forms negotiated by the AskUserQuestion bridge.
+// Consent requests and other tools retain their existing waiting behavior.
+func (c *conversation) yieldWorkerQuestions(epoch uint64) {
+	c.mu.Lock()
+	if epoch > c.workerYieldEpoch {
+		c.workerYieldEpoch = epoch
+	}
+	requests := make([]*parkedInput, 0, len(c.pendingInputs))
+	for _, request := range c.pendingInputs {
+		requests = append(requests, request)
+	}
+	c.mu.Unlock()
+	for _, request := range requests {
+		request.mu.Lock()
+		if !request.resolved && request.workerYield != nil && !request.workerYielded && request.workerEpoch < epoch {
+			request.workerYielded = true
+			close(request.workerYield)
+		}
+		request.mu.Unlock()
 	}
 }
 
@@ -318,31 +470,74 @@ func (c *conversation) ResolveInput(
 		return err
 	}
 	c.mu.Lock()
-	request, ok := c.pendingInputs[requestID]
-	if !ok {
-		c.mu.Unlock()
+	request := c.pendingInputs[requestID]
+	_, deferred := c.deferredQuestions[requestID]
+	c.mu.Unlock()
+	if request == nil {
+		if deferred {
+			return ports.ErrChatQuestionDeferred
+		}
+		return ports.ErrChatRequestNotPending
+	}
+	request.mu.Lock()
+	if deferred && !request.resolving && request.accepted == nil {
+		request.mu.Unlock()
+		return ports.ErrChatQuestionDeferred
+	}
+	if request.resolved || request.resolving {
+		request.mu.Unlock()
 		return ports.ErrChatRequestNotPending
 	}
 	if err := validateInputResponse(request.request, response); err != nil {
-		c.mu.Unlock()
+		request.mu.Unlock()
 		return err
 	}
-	delete(c.pendingInputs, requestID)
-	c.mu.Unlock()
+	if request.answerIntent != nil {
+		previous, _ := json.Marshal(request.answerIntent)
+		current, _ := json.Marshal(response)
+		if !bytes.Equal(previous, current) {
+			request.mu.Unlock()
+			return domain.ErrClientMessageConflict
+		}
+	}
+	request.answerIntent = &response
+	request.resolving = true
+	request.resolveDone = make(chan struct{})
+	persistent := c.proc != nil && c.proc.terminate != nil
+	if !persistent {
+		request.resolved = true
+		request.accepted = &response
+	}
+	request.mu.Unlock()
 	command := persistentInteractionCommand{
 		RequestID: requestID, Kind: persistentInteractionInput, Input: &response,
 	}
 	eventID, err := c.recordPersistentInteraction(ctx, command)
-	if err != nil {
-		c.mu.Lock()
-		if !c.closed {
-			c.pendingInputs[requestID] = request
+	request.mu.Lock()
+	request.resolving = false
+	resolveDone := request.resolveDone
+	defer close(resolveDone)
+	if request.resolved && persistent {
+		accepted := request.accepted
+		request.mu.Unlock()
+		if accepted != nil {
+			old, _ := json.Marshal(accepted)
+			current, _ := json.Marshal(response)
+			if bytes.Equal(old, current) {
+				return nil
+			}
 		}
-		c.mu.Unlock()
+		return ports.ErrChatRequestNotPending
+	}
+	if err != nil {
+		request.mu.Unlock()
 		return err
 	}
+	request.resolved = true
+	request.accepted = &response
+	request.mu.Unlock()
 	command.EventID = eventID
-
+	c.discardInput(requestID)
 	c.emit(persistentInteractionEvent(command))
 	request.result <- response
 	return nil
@@ -756,14 +951,17 @@ func (c *conversation) mergeToolUpdate(update *acpsdk.SessionToolCallUpdate) *to
 }
 
 func (c *conversation) toolEvent(turnID string, tool *toolState, completed bool) ports.ChatEvent {
-	output := toolOutputText(tool.rawOutput)
+	output := toolOutputText(withoutImageData(tool.rawOutput))
 	if tool.terminalOutput != "" {
 		output = tool.terminalOutput
 	}
 	activityKind := activityKindFromTool(tool.kind)
+	// The detail is rewritten on every tool update and carried by every snapshot,
+	// so a page an agent hands html_render and the screenshot html_preview hands
+	// back are not stored whole.
 	detailMap := map[string]any{
 		"protocol": "acp", "toolKind": tool.kind, "locations": tool.locations,
-		"input": tool.rawInput, "output": output, "content": tool.content,
+		"input": cappedInput(tool.rawInput), "output": output, "content": contentWithoutImageData(tool.content),
 	}
 	if activityKind == domain.ActivityKindFileChange {
 		files := make([]map[string]any, 0)
@@ -848,6 +1046,72 @@ func acpFilePatch(path string, oldText *string, newText string) string {
 		lines = append(lines, "+"+line)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// cappedInput keeps a tool's input only while it fits the tool payload cap,
+// as the Codex driver does for MCP arguments.
+func cappedInput(raw any) any {
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	return commanddetail.TruncatedJSON(encoded)
+}
+
+// imageStub stands in for an image block. Its base64 data would be stored as
+// text and printed as text when the row is expanded; bytes is its length.
+func imageStub(mimeType any, data string) map[string]any {
+	return map[string]any{"type": "image", "mimeType": mimeType, "bytes": len(data)}
+}
+
+// contentWithoutImageData keeps a tool's content blocks, text included, and
+// replaces each image block with imageStub.
+func contentWithoutImageData(content []acpsdk.ToolCallContent) []any {
+	if content == nil {
+		return nil
+	}
+	out := make([]any, len(content))
+	for i, item := range content {
+		if item.Content != nil && item.Content.Content.Image != nil {
+			image := item.Content.Content.Image
+			out[i] = map[string]any{"type": "content", "content": imageStub(image.MimeType, image.Data)}
+			continue
+		}
+		out[i] = item
+	}
+	return out
+}
+
+// withoutImageData replaces every image block in a decoded JSON value with
+// imageStub: MCP's {type:"image", data, mimeType} and the Anthropic
+// {type:"image", source:{type:"base64", media_type, data}} that
+// claude-agent-acp passes through as rawOutput.
+func withoutImageData(value any) any {
+	switch v := value.(type) {
+	case []any:
+		out := make([]any, len(v))
+		for i, item := range v {
+			out[i] = withoutImageData(item)
+		}
+		return out
+	case map[string]any:
+		if v["type"] == "image" {
+			if data, ok := v["data"].(string); ok {
+				return imageStub(v["mimeType"], data)
+			}
+			if source, ok := v["source"].(map[string]any); ok {
+				if data, ok := source["data"].(string); ok {
+					return imageStub(source["media_type"], data)
+				}
+			}
+		}
+		out := make(map[string]any, len(v))
+		for key, item := range v {
+			out[key] = withoutImageData(item)
+		}
+		return out
+	}
+	return value
 }
 
 // toolOutputText translates ACP's provider-defined rawOutput into AO's neutral

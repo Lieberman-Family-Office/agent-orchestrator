@@ -9,7 +9,10 @@ import (
 	"sort"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/gen"
 )
 
@@ -178,6 +181,17 @@ func (s *Store) createConversation(
 					ID:               existing.ID,
 				}); err != nil {
 					return fmt.Errorf("bind project conversation %s to %s: %w", existing.ID, options.session, err)
+				}
+				if existing.CurrentSessionID == nil || *existing.CurrentSessionID != options.session {
+					// The previous owner's reserved provider id dies with that owner.
+					// While the conversation is untouched, release it so the new owner
+					// starts on the same root instead of a child provider boundary.
+					if _, err := q.ReleaseUntouchedConversationProvider(ctx, gen.ReleaseUntouchedConversationProviderParams{
+						SessionID:       &options.session,
+						ProviderScopeID: uuid.NewString(),
+					}); err != nil {
+						return fmt.Errorf("release untouched provider of project conversation %s: %w", existing.ID, err)
+					}
 				}
 				if options.contextReset == nil ||
 					existing.LatestSequence <= 0 ||
@@ -923,6 +937,19 @@ func (s *Store) HasConversationTurns(ctx context.Context, conversationID string)
 	return hasTurns, nil
 }
 
+// LatestVisibleUserTurnSettled checks the current branch's latest user prompt
+// without loading the full conversation history.
+func (s *Store) LatestVisibleUserTurnSettled(ctx context.Context, conversationID string, sessionID domain.SessionID) (bool, error) {
+	settled, err := s.qr.LatestVisibleUserTurnSettled(ctx, gen.LatestVisibleUserTurnSettledParams{
+		ConversationID: conversationID,
+		SessionID:      sessionID,
+	})
+	if err != nil {
+		return false, fmt.Errorf("check latest user turn for %s: %w", conversationID, err)
+	}
+	return settled, nil
+}
+
 // AppendUserMessage records an inbound message and the turn it opens.
 //
 // Idempotent on clientMessageID: a retried send returns the message and turn that
@@ -987,7 +1014,7 @@ func (s *Store) appendUserMessage(
 		if readErr != nil {
 			return false, fmt.Errorf("check queued session %s: %w", session, readErr)
 		}
-		if record.IsTerminated || !record.ProvisionState.IsProvisioning() {
+		if record.IsTerminated || (!record.ProvisionState.IsProvisioning() && !record.HibernatedAt.Valid) {
 			return false, domain.ErrSessionNotProvisioning
 		}
 	}
@@ -1065,6 +1092,17 @@ func (s *Store) appendUserMessage(
 		}); err != nil {
 			return err
 		}
+		if msg.InterruptTargetProviderTurnID != "" {
+			if err := q.SetConversationTurnInterruptTarget(ctx, gen.SetConversationTurnInterruptTargetParams{
+				InterruptTargetProviderTurnID: msg.InterruptTargetProviderTurnID,
+				ID:                            turnID,
+			}); err != nil {
+				return fmt.Errorf("record interrupt target: %w", err)
+			}
+			if err := q.InheritConversationTurnInterruptDelivered(ctx, turnID); err != nil {
+				return fmt.Errorf("inherit interrupt acceptance: %w", err)
+			}
+		}
 		interactionAt := msg.InteractionAt
 		if interactionAt.IsZero() {
 			interactionAt = now
@@ -1108,6 +1146,19 @@ func (s *Store) ConversationMessageByClientID(
 		return domain.ConversationMessage{}, false, err
 	}
 	return messageToDomain(row), true, nil
+}
+
+// ConversationMessages returns the durable transcript in sequence order.
+func (s *Store) ConversationMessages(ctx context.Context, conversationID string) ([]domain.ConversationMessage, error) {
+	rows, err := s.qr.SelectConversationMessages(ctx, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	messages := make([]domain.ConversationMessage, 0, len(rows))
+	for _, row := range rows {
+		messages = append(messages, messageToDomain(row))
+	}
+	return messages, nil
 }
 
 // AdoptProviderTurn records a turn the provider started that AO never dispatched.
@@ -2031,12 +2082,48 @@ func (s *Store) NextQueuedTurn(ctx context.Context, conversationID string) (doma
 		return domain.QueuedTurn{}, fmt.Errorf("select next queued turn for %s: %w", conversationID, err)
 	}
 	return domain.QueuedTurn{
-		TurnID:              row.ID,
-		Text:                row.Text,
-		ClientMessageID:     row.ClientMessageID,
-		Origin:              row.Origin,
-		DeliveryContentJSON: row.DeliveryContentJson,
+		TurnID:                        row.ID,
+		Text:                          row.Text,
+		InterruptTargetProviderTurnID: row.InterruptTargetProviderTurnID,
+		ClientMessageID:               row.ClientMessageID,
+		Origin:                        row.Origin,
+		DeliveryContentJSON:           row.DeliveryContentJson,
 	}, nil
+}
+
+// PendingInterruptTurns lists durable queue-preserving cancellation intents for reconnect.
+func (s *Store) PendingInterruptTurns(ctx context.Context, conversationID string) ([]domain.ConversationTurn, error) {
+	rows, err := s.qr.ListPendingConversationInterruptTurns(ctx, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	turns := make([]domain.ConversationTurn, len(rows))
+	for i, row := range rows {
+		turns[i] = turnToDomain(row)
+	}
+	return turns, nil
+}
+
+// HasAcceptedInterrupt reads acceptance for the exact target, even after queue cancellation.
+func (s *Store) HasAcceptedInterrupt(ctx context.Context, conversationID, providerTurnID string) (bool, error) {
+	return s.qr.HasAcceptedConversationInterrupt(ctx, gen.HasAcceptedConversationInterruptParams{
+		ConversationID: conversationID, InterruptTargetProviderTurnID: providerTurnID,
+	})
+}
+
+// TurnByProviderID reads one exact durable cancellation target.
+func (s *Store) TurnByProviderID(ctx context.Context, conversationID, providerTurnID string) (domain.ConversationTurn, error) {
+	row, err := s.qr.SelectConversationTurnByProviderID(ctx, gen.SelectConversationTurnByProviderIDParams{
+		ConversationID: conversationID, ProviderTurnID: providerTurnID,
+	})
+	return turnToDomain(row), err
+}
+
+// MarkTurnInterruptDelivered retains cancellation acceptance for request retries.
+func (s *Store) MarkTurnInterruptDelivered(ctx context.Context, turnID string) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return s.qw.MarkConversationTurnInterruptDelivered(ctx, turnID)
 }
 
 // ReserveQueuedTurnForPromotion atomically removes one selected queued turn from
@@ -2485,6 +2572,19 @@ func (s *Store) UpsertActivity(
 
 	detail := string(activity.Detail)
 
+	if activity.Kind == domain.ActivityKindUserInput && activity.RequestID != "" {
+		prior, err := q.SelectConversationActivityByRequest(ctx, gen.SelectConversationActivityByRequestParams{ConversationID: conversationID, RequestID: activity.RequestID})
+		if err == nil {
+			if prior.Kind != activity.Kind {
+				return domain.ErrClientMessageConflict
+			}
+			return q.ReattachPersistentConversationQuestion(ctx, gen.ReattachPersistentConversationQuestionParams{ConversationID: conversationID, RequestID: activity.RequestID, UpdatedAt: now})
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("lookup input replay %s: %w", activity.RequestID, err)
+		}
+	}
+
 	if activity.ProviderItemID != "" {
 		_, err := q.SelectConversationActivityByProviderItem(ctx,
 			gen.SelectConversationActivityByProviderItemParams{
@@ -2644,6 +2744,73 @@ func (s *Store) ResolveApproval(
 		return fmt.Errorf("resolve approval %s: %w", requestID, err)
 	}
 	return nil
+}
+
+// ConversationInput reads a question in the visible, undiscarded branch lineage.
+func (s *Store) ConversationInput(ctx context.Context, conversationID, requestID string) (domain.ConversationActivity, error) {
+	row, err := s.qr.SelectConversationInputByRequest(ctx, gen.SelectConversationInputByRequestParams{ConversationID: conversationID, RequestID: requestID})
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.ConversationActivity{}, ports.ErrChatRequestNotPending
+	}
+	if err != nil {
+		return domain.ConversationActivity{}, err
+	}
+	conv, err := s.qr.SelectConversationByID(ctx, conversationID)
+	if err != nil {
+		return domain.ConversationActivity{}, err
+	}
+	floor, err := s.conversationVisibleAfterSequence(ctx, conv)
+	if err != nil {
+		return domain.ConversationActivity{}, err
+	}
+	if row.Sequence <= floor {
+		return domain.ConversationActivity{}, ports.ErrChatRequestNotPending
+	}
+	return activityToDomain(row), nil
+}
+
+// ClaimInputAnswer binds exact response bytes to the current controller before provider I/O.
+func (s *Store) ClaimInputAnswer(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, branchID string, activity domain.ConversationActivity, answerJSON string, now time.Time) (bool, error) {
+	q, unlock := s.conversationWriter(ctx)
+	defer unlock()
+	rows, err := q.ClaimConversationInputAnswer(ctx, gen.ClaimConversationInputAnswerParams{
+		ConversationID: conversationID, SessionID: session, ReviewID: reviewID,
+		Generation: generation, BranchID: branchID, ActivityID: activity.ID,
+		ExpectedRevision: activity.Revision, AnswerJson: answerJSON, UpdatedAt: now,
+	})
+	return rows == 1, err
+}
+
+// ResolveInputAnswer requires the same answer claim and current controller ownership.
+func (s *Store) ResolveInputAnswer(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, branchID, activityID, answerJSON string, now time.Time) (bool, error) {
+	q, unlock := s.conversationWriter(ctx)
+	defer unlock()
+	rows, err := q.ResolveClaimedConversationInputAnswer(ctx, gen.ResolveClaimedConversationInputAnswerParams{
+		ConversationID: conversationID, SessionID: session, ReviewID: reviewID,
+		Generation: generation, BranchID: branchID, ActivityID: activityID,
+		AnswerJson: answerJSON, UpdatedAt: now,
+	})
+	return rows == 1, err
+}
+
+// ReleaseInputAnswer permits corrected or retried bytes only after definite non-delivery.
+func (s *Store) ReleaseInputAnswer(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, branchID, activityID, answerJSON string, now time.Time) (bool, error) {
+	q, unlock := s.conversationWriter(ctx)
+	defer unlock()
+	rows, err := q.ReleaseConversationInputAnswer(ctx, gen.ReleaseConversationInputAnswerParams{
+		ConversationID: conversationID, SessionID: session, ReviewID: reviewID,
+		Generation: generation, BranchID: branchID, ActivityID: activityID,
+		AnswerJson: answerJSON, UpdatedAt: now,
+	})
+	return rows == 1, err
+}
+
+// DetachQuestion keeps an unanswered clarification after its provider RPC disappears.
+func (s *Store) DetachQuestion(ctx context.Context, conversationID, requestID string, now time.Time) (bool, error) {
+	q, unlock := s.conversationWriter(ctx)
+	defer unlock()
+	rows, err := q.DetachPersistentConversationQuestion(ctx, gen.DetachPersistentConversationQuestionParams{UpdatedAt: now, ConversationID: conversationID, RequestID: requestID})
+	return rows > 0, err
 }
 
 // HasPendingConversationInteractions reports whether the durable conversation
@@ -3150,6 +3317,22 @@ func (s *Store) LoadConversationSnapshotPage(
 			snapshot.Activities = append(snapshot.Activities, activityToDomain(activityRows[i]))
 		}
 	}
+	if beforeSequence == conv.LatestSequence+1 {
+		questions, err := s.qr.ListPersistentConversationQuestions(ctx, conversationID)
+		if err != nil {
+			return ConversationSnapshot{}, fmt.Errorf("read unanswered questions: %w", err)
+		}
+		seen := make(map[string]bool, len(snapshot.Activities))
+		for _, a := range snapshot.Activities {
+			seen[a.ID] = true
+		}
+		for _, row := range questions {
+			if row.Sequence > visibleAfterSequence && !seen[row.ID] {
+				snapshot.Activities = append(snapshot.Activities, activityToDomain(row))
+			}
+		}
+		sort.Slice(snapshot.Activities, func(i, j int) bool { return snapshot.Activities[i].Sequence < snapshot.Activities[j].Sequence })
+	}
 	return snapshot, nil
 }
 
@@ -3592,14 +3775,16 @@ func rateLimitsFromRow(row gen.Conversation) *domain.ConversationRateLimits {
 
 func turnToDomain(row gen.ConversationTurn) domain.ConversationTurn {
 	turn := domain.ConversationTurn{
-		ID:                 row.ID,
-		ConversationID:     row.ConversationID,
-		BranchID:           row.BranchID,
-		HandledBySessionID: row.HandledBySessionID,
-		ProviderTurnID:     row.ProviderTurnID,
-		State:              row.State,
-		ErrorMessage:       row.ErrorMessage,
-		RequestedAt:        row.RequestedAt,
+		ID:                            row.ID,
+		ConversationID:                row.ConversationID,
+		BranchID:                      row.BranchID,
+		HandledBySessionID:            row.HandledBySessionID,
+		ProviderTurnID:                row.ProviderTurnID,
+		InterruptTargetProviderTurnID: row.InterruptTargetProviderTurnID,
+		InterruptDelivered:            row.InterruptDelivered,
+		State:                         row.State,
+		ErrorMessage:                  row.ErrorMessage,
+		RequestedAt:                   row.RequestedAt,
 	}
 	if row.RetryOfTurnID.Valid {
 		turn.RetryOfTurnID = row.RetryOfTurnID.String

@@ -526,6 +526,9 @@ type ConversationTurn struct {
 	HandledByReviewID string `json:"handledByReviewId,omitempty"`
 	// ProviderTurnID correlates back to the provider's own turn. Opaque.
 	ProviderTurnID string `json:"providerTurnId,omitempty"`
+	// InterruptTargetProviderTurnID binds a priority prompt to its original interrupted turn.
+	InterruptTargetProviderTurnID string `json:"-"`
+	InterruptDelivered            bool   `json:"-"`
 	// RetryOfTurnID is the failed source whose durable prompt created this turn.
 	// It remains present after rollback so the source cannot offer a dead action.
 	RetryOfTurnID string `json:"retryOfTurnId,omitempty"`
@@ -601,8 +604,9 @@ type ConversationDiffFile struct {
 // delivered, so the queue survives a daemon restart as data rather than living
 // only in a controller's memory.
 type QueuedTurn struct {
-	TurnID string
-	Text   string
+	TurnID                        string
+	Text                          string
+	InterruptTargetProviderTurnID string
 	// ClientMessageID is carried through to the provider so a dispatch retried
 	// after a crash cannot produce a second provider turn.
 	ClientMessageID string
@@ -636,6 +640,8 @@ type ConversationMessage struct {
 	Role     MessageRole   `json:"role"`
 	Origin   MessageOrigin `json:"origin"`
 	Text     string        `json:"text"`
+	// InterruptTargetProviderTurnID is intake-only; the store persists it on the new turn atomically.
+	InterruptTargetProviderTurnID string `json:"-"`
 	// AuthoredByUser is an intake-only fact used to project user activity when
 	// AO delivered the message as automation. It is not part of the persisted
 	// delivery origin or the conversation API representation.

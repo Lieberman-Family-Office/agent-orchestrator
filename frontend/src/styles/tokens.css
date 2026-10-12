@@ -511,6 +511,7 @@
 	--leading-settings-mobile-hint: 14px;
 	--leading-settings-mobile-warning: 15px;
 	--size-settings-action-height: 38px;
+	--size-composer-toolbar-height: var(--size-control-form);
 	--radius-settings-action: 16px;
 	--radius-settings-dialog-lg: 24px;
 	--shadow-settings-dialog: var(--elevation-xl);
@@ -636,6 +637,16 @@
 
 	--font-sans: var(--font-family-base);
 	--font-mono: var(--font-family-mono);
+}
+
+/* macOS uses the system faces (SF Pro / SF Mono). Preload sets data-ao-platform
+   before first paint; the Nerd Font entries stay as per-glyph fallbacks for
+   terminal powerline and file-type icons. */
+:root[data-ao-platform="darwin"] {
+	--font-family-base: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+	--font-family-mono:
+		"SF Mono", SFMono-Regular, ui-monospace, "JetBrainsMono Nerd Font Mono", "JetBrainsMono Nerd Font",
+		"FiraCode Nerd Font Mono", "FiraCode Nerd Font", "MesloLGS NF", Menlo, monospace;
 }
 
 /* Light theme — set via data-theme (apply-initial-theme + Zustand toggle). */
@@ -786,7 +797,7 @@
 	--color-text-agents-sheet-description: var(--muted-foreground);
 	--color-text-agents-sheet-label: var(--foreground);
 
-	--color-bg-settings-row: var(--card);
+	--color-bg-settings-row: transparent;
 	--color-bg-settings-menu: var(--popover);
 	--color-bg-settings-menu-selected: color-mix(in oklch, var(--popover) 96%, var(--foreground) 4%);
 	--color-bg-settings-dialog: var(--card);

@@ -128,6 +128,155 @@ export function patchClaudeContextUsage(adapterPath) {
 	return true;
 }
 
+// Reuse the pinned bridge's native task registry. Ending its process loses the
+// task monitor even when a background shell's process group survives.
+export function patchClaudeHibernationCheck(adapterPath) {
+	const source = readFileSync(adapterPath, "utf8");
+	const method = '"_ao/session/can_hibernate"';
+	if (source.includes(method)) return false;
+	const marker = ".onRequest(GOAL_CONTROL_METHOD, { parse: parseGoalRequest }, (ctx) => agent.goal(ctx.params))";
+	if (!source.includes(marker) || !source.includes("session.liveBackgroundTasks.set(message.task_id")) {
+		throw new Error("claude-agent-acp no longer matches AO's native-task hibernation check");
+	}
+	const registration = `.onRequest(${method}, { parse: params => params }, (ctx) => {
+            const id = ctx.params?.sessionId;
+            const session = typeof id === "string" && Object.hasOwn(agent.sessions, id) ? agent.sessions[id] : undefined;
+            if (!session || session.queryClosed || !(session.liveBackgroundTasks instanceof Map)) {
+                throw RequestError.invalidParams(undefined, "Live Claude session unavailable.");
+            }
+            return { canHibernate: !Array.from(session.liveBackgroundTasks.values()).some(task => !task.endedPerLevel) };
+        })
+        `;
+	writeFileSync(adapterPath, source.replace(marker, registration + marker));
+	return true;
+}
+
+// ponytail: Pinned SDK extension exposes native atomic queue cancellation until upstream supports it.
+export function patchClaudeQueuedStop(sdkPath) {
+	const source = readFileSync(sdkPath, "utf8");
+	if (source.includes("/* AO queued Stop v2 */")) return false;
+	if (source.includes("async interrupt(aoOptions)")) throw new Error("obsolete AO queued Stop patch; rebuild the pinned SDK");
+	const interrupt = 'async interrupt(){return lr("sdk_interrupt",async()=>{let t=(await this.request({subtype:"interrupt"})).response?.still_queued;';
+	const input = 'this.abortController?.signal.aborted)break;await Promise.resolve(this.transport.write(Se(n)';
+	for (const marker of [interrupt, input]) {
+		if (source.split(marker).length !== 2) throw new Error("Claude SDK no longer matches AO's queued Stop patch");
+	}
+	writeFileSync(sdkPath, source
+		.replace(interrupt, 'async interrupt(aoOptions){/* AO queued Stop v2 */return lr("sdk_interrupt",async()=>{let aoRaw=(await this.request({subtype:"interrupt",...(aoOptions?.cancelQueued===true?{cancel_queued:true}:{})})).response;if(aoOptions?.cancelQueued===true){if(!aoRaw||![aoRaw.still_queued,aoRaw.cancelled].every(v=>Array.isArray(v)&&v.every(id=>typeof id==="string"&&id.length>0)))throw Error("malformed native Stop receipt");return{still_queued:aoRaw.still_queued,cancelled:aoRaw.cancelled}}let t=aoRaw?.still_queued;')
+		.replace(input, 'this.abortController?.signal.aborted)break;if(n.aoCancelled===true)continue;n.aoWritten=true;await Promise.resolve(this.transport.write(Se(n)'));
+	return true;
+}
+
+// Guidance waits for a safe boundary; worker updates additionally retain peer provenance.
+// ponytail: This pinned bridge patch must be replaced with upstream support when available.
+export function patchClaudeWorkerSteering(adapterPath) {
+	const source = readFileSync(adapterPath, "utf8");
+	if (source.includes("// AO: worker safe-boundary steering v7.")) return false;
+	if (source.includes("// AO: worker safe-boundary steering.") || source.includes("// AO: worker safe-boundary steering v2.") || source.includes("// AO: worker safe-boundary steering v3.") || source.includes("// AO: worker safe-boundary steering v4.") || source.includes("// AO: worker safe-boundary steering v5.") || source.includes("// AO: worker safe-boundary steering v6.")) {
+		throw new Error("claude-agent-acp has obsolete worker steering; rebuild from the pinned package");
+	}
+	const validation = "    return {\n        sessionId,\n        prompt: prompt,";
+	const priority = "userMessage.priority = STEER_PRIORITY;";
+	const capability = "steering: {\n                    supported: true,";
+	const questionRequest = "const createRequest = askUserQuestionsToCreateRequest(questions, sessionId, toolUseID);";
+	const questionResponse = "        const outcome = applyAskElicitationResponse(response, toolInput, questions);";
+	const lifecycle = "                    const frame = message;\n                    switch (frame.state) {";
+	const injected = 'return { outcome: "injected" };';
+	const questionMethod = "async handleAskUserQuestion(sessionId, toolInput, toolUseID, signal) {";
+	const questionCall = "return this.handleAskUserQuestion(sessionId, toolInput, toolUseID, signal);";
+	const initLifecycle = '                            case "init":';
+	const stop = "        session.cancelled = true;";
+	const interrupt = "const receipt = await session.query.interrupt();";
+	const orphanSeed = '                this.trackOrphanCommand(session, uuid, "pending");';
+	const teardown = "        await this.cancel({ sessionId });";
+	const activate = "            session.activeTurn = turn;";
+	for (const marker of [validation, priority, capability, questionRequest, questionResponse, lifecycle, injected, questionMethod, questionCall, initLifecycle, stop, interrupt, orphanSeed, teardown, activate]) {
+		if (source.split(marker).length !== 2) {
+			throw new Error("claude-agent-acp no longer matches AO's worker steering patch");
+		}
+	}
+	const validateWorker = `    // AO: worker safe-boundary steering v7.
+    if (steering?.priority !== undefined && steering.priority !== "next") {
+        throw RequestError.invalidParams(undefined, "invalid worker steering priority");
+    }
+    if (steering?.senderSessionId !== undefined) {
+        if (steering.priority !== "next" || typeof steering.senderSessionId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(steering.senderSessionId)) {
+            throw RequestError.invalidParams(undefined, "invalid worker steering metadata");
+        }
+    }
+`;
+	const delivery = `const workerSteering = params._meta?.steering;
+        if (!session.aoInterruptCancelQueued || session.cancelled) {
+            throw RequestError.internalError(undefined, "safe guidance requires confirmed atomic Stop support and a running turn");
+        }
+        userMessage.priority = "next";
+        if (workerSteering?.senderSessionId !== undefined) {
+            userMessage.origin = { kind: "peer", from: workerSteering.senderSessionId };
+            const firstText = userMessage.message.content.find(block => block.type === "text");
+            if (!firstText) {
+                throw RequestError.invalidParams(undefined, "worker steering requires text content");
+            }
+            firstText.text = '<cross-session-message from="' + workerSteering.senderSessionId + '">\\n' + firstText.text + '\\n</cross-session-message>';
+            session.aoWorkerSteeringEpoch = (session.aoWorkerSteeringEpoch ?? 0) + 1;
+            (session.aoWorkerSteering ??= new Set()).add(steeredUuid);
+        }
+        (session.aoPendingGuidance ??= new Map()).set(steeredUuid, userMessage);`;
+	writeFileSync(adapterPath, source
+		.replace(validation, validateWorker + validation)
+		.replace(priority, delivery)
+		.replace(injected, 'return { outcome: "injected", workerEpoch: session.aoWorkerSteeringEpoch ?? 0, workerPending: workerSteering?.senderSessionId !== undefined && session.aoWorkerSteering?.has(steeredUuid) === true };')
+		.replace(capability, capability + "\n                    aoHumanSafeBoundary: true,\n                    aoGuidanceStopFence: 3,\n                    aoWorkerSafeBoundary: true,\n                    aoWorkerQuestionYield: true,\n                    aoWorkerQuestionOwnership: true,")
+		.replace(initLifecycle, initLifecycle + '\n                                if (message.capabilities?.includes("interrupt_cancel_queued_v1")) session.aoInterruptCancelQueued = true;')
+		.replace(stop, stop + '\n        const aoCancelledGuidance = new Map(session.aoPendingGuidance ?? []);\n        for (const message of aoCancelledGuidance.values()) message.aoCancelled = true;\n        session.aoPendingGuidance?.clear();\n        session.aoWorkerSteering?.clear();')
+		.replace(orphanSeed, '                if (!session.aoSeededGuidance?.has(uuid)) {\n                    (session.aoSeededGuidance ??= new Set()).add(uuid);\n                    if (!session.msgLifecycleV1 || !session.orphanCommands?.has(uuid)) this.trackOrphanCommand(session, uuid, "pending");\n                }')
+		.replace(teardown, '        try { await this.cancel({ sessionId }); }\n        catch (error) { this.logger.error(`Session ${sessionId}: cancel failed during teardown: ${error}`); }')
+		.replace(activate, activate + '\n            session.aoSeededGuidance?.clear();')
+		.replace(interrupt, `let receipt;
+        try {
+            receipt = await session.query.interrupt(session.aoInterruptCancelQueued ? { cancelQueued: true } : undefined);
+            if (session.aoInterruptCancelQueued && (!Array.isArray(receipt?.still_queued) || receipt.still_queued.length !== 0)) {
+                throw new Error("native Stop did not confirm queued guidance cancellation");
+            }
+        } catch (error) {
+            this.closeQueryStream(session);
+            throw error;
+        }
+        if (session.aoInterruptCancelQueued) {
+            const aoNativeCancelled = new Set(receipt.cancelled);
+            for (const [uuid, message] of aoCancelledGuidance) {
+                if (message.aoWritten !== true || aoNativeCancelled.has(uuid)) {
+                    for (const turn of session.turnQueue ?? []) turn.steeredEchoes?.delete(uuid);
+                    if (lifecycleLane) {
+                        if (session.orphanCommands?.get(uuid) === "pending") session.orphanCommands.delete(uuid);
+                    } else if (session.aoSeededGuidance?.has(uuid)) {
+                        session.pendingOrphanResults = Math.max(0, (session.pendingOrphanResults ?? 0) - 1);
+                    }
+                }
+            }
+        }`)
+		.replace(questionMethod, 'async handleAskUserQuestion(sessionId, toolInput, toolUseID, signal, agentID, parentToolUseId) {')
+		.replace(questionCall, 'return this.handleAskUserQuestion(sessionId, toolInput, toolUseID, signal, agentID, parentToolUseId);')
+		.replace(questionRequest, questionRequest + '\n        // ponytail: Subagent questions retain their callback until owner-targeted continuation exists.\n        createRequest._meta = { ...createRequest._meta, aoQuestionAgentId: agentID, aoQuestionParentToolUseId: parentToolUseId, aoWorkerQuestionEpoch: this.sessions[sessionId]?.aoWorkerSteeringEpoch ?? 0, aoWorkerQuestionYield: agentID || parentToolUseId ? false : this.sessions[sessionId]?.aoWorkerSteering?.size > 0 ? "automatic-worker-deferral" : true };')
+		.replace(questionResponse, `        if (response.action === "cancel" && response._meta?.aoWorkerQuestionYield === "automatic-worker-deferral") {
+            return {
+                behavior: "deny",
+                interrupt: false,
+                message: "AO automatically deferred this unanswered question to process a worker update. The form remains answerable. The user did not answer, skip, or request a stop. Do not infer approval or proceed with work that requires this answer.",
+            };
+        }
+` + questionResponse)
+		.replace(lifecycle, `                    const frame = message;
+                    const workerUuid = frame.command_uuid ?? frame.uuid;
+                    if (["started", "completed", "discarded", "cancelled"].includes(frame.state)) session.aoPendingGuidance?.delete(workerUuid);
+                    if (session.aoWorkerSteering?.has(workerUuid) && ["started", "completed", "discarded", "cancelled"].includes(frame.state)) {
+                        session.aoWorkerSteering.delete(workerUuid);
+                        for (const turn of session.turnQueue ?? []) turn.steeredEchoes?.delete(workerUuid);
+                    }
+                    switch (frame.state) {`)
+	);
+	return true;
+}
+
 export function pruneNodeDistribution(nodeRoot) {
 	// The Unix archives expose npm/corepack as bin/ symlinks into lib/. Remove
 	// the entry points before their targets so packagers never see dangling

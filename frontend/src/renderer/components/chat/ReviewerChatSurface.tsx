@@ -6,6 +6,7 @@ import { useHostConnection } from "../../hooks/useHostConnection";
 import { sessionUiKey } from "../../lib/hosts";
 import { useSessionLinkNavigation } from "../../lib/use-session-link-navigation";
 import { ChatWorkspace } from "./ChatWorkspace";
+import { can } from "../../types/conversation";
 
 export function ReviewerChatSurface({ reviewId, workerSessionId, hostId, hideHeader = false }: { reviewId: string; workerSessionId: string; hostId?: string; hideHeader?: boolean }) {
 	const { t } = useTranslation();
@@ -49,6 +50,8 @@ export function ReviewerChatSurface({ reviewId, workerSessionId, hostId, hideHea
 			loadingOlder={isLoadingOlder}
 			onLoadOlder={loadOlder}
 			onSend={(text, attachments, clientMessageId) => commands.send({ text, attachments, clientMessageId })}
+			onInterruptSend={can(snapshot, "interrupt_send") ? (text, attachments, clientMessageId) =>
+				commands.send({ text, attachments, clientMessageId, interruptAndSend: true }) : undefined}
 			onDecide={commands.resolve}
 			onResolveInput={commands.resolveInput}
 			onInterrupt={commands.interrupt}

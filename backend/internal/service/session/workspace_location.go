@@ -45,3 +45,29 @@ func (s *Service) WorkspaceLocation(ctx context.Context, id domain.SessionID) (s
 	}
 	return filepath.Clean(workspacePath), nil
 }
+
+// ArtifactLocation resolves the daemon-owned artifact root for desktop file handoff.
+func (s *Service) ArtifactLocation(ctx context.Context, id domain.SessionID) (string, error) {
+	record, ok, err := s.store.GetSession(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", apierr.NotFound("SESSION_NOT_FOUND", "Unknown session")
+	}
+	root := record.Metadata.ArtifactDir
+	if root == "" && s.dataDir != "" {
+		root = filepath.Join(s.dataDir, "artifacts", string(id))
+	}
+	if !filepath.IsAbs(root) {
+		return "", apierr.NotFound("SESSION_ARTIFACTS_NOT_FOUND", "Session artifacts are not available")
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		return "", fmt.Errorf("read session artifact directory: %w", err)
+	}
+	if !info.IsDir() {
+		return "", apierr.NotFound("SESSION_ARTIFACTS_NOT_FOUND", "Session artifacts are not available")
+	}
+	return filepath.Clean(root), nil
+}

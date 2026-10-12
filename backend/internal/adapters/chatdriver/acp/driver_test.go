@@ -583,6 +583,368 @@ func TestPersistentACPResumeAdoptsLivePromptWithoutSecondSetup(t *testing.T) {
 	}
 }
 
+func TestPersistentACPReconnectRefusesActiveHostWithoutDurableRunningTurn(t *testing.T) {
+	initialize, err := json.Marshal(acpsdk.InitializeResponse{ProtocolVersion: acpsdk.ProtocolVersionNumber})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := json.Marshal(acpsdk.NewSessionResponse{SessionId: "retained-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemon, host := net.Pipe()
+	t.Cleanup(func() { _ = host.Close(); _ = daemon.Close() })
+	driver := New(Config{Harness: domain.HarnessClaudeCode}, slog.New(slog.DiscardHandler))
+	driver.connectHost = func(context.Context, persistenthost.Config) (*persistenthost.Transport, error) {
+		return &persistenthost.Transport{Stdin: daemon, Stdout: daemon, Reconnected: true, ACPState: &persistenthost.ACPState{InitializeResult: initialize, SessionResult: session, SessionID: "retained-session", ActivePrompt: true}}, nil
+	}
+	opened, err := driver.Reconnect(context.Background(), ports.ChatResumeConfig{SessionID: "retained", DataDir: t.TempDir(), WorkspacePath: t.TempDir(), ProviderConversationID: "retained-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv := opened.(*conversation)
+	t.Cleanup(func() { _ = conv.Close() })
+	err = conv.ActivateLiveReconnect(context.Background(), "")
+	if !errors.Is(err, ports.ErrChatRecoveryInconclusive) || !strings.Contains(err.Error(), "active prompt but no durable running turn") {
+		t.Fatalf("missing durable target guard: %v", err)
+	}
+	if err := conv.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-conv.conn.Done():
+	case <-time.After(time.Second):
+		t.Fatal("refused activation retained connection")
+	}
+}
+
+func TestPersistentACPReconnectBackpressuresBurstWithoutLosingEvents(t *testing.T) {
+	initialize, err := json.Marshal(acpsdk.InitializeResponse{ProtocolVersion: acpsdk.ProtocolVersionNumber})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := json.Marshal(acpsdk.NewSessionResponse{SessionId: "burst-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	daemon, host := net.Pipe()
+	t.Cleanup(func() { _ = host.Close(); _ = daemon.Close() })
+	var logs bytes.Buffer
+	driver := New(Config{Harness: domain.HarnessClaudeCode, Capabilities: ports.ChatCapabilities{ports.ChatCapabilityStreaming: true}}, slog.New(slog.NewTextHandler(&logs, nil)))
+	driver.connectHost = func(context.Context, persistenthost.Config) (*persistenthost.Transport, error) {
+		return &persistenthost.Transport{Stdin: daemon, Stdout: daemon, Reconnected: true, ACPState: &persistenthost.ACPState{InitializeResult: initialize, SessionResult: session, SessionID: "burst-session", ActivePrompt: true}}, nil
+	}
+	opened, err := driver.Reconnect(context.Background(), ports.ChatResumeConfig{SessionID: "burst", DataDir: t.TempDir(), WorkspacePath: t.TempDir(), ProviderConversationID: "burst-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv := opened.(*conversation)
+	t.Cleanup(func() { _ = conv.Close() })
+	const count = 30000
+	written := make(chan error, 1)
+	go func() {
+		for i := range count {
+			if _, err := fmt.Fprintf(host, `{"jsonrpc":"2.0","method":"session/update","params":{"_meta":{"ao.persistentEventId":"burst:%d"},"sessionId":"burst-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"%d"}}}}`+"\n", i, i); err != nil {
+				written <- err
+				return
+			}
+		}
+		_, err := fmt.Fprintln(host, `{"jsonrpc":"2.0","method":"_ao/persistent_prompt_result","params":{"eventId":"burst:terminal","result":{"stopReason":"end_turn"}}}`)
+		written <- err
+	}()
+	if err := conv.ActivateLiveReconnect(context.Background(), "durable-burst-turn"); err != nil {
+		t.Fatal(err)
+	}
+	// No projector can drain before activation returns. A full output buffer must
+	// backpressure the journal, not overflow the SDK notification queue.
+	deadline := time.After(3 * time.Second)
+	for len(conv.events) < cap(conv.events) {
+		select {
+		case <-conv.conn.Done():
+			t.Fatal("burst closed before projector started")
+		case <-deadline:
+			t.Fatal("burst never filled event buffer")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	select {
+	case <-conv.conn.Done():
+		t.Fatal("burst overflowed SDK queue")
+	case <-time.After(100 * time.Millisecond):
+	}
+	for i := 0; i < count; {
+		event := nextEvent(t, conv.Events())
+		if event.Kind == ports.ChatEventControllerState && event.ControllerState == ports.ChatControllerStopped {
+			t.Fatal("burst stopped controller")
+		}
+		if event.Kind != ports.ChatEventMessageDelta {
+			continue
+		}
+		if event.Delta != fmt.Sprint(i) || event.ProviderEventID != fmt.Sprintf("burst:%d:0", i) || event.ProviderTurnID != "durable-burst-turn" {
+			t.Fatalf("lost or reordered frame %d: %+v", i, event)
+		}
+		i++
+	}
+	for {
+		event := nextEvent(t, conv.Events())
+		if event.Kind == ports.ChatEventTurnCompleted {
+			if event.ProviderEventID != "burst:terminal" || event.TurnState != domain.TurnStateCompleted {
+				t.Fatalf("wrong terminal: %+v", event)
+			}
+			break
+		}
+		if event.Kind == ports.ChatEventControllerState && event.ControllerState == ports.ChatControllerStopped {
+			t.Fatal("burst ended before terminal")
+		}
+	}
+	if err := <-written; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPersistentACPConnectionFailureDetachesTransportWithoutTerminatingProvider(t *testing.T) {
+	daemon, host := net.Pipe()
+	t.Cleanup(func() { _ = host.Close(); _ = daemon.Close() })
+	gate := newGatedReader(daemon, true)
+	proc := &process{stdin: daemon, stdout: gate, gate: gate}
+	proc.stop = persistentStop(gate, daemon)
+	proc.terminate = func() error { t.Error("connection failure terminated provider"); return nil }
+	conv := newConversation(proc, slog.New(slog.DiscardHandler), "", nil, nil)
+	t.Cleanup(func() { _ = conv.Close() })
+	written := make(chan error, 1)
+	go func() { _, err := io.WriteString(host, strings.Repeat("x", maxACPFrameSize+1)+"\n"); written <- err }()
+	select {
+	case <-conv.conn.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("oversized frame did not end SDK connection")
+	}
+	closed := make(chan error, 1)
+	go func() { _, err := host.Read(make([]byte, 1)); closed <- err }()
+	select {
+	case err := <-closed:
+		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("host detach: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("failed SDK retained host socket")
+	}
+	select {
+	case <-written:
+	case <-time.After(time.Second):
+		t.Fatal("detached host writer is still blocked")
+	}
+}
+
+func replayBoundaryConversation(t *testing.T) (*conversation, net.Conn) {
+	t.Helper()
+	daemon, host := net.Pipe()
+	gate := newGatedReader(daemon, true)
+	proc := &process{stdin: daemon, stdout: gate, gate: gate}
+	proc.stop = persistentStop(gate, daemon)
+	proc.terminate = func() error { t.Error("replay boundary terminated provider"); return nil }
+	conv := newConversation(proc, slog.New(slog.DiscardHandler), "", nil, nil)
+	conv.mu.Lock()
+	conv.sessionID, conv.activeTurn = "review-session", "review-turn"
+	conv.mu.Unlock()
+	t.Cleanup(func() { _ = conv.legacyWire.reader.Close(); _ = host.Close(); _ = conv.Close() })
+	return conv, host
+}
+
+func TestPersistentACPCloseUnblocksBackpressuredReplay(t *testing.T) {
+	conv, host := replayBoundaryConversation(t)
+	go func() {
+		for range eventBuffer + 2 {
+			if _, err := fmt.Fprintln(host, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"burst"}}}}`); err != nil {
+				return
+			}
+		}
+	}()
+	deadline := time.After(3 * time.Second)
+	for len(conv.events) < cap(conv.events) {
+		select {
+		case <-deadline:
+			t.Fatal("replay did not fill output buffer")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if err := conv.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-conv.conn.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Close retained blocked SDK reader")
+	}
+}
+
+func TestPersistentACPRejectsMalformedEnvelopeWithoutBlockingNextNotification(t *testing.T) {
+	for _, field := range []string{`"jsonrpc":7`, `"jsonrpc":"2.0","error":7`} {
+		t.Run(field, func(t *testing.T) {
+			conv, host := replayBoundaryConversation(t)
+			go func() {
+				_, _ = fmt.Fprintf(host, `{%s,"method":"session/update","params":{"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"rejected"}}}}`+"\n", field)
+				_, _ = fmt.Fprintln(host, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"after malformed"}}}}`)
+			}()
+			event := nextEvent(t, conv.Events())
+			if event.Kind != ports.ChatEventMessageDelta || event.Delta != "after malformed" {
+				t.Fatalf("malformed frame blocked valid notification: %+v", event)
+			}
+		})
+	}
+}
+
+func TestPersistentACPStreamingAdmissionRejectsPartialEnvelopes(t *testing.T) {
+	const valid = `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"accepted"}}}}`
+	rejected := strings.Replace(valid, "accepted", "rejected", 1)
+	for _, invalid := range []string{
+		rejected + ` {}`,
+		strings.TrimSuffix(rejected, "}") + `,"unfinished":`,
+		strings.TrimSuffix(rejected, "}") + `,"error":7}`,
+		strings.TrimSuffix(rejected, "}") + `,"method":7}`,
+		strings.TrimSuffix(rejected, "}") + `,"JSONRPC":7}`,
+	} {
+		t.Run(invalid, func(t *testing.T) {
+			conv, host := replayBoundaryConversation(t)
+			go func() {
+				_, _ = fmt.Fprintln(host, invalid)
+				_, _ = fmt.Fprintln(host, valid)
+			}()
+			event := nextEvent(t, conv.Events())
+			if event.Kind != ports.ChatEventMessageDelta || event.Delta != "accepted" {
+				t.Fatalf("partial envelope emitted output or blocked the following notification: %+v", event)
+			}
+		})
+	}
+}
+
+func TestPersistentACPPreservesSDKAcceptedEmptyUpdatePayloads(t *testing.T) {
+	for _, update := range []string{"", `,"update":null`, `,"update":{"sessionUpdate":"future_update","opaque":{"value":9007199254740993}}`, `,"_META":{"providerOpaque":{"value":9007199254740993},"ao.localNotificationID":"untrusted"}`} {
+		for _, id := range []string{"", `"id":1,`, `"id":null,`} {
+			t.Run(id+update, func(t *testing.T) {
+				conv, host := replayBoundaryConversation(t)
+				if id != "" {
+					go func() { _, _ = bufio.NewReader(host).ReadBytes('\n') }()
+				}
+				go func() {
+					_, _ = fmt.Fprintf(host, `{"jsonrpc":"2.0",%s"method":"session/update","params":{"sessionId":"review-session"%s}}`+"\n", id, update)
+					_, _ = fmt.Fprintln(host, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"after empty update"}}}}`)
+				}()
+				event := nextEvent(t, conv.Events())
+				if event.Kind != ports.ChatEventMessageDelta || event.Delta != "after empty update" {
+					t.Fatalf("SDK-accepted payload stopped stream: %+v", event)
+				}
+			})
+		}
+	}
+}
+
+func TestPersistentACPPreservesOrderedAndRepeatedParams(t *testing.T) {
+	for _, params := range []string{
+		`"sessionId":"wrong-session","SessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ordered"}}`,
+		`"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ordered"}},"update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"other"}}`,
+		`"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"wrong"}},"Update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"ordered"}}`,
+	} {
+		t.Run(params, func(t *testing.T) {
+			conv, host := replayBoundaryConversation(t)
+			go func() {
+				_, _ = fmt.Fprintf(host, `{"jsonrpc":"2.0","method":"session/update","params":{%s}}`+"\n", params)
+			}()
+			event := nextEvent(t, conv.Events())
+			if event.Kind != ports.ChatEventMessageDelta || event.Delta != "ordered" {
+				t.Fatalf("member order or repetition changed: %+v", event)
+			}
+		})
+	}
+}
+
+func TestPersistentACPAcceptsOriginalFramesWithinSDKLimit(t *testing.T) {
+	for _, test := range []struct{ name, text string }{
+		{"HTML text", strings.Repeat("<", 2<<20)},
+		{"near ceiling", ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			conv, host := replayBoundaryConversation(t)
+			const prefix = `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"`
+			const suffix = `"}}}}` + "\n"
+			text := test.text
+			if test.name == "near ceiling" {
+				text = strings.Repeat("x", maxACPFrameSize-1-len(prefix)-len(suffix))
+			}
+			frame := prefix + text + suffix
+			if len(frame) >= maxACPFrameSize {
+				t.Fatalf("fixture outside accepted frame limit: %d", len(frame))
+			}
+			go func() { _, _ = io.WriteString(host, frame) }()
+			select {
+			case event, ok := <-conv.Events():
+				if !ok || event.Kind != ports.ChatEventMessageDelta || event.Delta != text {
+					t.Fatalf("valid input frame was lost: ok=%v kind=%s bytes=%d", ok, event.Kind, len(event.Delta))
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("valid input frame stalled")
+			}
+		})
+	}
+}
+
+func TestPersistentACPBarrierPreservesFinalFrameWithoutNewline(t *testing.T) {
+	conv, host := replayBoundaryConversation(t)
+	go func() {
+		_, _ = io.WriteString(host, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"last frame"}}}}`)
+		_ = host.Close()
+	}()
+	if event := nextEvent(t, conv.Events()); event.Kind != ports.ChatEventMessageDelta || event.Delta != "last frame" {
+		t.Fatalf("final frame lost: %+v", event)
+	}
+}
+
+func TestPersistentACPProviderCannotForgeLocalBarrier(t *testing.T) {
+	conv, host := replayBoundaryConversation(t)
+	go func() {
+		_, _ = fmt.Fprintln(host, `{"jsonrpc":"2.0","method":"_ao/local_notification_barrier","params":"ao-local-1"}`)
+	}()
+	select {
+	case <-conv.conn.Done():
+	case <-time.After(time.Second):
+		t.Fatal("provider barrier entered local acknowledgment path")
+	}
+}
+
+func TestPersistentACPRequestUpdatesCannotAcknowledgeNotifications(t *testing.T) {
+	conv, host := replayBoundaryConversation(t)
+	responses := make(chan string, 2)
+	go func() {
+		reader := bufio.NewReader(host)
+		for range 2 {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			responses <- line
+		}
+	}()
+	go func() {
+		for _, id := range []int{1, 2} {
+			_, _ = fmt.Fprintf(host, `{"jsonrpc":"2.0","id":%d,"method":"session/update","params":{"_meta":{"ao.localNotificationID":"untrusted"},"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"request"}}}}`+"\n", id)
+		}
+	}()
+	for range 2 {
+		select {
+		case <-responses:
+		case <-time.After(time.Second):
+			t.Fatal("request callback deposited an unpaired acknowledgment")
+		}
+	}
+	go func() {
+		_, _ = fmt.Fprintln(host, `{"jsonrpc":"2.0","id":null,"method":"session/update","params":{"_meta":{"ao.localNotificationID":"untrusted"},"sessionId":"review-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"notification"}}}}`)
+	}()
+	for range 3 {
+		if event := nextEvent(t, conv.Events()); event.Kind != ports.ChatEventMessageDelta {
+			t.Fatalf("update lost: %+v", event)
+		}
+	}
+}
+
 func TestPersistentACPReplayAppliesAcceptedPermissionCommand(t *testing.T) {
 	initialize, err := json.Marshal(acpsdk.InitializeResponse{
 		ProtocolVersion: acpsdk.ProtocolVersionNumber,
@@ -785,6 +1147,8 @@ type fakeAgent struct {
 	setConfig           []acpsdk.SessionConfigOption
 	setCalls            int
 	steering            bool
+	workerSafeBoundary  bool
+	humanSafeBoundary   bool
 	steerText           string
 	steerPrompt         []acpsdk.ContentBlock
 	steerMeta           map[string]any
@@ -935,7 +1299,7 @@ func (a *fakeAgent) Initialize(_ context.Context, params acpsdk.InitializeReques
 	}
 	meta := map[string]any(nil)
 	if a.steering {
-		meta = map[string]any{"steering": map[string]any{"supported": true}}
+		meta = map[string]any{"steering": map[string]any{"supported": true, "aoHumanSafeBoundary": a.humanSafeBoundary, "aoGuidanceStopFence": map[bool]int{true: 3}[a.humanSafeBoundary], "aoWorkerSafeBoundary": a.workerSafeBoundary, "aoWorkerQuestionYield": a.workerSafeBoundary, "aoWorkerQuestionOwnership": a.workerSafeBoundary}}
 	}
 	defaultCaps := acpsdk.AgentCapabilities{
 		SessionCapabilities: acpsdk.SessionCapabilities{Resume: &acpsdk.SessionResumeCapabilities{}},
@@ -974,7 +1338,7 @@ func (a *fakeAgent) HandleExtensionMethod(_ context.Context, method string, raw 
 	if outcome == "" {
 		outcome = "injected"
 	}
-	return steeringResponse{Outcome: outcome}, nil
+	return steeringResponse{Outcome: outcome, WorkerPending: outcome == "injected", WorkerEpoch: 1}, nil
 }
 func (a *fakeAgent) Logout(context.Context, acpsdk.LogoutRequest) (acpsdk.LogoutResponse, error) {
 	return acpsdk.LogoutResponse{}, nil
@@ -2578,6 +2942,105 @@ func TestACPDriverExtractsCommandFromExecuteToolInput(t *testing.T) {
 	}
 }
 
+// A tool row's detail is rewritten on every update and carried by every
+// snapshot, so an html_render page and an html_preview screenshot are not
+// stored whole.
+func TestACPToolDetailCapsInputAndDropsImageData(t *testing.T) {
+	page := map[string]any{"html": strings.Repeat("<p>x</p>", 2000), "title": "Turns"}
+	shot := strings.Repeat("iVBORw0KGgo", 400)
+	tool := &toolState{
+		id: "mcp-1", kind: acpsdk.ToolKindOther, status: acpsdk.ToolCallStatusCompleted, rawInput: page,
+		content: []acpsdk.ToolCallContent{
+			acpsdk.ToolContent(acpsdk.ImageBlock(shot, "image/png")),
+			acpsdk.ToolContent(acpsdk.TextBlock(`{"width":720}`)),
+		},
+		rawOutput: []any{
+			map[string]any{"type": "image", "data": shot, "mimeType": "image/png"},
+			map[string]any{"type": "text", "text": `{"width":720}`},
+		},
+	}
+	event := (&conversation{}).toolEvent("turn-1", tool, true)
+	approval := approvalToolDetail(acpsdk.ToolCallUpdate{RawInput: page}, domain.ActivityKindMCPTool)
+
+	for name, raw := range map[string][]byte{"tool": event.Detail, "approval": approval} {
+		if strings.Contains(string(raw), `\u003cp\u003ex\u003c/p\u003e`) || strings.Contains(string(raw), shot) {
+			t.Fatalf("%s detail stored the page or the screenshot: %.300s", name, raw)
+		}
+		var detail struct {
+			Input map[string]any `json:"input"`
+		}
+		if err := json.Unmarshal(raw, &detail); err != nil {
+			t.Fatal(err)
+		}
+		if detail.Input["truncated"] != true {
+			t.Fatalf("%s input = %v, want the truncation marker", name, detail.Input)
+		}
+	}
+	var detail struct {
+		Content []json.RawMessage `json:"content"`
+		Output  string            `json:"output"`
+	}
+	if err := json.Unmarshal(event.Detail, &detail); err != nil {
+		t.Fatal(err)
+	}
+	stub := fmt.Sprintf(`{"bytes":%d,"mimeType":"image/png","type":"image"}`, len(shot))
+	if len(detail.Content) != 2 || string(detail.Content[0]) != `{"content":`+stub+`,"type":"content"}` ||
+		string(detail.Content[1]) != `{"content":{"text":"{\"width\":720}","type":"text"},"type":"content"}` {
+		t.Fatalf("content = %s", detail.Content)
+	}
+	if want := `[` + stub + `,{"text":"{\"width\":720}","type":"text"}]`; detail.Output != want {
+		t.Fatalf("output = %s\nwant     %s", detail.Output, want)
+	}
+}
+
+// claude-agent-acp passes an MCP image result through as rawOutput in the
+// Anthropic shape, with the base64 under source.data.
+func TestACPToolDetailDropsAnthropicImageData(t *testing.T) {
+	shot := strings.Repeat("iVBORw0KGgo", 400)
+	tool := &toolState{
+		id: "mcp-2", kind: acpsdk.ToolKindOther, status: acpsdk.ToolCallStatusCompleted,
+		rawOutput: []any{
+			map[string]any{"type": "image", "source": map[string]any{"type": "base64", "media_type": "image/png", "data": shot}},
+			map[string]any{"type": "text", "text": "ok"},
+		},
+	}
+	event := (&conversation{}).toolEvent("turn-1", tool, true)
+	if strings.Contains(string(event.Detail), shot) {
+		t.Fatalf("detail stored the screenshot: %.300s", event.Detail)
+	}
+	var detail struct {
+		Output string `json:"output"`
+	}
+	if err := json.Unmarshal(event.Detail, &detail); err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf(`[{"bytes":%d,"mimeType":"image/png","type":"image"},{"text":"ok","type":"text"}]`, len(shot))
+	if detail.Output != want {
+		t.Fatalf("output = %s\nwant     %s", detail.Output, want)
+	}
+}
+
+func TestACPToolDetailKeepsReadContentAndSmallInput(t *testing.T) {
+	file := strings.Repeat("line of a file\n", 2000)
+	tool := &toolState{
+		id: "read-1", kind: acpsdk.ToolKindRead, status: acpsdk.ToolCallStatusCompleted,
+		rawInput: map[string]any{"file_path": "/repo/main.go"},
+		content:  []acpsdk.ToolCallContent{acpsdk.ToolContent(acpsdk.TextBlock(file))},
+	}
+	var detail struct {
+		Input   map[string]any           `json:"input"`
+		Content []acpsdk.ToolCallContent `json:"content"`
+	}
+	if err := json.Unmarshal((&conversation{}).toolEvent("turn-1", tool, true).Detail, &detail); err != nil {
+		t.Fatal(err)
+	}
+	if detail.Input["file_path"] != "/repo/main.go" || len(detail.Content) != 1 ||
+		detail.Content[0].Content == nil || detail.Content[0].Content.Content.Text == nil ||
+		detail.Content[0].Content.Content.Text.Text != file {
+		t.Fatalf("read detail changed: input=%v content=%+v", detail.Input, detail.Content)
+	}
+}
+
 func TestRawCommandFromInput(t *testing.T) {
 	tests := []struct {
 		name string
@@ -3335,7 +3798,9 @@ func awaitSkillCount(t *testing.T, lister ports.ChatSkillLister, want int) []por
 
 func TestACPDriverMapsAdvertisedSteeringOntoAO(t *testing.T) {
 	agent := &fakeAgent{
-		steering: true,
+		steering:           true,
+		workerSafeBoundary: true,
+		humanSafeBoundary:  true,
 		capabilities: &acpsdk.AgentCapabilities{
 			PromptCapabilities: acpsdk.PromptCapabilities{Image: true},
 			SessionCapabilities: acpsdk.SessionCapabilities{
@@ -3390,6 +3855,59 @@ func TestACPDriverMapsAdvertisedSteeringOntoAO(t *testing.T) {
 	steering, _ := meta["steering"].(map[string]any)
 	if steering["idleBehavior"] != "promptRequired" {
 		t.Fatalf("steering meta = %#v", meta)
+	}
+
+	question := make(chan ports.ChatInputResponse, 1)
+	questionCtx, cancelQuestion := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelQuestion()
+	go func() {
+		response, _ := conv.requestInput(questionCtx, "pending-question", ports.ChatInputRequest{Mode: ports.ChatInputModeForm}, &parkedInput{workerYield: make(chan struct{})})
+		question <- response
+	}()
+	for event := range conv.Events() {
+		if event.Kind == ports.ChatEventInputRequested {
+			break
+		}
+	}
+	if _, err := conv.Steer(context.Background(), "turn-1", ports.ChatUserMessage{Text: "worker finished", Origin: domain.MessageOriginAutomation, SenderSessionID: "worker-54"}); err != nil {
+		t.Fatalf("worker steer: %v", err)
+	}
+	select {
+	case <-question:
+	case <-questionCtx.Done():
+		t.Fatal("accepted worker update remained behind the unanswered question")
+	}
+	agent.mu.Lock()
+	workerMeta := agent.steerMeta
+	agent.mu.Unlock()
+	workerSteering, _ := workerMeta["steering"].(map[string]any)
+	if workerSteering["priority"] != "next" || workerSteering["senderSessionId"] != "worker-54" {
+		t.Fatalf("worker update lacks safe-boundary provenance: %#v", workerMeta)
+	}
+	if steering["priority"] != "next" || steering["senderSessionId"] != nil {
+		t.Fatalf("human guidance must retain provenance without tool preemption: %#v", steering)
+	}
+	conv.humanSafeBoundary = false
+	for _, origin := range []domain.MessageOrigin{"", domain.MessageOriginHuman, domain.MessageOriginAutomation} {
+		if _, err := conv.Steer(context.Background(), "turn-1", ports.ChatUserMessage{Text: "ledger receipt", Origin: origin}); !errors.Is(err, ports.ErrChatTurnNotSteerable) {
+			t.Fatalf("unpatched Claude bridge must not preempt ordinary guidance: %v", err)
+		}
+	}
+	conv.humanSafeBoundary = true
+	conv.workerSafeBoundary = false
+	if _, err := conv.Steer(context.Background(), "turn-1", ports.ChatUserMessage{Text: "unsupported worker update", Origin: domain.MessageOriginAutomation, SenderSessionID: "worker-54"}); !errors.Is(err, ports.ErrChatTurnNotSteerable) {
+		t.Fatalf("unpatched Claude bridge must not silently cancel tools: %v", err)
+	}
+	conv.harness = domain.HarnessOpenCode
+	if _, err := conv.Steer(context.Background(), "turn-1", ports.ChatUserMessage{Text: "other provider update", Origin: domain.MessageOriginAutomation, SenderSessionID: "worker-54"}); err != nil {
+		t.Fatalf("non-Claude steering changed: %v", err)
+	}
+	agent.mu.Lock()
+	otherMeta := agent.steerMeta
+	agent.mu.Unlock()
+	otherSteering, _ := otherMeta["steering"].(map[string]any)
+	if _, present := otherSteering["priority"]; present {
+		t.Fatal("Claude-only delivery metadata sent to another provider")
 	}
 
 	agent.mu.Lock()
@@ -4180,5 +4698,63 @@ func TestReconnectMissingHostNeverLaunchesProvider(t *testing.T) {
 	})
 	if !errors.Is(err, ports.ErrChatHostNotRunning) {
 		t.Fatalf("error=%v", err)
+	}
+}
+
+// A provider that never persisted the stored session reports it missing on
+// reload. Only a caller that proved the conversation never started may then
+// start fresh; every other reload failure keeps its existing error.
+func TestACPDriverResumeStartsFreshOnlyForMissingSessionWhenAllowed(t *testing.T) {
+	notFound := &acpsdk.RequestError{Code: -32002, Message: "Resource not found: provider-session-1"}
+	tests := []struct {
+		name           string
+		loadErr        error
+		freshIfMissing bool
+		wantFresh      bool
+	}{
+		{name: "missing and allowed", loadErr: notFound, freshIfMissing: true, wantFresh: true},
+		{name: "missing without proof", loadErr: notFound},
+		{name: "provider failure with proof", loadErr: errors.New("transcript replay failed"), freshIfMissing: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			agent := &fakeAgent{
+				capabilities: &acpsdk.AgentCapabilities{LoadSession: true},
+				failLoadFrom: 1,
+				failLoadErr:  tt.loadErr,
+			}
+			driver := New(Config{
+				Harness:      domain.HarnessClaudeCode,
+				Capabilities: ports.ChatCapabilities{ports.ChatCapabilityStreaming: true},
+				Probe:        func(context.Context) error { return nil },
+				Launch:       func(context.Context, LaunchConfig) (Launch, error) { return Launch{Command: "fake"}, nil },
+			}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			driver.useTestProcess(fakeSpawn(agent))
+
+			conv, err := driver.Resume(context.Background(), ports.ChatResumeConfig{
+				ProviderConversationID: "provider-session-1",
+				WorkspacePath:          t.TempDir(),
+				FreshIfMissing:         tt.freshIfMissing,
+			})
+			if !tt.wantFresh {
+				if !errors.Is(err, ports.ErrChatResumeFailed) {
+					t.Fatalf("Resume error = %v, want ErrChatResumeFailed", err)
+				}
+				agent.mu.Lock()
+				newCwd := agent.newParams.Cwd
+				agent.mu.Unlock()
+				if newCwd != "" {
+					t.Fatal("a reload failure without proof started a fresh provider session")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Resume: %v", err)
+			}
+			defer func() { _ = conv.Close() }()
+			if got := conv.ProviderConversationID(); got != "claude-session-1" {
+				t.Fatalf("provider conversation = %q, want the fresh session", got)
+			}
+		})
 	}
 }

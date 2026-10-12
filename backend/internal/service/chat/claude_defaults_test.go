@@ -18,6 +18,7 @@ import (
 type claudeDefaultsConversation struct {
 	*fakeConversation
 	model, effort string
+	modelID       string
 	calls         []string
 	listCalls     int
 	listErr       error
@@ -29,9 +30,13 @@ func (c *claudeDefaultsConversation) ListConfigOptions(context.Context) ([]ports
 	if c.listErr != nil {
 		return nil, c.listErr
 	}
+	modelID := c.modelID
+	if modelID == "" {
+		modelID = "model"
+	}
 	return []ports.ChatConfigOption{
 		{
-			ID: "model", Category: "model", Type: ports.ChatConfigOptionSelect,
+			ID: modelID, Category: "model", Type: ports.ChatConfigOptionSelect,
 			Current: ports.ChatConfigOptionValue{Select: c.model},
 			Choices: []ports.ChatConfigOptionChoice{
 				{Value: "default", Name: "Default (recommended)", Description: "Opus (1M context)"},
@@ -56,7 +61,7 @@ func (c *claudeDefaultsConversation) ReconnectedLive() bool { return c.live }
 func (c *claudeDefaultsConversation) SetConfigOption(ctx context.Context, id string, value ports.ChatConfigOptionValue) ([]ports.ChatConfigOption, error) {
 	c.calls = append(c.calls, id+":"+value.Select)
 	switch id {
-	case "model":
+	case "model", c.modelID:
 		c.model, c.effort = value.Select, "default"
 	case "effort":
 		c.effort = value.Select
@@ -159,6 +164,70 @@ func TestClaudeImplicitDefaultsRemainProviderOwnedAcrossStartSwitchAndResume(t *
 	}
 	if !reflect.DeepEqual(second.calls, []string{"effort:high", "model:default"}) {
 		t.Fatalf("restored default provider calls = %v", second.calls)
+	}
+}
+
+func TestClaudeUnrelatedConfigChangePreservesExplicitModelPin(t *testing.T) {
+	for _, modelID := range []string{"model", "provider-model"} {
+		t.Run(modelID, func(t *testing.T) {
+			ctx := context.Background()
+			st := openStore(t)
+			const pinnedModel = "cc/claude-opus-5-5(max)"
+			created, err := st.CreateSession(ctx, domain.SessionRecord{
+				ProjectID: testProject, Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode,
+				Mode: domain.SessionModeChat, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+				Metadata: domain.SessionMetadata{Model: pinnedModel},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			conv := &claudeDefaultsConversation{fakeConversation: newFakeConversation(), model: "default", effort: "default", modelID: modelID}
+			var modelWrites []string
+			svc := chatsvc.New(chatsvc.Options{
+				Store: st, Reader: fullSnapshotReader(st), Sessions: st,
+				Drivers: fakeRegistry{driver: fakeDriver{conv: conv}},
+				Log:     slog.New(slog.DiscardHandler), NewID: uuid.NewString,
+				OnModelChanged: func(id domain.SessionID, model string) {
+					modelWrites = append(modelWrites, model)
+					if _, err := st.UpdateSessionModel(ctx, id, model); err != nil {
+						t.Fatal(err)
+					}
+				},
+			})
+			if _, err := svc.Start(ctx, chatsvc.StartConfig{
+				SessionID: created.ID, ProjectID: testProject, Harness: domain.HarnessClaudeCode,
+				WorkspacePath: t.TempDir(), Model: pinnedModel,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = svc.Stop(ctx, created.ID) })
+			for _, configID := range []string{"effort", "mode", modelID} {
+				value, wantModel := "high", pinnedModel
+				if configID == modelID {
+					value, wantModel = "default", ""
+				}
+				if _, err := svc.SetConfigOption(ctx, created.ID, configID, ports.ChatConfigOptionValue{Select: value}); err != nil {
+					t.Fatal(err)
+				}
+				stored, err := st.ConversationForSession(ctx, created.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				record, found, err := st.GetSession(ctx, created.ID)
+				if err != nil || !found {
+					t.Fatalf("read session: found=%v error=%v", found, err)
+				}
+				if stored.Settings.Model != wantModel || record.Metadata.Model != wantModel {
+					t.Fatalf("%s changed model pin: conversation=%q session=%q want=%q", configID, stored.Settings.Model, record.Metadata.Model, wantModel)
+				}
+				if configID != modelID && (stored.Settings.ReasoningEffort != "high" || len(modelWrites) != 0) {
+					t.Fatalf("%s settings=%+v model writes=%v", configID, stored.Settings, modelWrites)
+				}
+			}
+			if !reflect.DeepEqual(modelWrites, []string{""}) {
+				t.Fatalf("explicit model reset writes=%v, want one clearing write", modelWrites)
+			}
+		})
 	}
 }
 

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { AppBrowserLinkContext, AppLink } from "./AppLink";
 import { ProductExternalLink } from "./ProductExternalLink";
@@ -9,6 +9,38 @@ const url = "https://github.com/aoagents/agent-orchestrator/pull/42";
 afterEach(() => vi.restoreAllMocks());
 
 describe("AppLink", () => {
+	it.each([false, true])("cancels overlapping preview timers on unmount (close=%s)", (close) => {
+		vi.useFakeTimers();
+		try {
+			const view = render(<AppLink href="ao://sessions/project/session" hoverPreview={() => <div>Preview</div>}>Worker</AppLink>);
+			const link = screen.getByRole("link");
+			fireEvent.pointerOver(link, { pointerType: "mouse" });
+			fireEvent.focus(link);
+			if (close) {
+				fireEvent.pointerOut(link, { pointerType: "mouse" });
+				fireEvent.blur(link);
+			}
+			view.unmount();
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("opens a session preview with keyboard focus", () => {
+		vi.useFakeTimers();
+		try {
+			const view = render(<AppLink href="ao://sessions/project/session" hoverPreview={() => <div>Keyboard preview</div>}>Worker</AppLink>);
+			fireEvent.focus(screen.getByRole("link"));
+			act(() => vi.advanceTimersByTime(300));
+			expect(screen.getByText("Keyboard preview")).toBeInTheDocument();
+			view.unmount();
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("opens PR links in ao even when the product link stops propagation", () => {
 		const open = vi.fn();
 		const external = vi.spyOn(aoBridge.app, "openExternal").mockResolvedValue(undefined);
@@ -81,5 +113,15 @@ describe("AppLink", () => {
 		await user.click(screen.getByRole("menuitem", { name: "Open in Files" }));
 		expect(openFile).toHaveBeenCalledExactlyOnceWith(path);
 		expect(open).not.toHaveBeenCalled();
+	});
+
+	it("mounts a caller supplied preview only after a session link opens", async () => {
+		const preview = vi.fn(() => <div data-testid="session-preview">Worker details</div>);
+		render(<AppLink href="ao://sessions/project/session" hoverPreview={preview}>Worker</AppLink>);
+
+		expect(preview).not.toHaveBeenCalled();
+		fireEvent.pointerOver(screen.getByRole("link"), { pointerType: "mouse" });
+		await waitFor(() => expect(screen.getByTestId("session-preview")).toBeInTheDocument());
+		expect(preview).toHaveBeenCalled();
 	});
 });

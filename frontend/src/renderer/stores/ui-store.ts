@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { appI18n } from "../i18n";
 import { aoBridge } from "../lib/bridge";
 import { sessionUiKey } from "../lib/hosts";
 import type { ProjectSettingsSection as ProjectFormSection } from "../components/ProjectSettingsForm";
@@ -36,7 +37,7 @@ export type GlobalSettingsSection =
 	| "help";
 
 /** Project settings pages: the project form sections plus the cues manager. */
-export type ProjectSettingsSection = ProjectFormSection | "environment" | "cues";
+export type ProjectSettingsSection = ProjectFormSection | "environment" | "scripts" | "cues";
 
 export type SettingsModal =
 	| {
@@ -46,6 +47,8 @@ export type SettingsModal =
 			hostId?: string;
 			/** Which Harness page view (local or cloud logins) to open. */
 			harnessView?: "local" | "cloud";
+			/** Start focusAgentId's login flow as soon as the Harness page can. */
+			startLogin?: boolean;
 			/** Preserve the project form while global recovery settings is above it. */
 			returnTo?: Extract<SettingsModal, { scope: "project" }>;
 	}
@@ -55,6 +58,7 @@ export type SettingsModal =
 			hostId?: string;
 			/** Page to open on, so callers can deep-link a project setting. */
 			section?: ProjectSettingsSection;
+			cloudOrgId?: string;
 	};
 
 /** Worker detail view toggles — Changes (Git rail) is the default. */
@@ -126,11 +130,14 @@ export type UiState = {
 	diagnostics: boolean;
 	/** Copy the terminal selection to the clipboard on mouse-up, like native terminals. Default on. */
 	terminalCopyOnSelect: boolean;
+	hideAutomationMessages: boolean;
+	chatSendMode: "steer" | "interrupt";
 	restartingProjectIds: ReadonlySet<string>;
 	// Projects whose initial orchestrator spawn (after import/clone) is still
 	// running in the background. The board renders a progress banner and gates
 	// session actions until the spawn settles, instead of blocking navigation.
 	provisioningProjectIds: ReadonlySet<string>;
+	projectCreationPending: boolean;
 	orchestratorReplacementErrors: Record<string, OrchestratorReplacementFailure>;
 	orchestratorStartupErrors: Record<string, string>;
 	globalToasts: GlobalToast[];
@@ -175,12 +182,15 @@ export type UiState = {
 	setRemoteHosts: (enabled: boolean) => void;
 	setDiagnostics: (enabled: boolean) => void;
 	setTerminalCopyOnSelect: (enabled: boolean) => void;
+	setHideAutomationMessages: (hidden: boolean) => void;
+	setChatSendMode: (mode: "steer" | "interrupt") => void;
 	/** True while the restart-to-update confirmation is open. */
 	updateInstallPromptOpen: boolean;
 	openUpdateInstallPrompt: () => void;
 	closeUpdateInstallPrompt: () => void;
-	openGlobalSettings: (section?: GlobalSettingsSection, options?: { focusAgentId?: string; hostId?: string; harnessView?: "local" | "cloud"; preserveProject?: boolean }) => void;
-	openProjectSettings: (projectId: string, options?: string | { section?: ProjectSettingsSection }) => void;
+	openGlobalSettings: (section?: GlobalSettingsSection, options?: { focusAgentId?: string; hostId?: string; harnessView?: "local" | "cloud"; startLogin?: boolean; preserveProject?: boolean }) => void;
+	/** `options` as a string is the owning daemon's host ID (remote projects). */
+	openProjectSettings: (projectId: string, options?: string | { section?: ProjectSettingsSection; cloudOrgId?: string }) => void;
 	closeSettings: () => void;
 	/** Refresh resolvedTheme from OS without writing light/dark to storage. */
 	syncSystemTheme: () => void;
@@ -204,6 +214,7 @@ export type UiState = {
 	setCommandPaletteOpen: (open: boolean) => void;
 	setProjectRestarting: (projectId: string, restarting: boolean, hostId?: string) => void;
 	setProjectProvisioning: (projectId: string, provisioning: boolean, hostId?: string) => void;
+	setProjectCreationPending: (pending: boolean) => void;
 	setOrchestratorReplacementError: (projectId: string, failure: OrchestratorReplacementFailure | null) => void;
 	setOrchestratorStartupError: (projectId: string, message: string | null, hostId?: string) => void;
 	showGlobalToast: (title: string, body?: string, style?: GlobalToast["tone"] | GlobalToast["placement"] | GlobalToastOptions) => void;
@@ -232,6 +243,23 @@ const developerModeStorageKey = "ao.developerMode";
 const remoteHostsStorageKey = "ao.remoteHosts";
 const diagnosticsStorageKey = "ao.diagnostics";
 const terminalCopyOnSelectStorageKey = "ao.terminalCopyOnSelect";
+// ponytail: Renderer-local preference; add storage-event sync if separate AO windows need live synchronization.
+const hideAutomationMessagesStorageKey = "ao.chat.hideAutomationMessages";
+function initialHideAutomationMessages(): boolean {
+	try {
+		return getLocalStorage()?.getItem(hideAutomationMessagesStorageKey) === "true";
+	} catch {
+		return false;
+	}
+}
+const chatSendModeStorageKey = "ao.chat.sendMode";
+function initialChatSendMode(): "steer" | "interrupt" {
+	try {
+		return getLocalStorage()?.getItem(chatSendModeStorageKey) === "interrupt" ? "interrupt" : "steer";
+	} catch {
+		return "steer";
+	}
+}
 function getLocalStorage() {
 	if (typeof window === "undefined" || !window.localStorage) return null;
 	return window.localStorage;
@@ -246,7 +274,9 @@ function initialDeveloperMode() {
 }
 
 function initialRemoteHosts() {
-	return getLocalStorage()?.getItem(remoteHostsStorageKey) === "true";
+	// Developer mode remains the feature gate. Once enabled, signed-in devices
+	// should discover account hosts without an extra per-device setup switch.
+	return getLocalStorage()?.getItem(remoteHostsStorageKey) !== "false";
 }
 
 function initialDiagnostics() {
@@ -313,8 +343,39 @@ export const useUiStore = create<UiState>((set, get) => ({
 	remoteHosts: initialRemoteHosts(),
 	diagnostics: initialDiagnostics(),
 	terminalCopyOnSelect: initialTerminalCopyOnSelect(),
+	chatSendMode: initialChatSendMode(),
+	setChatSendMode: (chatSendMode) => {
+		set({ chatSendMode });
+		try {
+			const storage = getLocalStorage();
+			if (!storage) throw new Error("Storage unavailable");
+			storage.setItem(chatSendModeStorageKey, chatSendMode);
+		} catch {
+			get().showGlobalToast(
+				appI18n.t("chat.automation.storageTitle"),
+				appI18n.t("chat.automation.storageBody"),
+				{ tone: "error", dedupeKey: "chat-send-mode-storage" },
+			);
+		}
+	},
+	hideAutomationMessages: initialHideAutomationMessages(),
+	setHideAutomationMessages: (hideAutomationMessages) => {
+		set({ hideAutomationMessages });
+		try {
+			const storage = getLocalStorage();
+			if (!storage) throw new Error("Storage unavailable");
+			storage.setItem(hideAutomationMessagesStorageKey, String(hideAutomationMessages));
+		} catch {
+			get().showGlobalToast(
+				appI18n.t("chat.automation.storageTitle"),
+				appI18n.t("chat.automation.storageBody"),
+				{ tone: "error", dedupeKey: "automation-visibility-storage" },
+			);
+		}
+	},
 	restartingProjectIds: new Set<string>(),
 	provisioningProjectIds: new Set<string>(),
+	projectCreationPending: false,
 	orchestratorReplacementErrors: {},
 	orchestratorStartupErrors: {},
 	globalToasts: [],
@@ -372,6 +433,7 @@ export const useUiStore = create<UiState>((set, get) => ({
 			...(options?.focusAgentId ? { focusAgentId: options.focusAgentId } : {}),
 			...(options?.hostId && options.hostId !== "local" ? { hostId: options.hostId } : {}),
 			...(options?.harnessView ? { harnessView: options.harnessView } : {}),
+			...(options?.startLogin && options.focusAgentId ? { startLogin: true } : {}),
 			...(options?.preserveProject && state.settingsModal?.scope === "project"
 				? { returnTo: state.settingsModal }
 				: options?.preserveProject && state.settingsModal?.scope === "global" && state.settingsModal.returnTo
@@ -385,6 +447,7 @@ export const useUiStore = create<UiState>((set, get) => ({
 			projectId,
 			...(typeof options === "string" && options !== "local" ? { hostId: options } : {}),
 			...(typeof options === "object" && options?.section ? { section: options.section } : {}),
+			...(typeof options === "object" && options?.cloudOrgId !== undefined ? { cloudOrgId: options.cloudOrgId } : {}),
 		},
 	}),
 	closeSettings: () => set((state) => ({
@@ -528,6 +591,7 @@ export const useUiStore = create<UiState>((set, get) => ({
 			}
 			return { restartingProjectIds };
 		}),
+	setProjectCreationPending: (pending) => set({ projectCreationPending: pending }),
 	setProjectProvisioning: (projectId, provisioning, hostId) =>
 		set((state) => {
 			const provisioningProjectIds = new Set(state.provisioningProjectIds);

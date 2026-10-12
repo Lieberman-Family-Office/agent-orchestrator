@@ -58,9 +58,18 @@ type parkedPermission struct {
 }
 
 type parkedInput struct {
-	request ports.ChatInputRequest
-	result  chan ports.ChatInputResponse
-	ready   chan struct{}
+	mu            sync.Mutex
+	resolved      bool
+	resolving     bool
+	accepted      *ports.ChatInputResponse
+	answerIntent  *ports.ChatInputResponse
+	resolveDone   chan struct{}
+	workerYield   chan struct{}
+	workerYielded bool
+	workerEpoch   uint64
+	request       ports.ChatInputRequest
+	result        chan ports.ChatInputResponse
+	ready         chan struct{}
 }
 
 type toolState struct {
@@ -84,14 +93,20 @@ type nestedMessageState struct {
 type conversation struct {
 	conn            *acpsdk.ClientSideConnection
 	legacyWire      *legacyACPTransport
+	updateProcessed chan string
+	streamDone      chan struct{}
 	proc            *process
 	log             *slog.Logger
 	providerScopeID string
+	harness         domain.AgentHarness
 
 	mu                 sync.Mutex
 	sessionID          string
 	reportedSessionID  string
 	capabilities       ports.ChatCapabilities
+	workerSafeBoundary bool
+	humanSafeBoundary  bool
+	workerYieldEpoch   uint64
 	prepared           *preparedTurn
 	activeTurn         string
 	settlingTurn       string
@@ -99,6 +114,7 @@ type conversation struct {
 	interrupt          *interruptAttempt
 	pending            map[string]*parkedPermission
 	pendingInputs      map[string]*parkedInput
+	deferredQuestions  map[string]struct{}
 	accepted           map[string]persistentInteractionCommand
 	messages           map[string]string
 	thoughts           map[string]string
@@ -129,6 +145,7 @@ type conversation struct {
 	// credential mid-turn. Nil when the binding does not supply one.
 	onAuthRejected        func()
 	promptResponseFailure func(acpsdk.PromptResponse) error
+	hibernationCheck      func(context.Context, *acpsdk.ClientSideConnection, acpsdk.SessionId) (bool, error)
 
 	contextTokens     int64
 	contextWindow     int64
@@ -163,6 +180,7 @@ var _ ports.ChatSteerer = (*conversation)(nil)
 var _ ports.ChatInputResponder = (*conversation)(nil)
 var _ ports.ChatProviderPreserver = (*conversation)(nil)
 var _ ports.ChatProviderTerminator = (*conversation)(nil)
+var _ ports.ChatProviderHibernator = (*conversation)(nil)
 var _ ports.ChatLiveReconnector = (*conversation)(nil)
 var _ ports.ChatLiveReconnectActivator = (*conversation)(nil)
 var _ ports.ChatProviderEventAcknowledger = (*conversation)(nil)
@@ -195,10 +213,12 @@ func newConversation(
 		nestedMessages:   make(map[string]nestedMessageState),
 		tools:            make(map[string]*toolState),
 		events:           make(chan ports.ChatEvent, eventBuffer),
+		updateProcessed:  make(chan string, 1),
+		streamDone:       make(chan struct{}),
 		extensionFor:     extensionFor,
 		extensionMethods: reverseAliases,
 	}
-	legacyWire, sdkWriter, sdkReader := newLegacyACPTransport(proc.stdin, proc.stdout)
+	legacyWire, sdkWriter, sdkReader := newLegacyACPTransport(proc.stdin, proc.stdout, c.updateProcessed, c.streamDone)
 	c.legacyWire = legacyWire
 	c.conn = acpsdk.NewClientSideConnection(
 		c, sdkWriter, newExtensionMethodReader(sdkReader, extensionAliases),
@@ -330,6 +350,12 @@ func (c *conversation) Events() <-chan ports.ChatEvent { return c.events }
 // PreservesProviderOnClose reports that Close detaches only when this
 // conversation is backed by the daemon-independent host.
 func (c *conversation) PreservesProviderOnClose() bool { return c.proc.terminate != nil }
+
+func (c *conversation) ProviderRetained() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.detaching
+}
 
 // ReconnectedLive distinguishes the same initialized ACP connection from a
 // replacement process recovered with session/load or session/resume.
@@ -943,16 +969,32 @@ func (c *conversation) discard() {
 }
 
 func (c *conversation) Close() error {
-	return c.closeProvider(false)
+	return c.closeProvider(false, false)
 }
 
 // Terminate destroys the provider host. Close deliberately only detaches during
 // daemon shutdown or updater replacement.
 func (c *conversation) Terminate() error {
-	return c.closeProvider(true)
+	return c.closeProvider(true, true)
 }
 
-func (c *conversation) closeProvider(terminate bool) error {
+func (c *conversation) CanHibernate(ctx context.Context) (bool, error) {
+	if c.hibernationCheck == nil {
+		return true, nil
+	}
+	c.mu.Lock()
+	id := c.sessionID
+	c.mu.Unlock()
+	return c.hibernationCheck(ctx, c.conn, acpsdk.SessionId(id))
+}
+
+// Hibernate releases the bridge and its provider without closing the native
+// ACP session. session/close can delete the resume state on some agents.
+func (c *conversation) Hibernate() error {
+	return c.closeProvider(true, false)
+}
+
+func (c *conversation) closeProvider(terminate, closeSession bool) error {
 	var closeErr error
 	c.closeOnce.Do(func() {
 		c.mu.Lock()
@@ -963,6 +1005,7 @@ func (c *conversation) closeProvider(terminate bool) error {
 		sessionID := c.sessionID
 		c.mu.Unlock()
 		if persistent && !terminate {
+			_ = c.legacyWire.reader.Close()
 			closeErr = c.proc.stop()
 			return
 		}
@@ -971,7 +1014,7 @@ func (c *conversation) closeProvider(terminate bool) error {
 		}
 		c.failPendingPermissions()
 		c.failPendingInputs()
-		if sessionID != "" {
+		if closeSession && sessionID != "" {
 			closeCtx, cancelClose := context.WithTimeout(context.Background(), 2*time.Second)
 			_, _ = c.conn.CloseSession(closeCtx, acpsdk.CloseSessionRequest{SessionId: acpsdk.SessionId(sessionID)})
 			cancelClose()
@@ -1001,6 +1044,12 @@ func (c *conversation) AcknowledgeProviderEvent(ctx context.Context, providerEve
 
 func (c *conversation) watchConnection() {
 	<-c.conn.Done()
+	close(c.streamDone)
+	_ = c.legacyWire.reader.Close()
+	if c.proc.terminate != nil {
+		// Detach a dead SDK transport; never terminate its durable provider host.
+		_ = c.proc.stop()
+	}
 	c.mu.Lock()
 	detaching := c.detaching
 	c.mu.Unlock()
@@ -1008,7 +1057,7 @@ func (c *conversation) watchConnection() {
 		c.failPendingPermissions()
 		c.failPendingInputs()
 	}
-	c.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: ports.ChatControllerStopped})
+	c.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: ports.ChatControllerStopped, ProviderRetained: detaching})
 	c.eventMu.Lock()
 	if !c.eventsClosed {
 		c.eventsClosed = true
@@ -1127,10 +1176,12 @@ func (c *conversation) failPendingInputs() {
 	c.pendingInputs = make(map[string]*parkedInput)
 	c.mu.Unlock()
 	for _, request := range pending {
-		select {
-		case request.result <- ports.ChatInputResponse{Action: ports.ChatInputActionCancel}:
-		default:
+		request.mu.Lock()
+		if !request.resolved {
+			request.resolved = true
+			request.result <- ports.ChatInputResponse{Action: ports.ChatInputActionCancel}
 		}
+		request.mu.Unlock()
 	}
 }
 

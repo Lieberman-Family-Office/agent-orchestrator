@@ -134,8 +134,8 @@ test("queued image edits preserve attachments and the ordinary draft @T0", async
 	await expect.poll(() => edits.length).toBe(1);
 	expect(edits[0]).toEqual({
 		clientMessageId: expect.any(String),
-		// The pasted image's inline chip names its path where it was pasted.
-		text: `Inspect the screenshot ${path}\n\nAttached files (read these files in the workspace):\n- ${path}`,
+		// The inline chip includes its editor-owned typing separator; preserve it.
+		text: `Inspect the screenshot ${path} \n\nAttached files (read these files in the workspace):\n- ${path}`,
 		attachments: [{ mimeType: "image/png", data: png }],
 		retainedContent: [],
 		expectedRevision: 0,

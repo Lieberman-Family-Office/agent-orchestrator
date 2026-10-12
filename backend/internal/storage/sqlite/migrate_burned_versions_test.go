@@ -192,6 +192,15 @@ var shippedMigrations = map[int64]string{
 	// owns automatic workspace initialization.
 	188: "0188_remove_worktree_startup_cues.sql",
 	189: "0189_session_interaction.sql",
+	190: "0190_session_hibernation.sql",
+	191: "0191_session_branch_state.sql",
+	192: "0192_allow_openhands_harness.sql",
+	193: "0193_allow_codewhale_harness.sql",
+	194: "0194_allow_command_code_harness.sql",
+	// Supersedes custom 0.13.4 migration IDs 190/191 without changing their DDL.
+	// repairCustom0134MigrationHistory validates and remaps those installed identities.
+	195: "0195_project_revision.sql",
+	196: "0196_interrupt_and_send.sql",
 }
 
 // burnedVersion reports version numbers that must never be (re)used: they

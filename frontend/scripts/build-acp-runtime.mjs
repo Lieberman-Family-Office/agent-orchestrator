@@ -16,7 +16,10 @@ import {
 	createWorkDirectory,
 	npmInvocation,
 	patchClaudeContextUsage,
+	patchClaudeHibernationCheck,
+	patchClaudeQueuedStop,
 	patchClaudeRetryDetails,
+	patchClaudeWorkerSteering,
 	pruneNodeDistribution,
 	runtimeSourceFiles,
 } from "./build-acp-runtime-helpers.mjs";
@@ -84,6 +87,9 @@ const npm = npmInvocation(["ci", "--omit=dev", "--omit=optional", "--ignore-scri
 run(npm.command, npm.args, { cwd: outDir });
 patchClaudeRetryDetails(claudeAdapter);
 patchClaudeContextUsage(claudeAdapter);
+patchClaudeHibernationCheck(claudeAdapter);
+patchClaudeWorkerSteering(claudeAdapter);
+patchClaudeQueuedStop(join(outDir, "node_modules", "@anthropic-ai", "claude-agent-sdk", "sdk.mjs"));
 
 // The Claude Agent SDK declares platform-native Claude executables as optional
 // dependencies. --omit=optional excludes them; this removal is defense-in-depth.

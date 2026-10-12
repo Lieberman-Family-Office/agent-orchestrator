@@ -75,17 +75,26 @@ func (s *blockingWorkspacePublishStore) SetSessionProvisionedWorkspace(
 // before the expensive work starts, and the opening prompt is already in the
 // durable queue rather than waiting on a controller that does not exist.
 func TestSpawnAsyncChat_AnswersBeforeWorkspaceAndController(t *testing.T) {
+	testAsyncChatAnswersBeforeWorkspaceAndController(t, domain.KindWorker)
+}
+
+func testAsyncChatAnswersBeforeWorkspaceAndController(t *testing.T, kind domain.SessionKind) {
 	launcher := &recordingLauncher{}
 	m, st, rt := newChatManager(launcher)
 	m.browserCapabilities = browsersvc.NewAuthority()
 	deferred := deferredBackground(m)
 	ws := m.workspace.(*fakeWorkspace)
 
-	rec, _, _, err := m.Spawn(context.Background(), asyncChatSpawnConfig("do the thing"))
+	cfg := asyncChatSpawnConfig("do the thing")
+	cfg.Kind = kind
+	if kind == domain.KindOrchestrator {
+		cfg.RequestedMode = ""
+	}
+	rec, _, _, err := m.Spawn(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("spawn: %v", err)
 	}
-	if rec.ProvisionState != domain.SessionProvisionProvisioning {
+	if rec.Mode != domain.SessionModeChat || rec.ProvisionState != domain.SessionProvisionProvisioning {
 		t.Fatalf("provision state = %q, want provisioning", rec.ProvisionState)
 	}
 	if rec.Metadata.WorkspacePath != "" {
@@ -244,6 +253,10 @@ func TestSpawnAsyncChat_DrainFailureLeavesRetryableSession(t *testing.T) {
 }
 
 func TestResumeFailedAsyncChatSpawnRetriesSameSessionAndQueue(t *testing.T) {
+	testResumeFailedAsyncChatSpawn(t, domain.KindWorker)
+}
+
+func testResumeFailedAsyncChatSpawn(t *testing.T, kind domain.SessionKind) {
 	launcher := &recordingLauncher{}
 	m, st, _ := newChatManager(launcher)
 	m.browserCapabilities = browsersvc.NewAuthority()
@@ -252,12 +265,17 @@ func TestResumeFailedAsyncChatSpawnRetriesSameSessionAndQueue(t *testing.T) {
 	m.SetHarnessUseGate(gate)
 	ws := m.workspace.(*fakeWorkspace)
 	ws.createErr = errors.New("temporary git failure")
-	rec, _, _, err := m.Spawn(context.Background(), asyncChatSpawnConfig("do the thing"))
+	cfg := asyncChatSpawnConfig("do the thing")
+	cfg.Kind = kind
+	if kind == domain.KindOrchestrator {
+		cfg.RequestedMode = ""
+	}
+	rec, _, _, err := m.Spawn(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	(*deferred)[0]()
-	if st.sessions[rec.ID].ProvisionState != domain.SessionProvisionFailed {
+	if st.sessions[rec.ID].ProvisionState != domain.SessionProvisionFailed || st.sessions[rec.ID].IsTerminated {
 		t.Fatal("initial start did not fail")
 	}
 
@@ -403,6 +421,7 @@ func TestResumeFailedAsyncChatSpawnReusesPublishedWorkspace(t *testing.T) {
 		ID: "mer-1", ProjectID: chatTestProject, Kind: domain.KindWorker,
 		Harness: domain.HarnessCodex, Mode: domain.SessionModeChat,
 		ProvisionState: domain.SessionProvisionFailed,
+		ProvisionSteps: []domain.SessionProvisionStep{{ID: domain.SessionProvisionStepSetup, Status: domain.SessionProvisionStepDone}},
 		Metadata:       domain.SessionMetadata{Branch: "ao/mer-1/root", WorkspacePath: workspacePath},
 	}
 	ws := m.workspace.(*fakeWorkspace)
@@ -420,6 +439,43 @@ func TestResumeFailedAsyncChatSpawnReusesPublishedWorkspace(t *testing.T) {
 	}
 	if body, err := os.ReadFile(filepath.Join(workspacePath, "provision-runs")); err != nil || string(body) != "x" {
 		t.Fatalf("post-create ran again on published workspace: %q, %v", body, err)
+	}
+}
+
+func TestResumeFailedAsyncChatSpawnRerunsUnfinishedSetup(t *testing.T) {
+	for _, setupStatus := range []domain.SessionProvisionStepStatus{"", domain.SessionProvisionStepRunning} {
+		t.Run(string(setupStatus), func(t *testing.T) {
+			m, st, _ := newChatManager(&recordingLauncher{})
+			m.dataDir = t.TempDir()
+			deferred := deferredBackground(m)
+			workspace := t.TempDir()
+			project := st.projects[string(chatTestProject)]
+			project.Config.PostCreate = []string{"printf x >> provision-runs"}
+			st.projects[string(chatTestProject)] = project
+			st.sessions["mer-1"] = domain.SessionRecord{
+				ID: "mer-1", ProjectID: chatTestProject, Kind: domain.KindWorker,
+				Harness: domain.HarnessCodex, Mode: domain.SessionModeChat,
+				ProvisionState: domain.SessionProvisionFailed,
+				Metadata:       domain.SessionMetadata{Branch: "returned-branch", WorkspacePath: workspace},
+			}
+			if setupStatus != "" {
+				rec := st.sessions["mer-1"]
+				rec.ProvisionSteps = []domain.SessionProvisionStep{{ID: domain.SessionProvisionStepSetup, Status: setupStatus}}
+				st.sessions["mer-1"] = rec
+			}
+			ws := m.workspace.(*fakeWorkspace)
+			ws.createErr = errors.New("must reuse workspace")
+			if _, err := m.ResumeAgentWithMode(context.Background(), "mer-1"); err != nil {
+				t.Fatal(err)
+			}
+			(*deferred)[0]()
+			if body, err := os.ReadFile(filepath.Join(workspace, "provision-runs")); err != nil || string(body) != "x" {
+				t.Fatalf("unfinished setup skipped on retry: %q, %v", body, err)
+			}
+			if ws.createCount != 0 || st.sessions["mer-1"].ProvisionState != domain.SessionProvisionReady {
+				t.Fatalf("retry did not reuse and finish: creates=%d session=%+v", ws.createCount, st.sessions["mer-1"])
+			}
+		})
 	}
 }
 
@@ -628,6 +684,22 @@ func TestSpawnAsyncChat_FailedCleanupRetainsWorkspacePath(t *testing.T) {
 	stored := st.sessions[rec.ID]
 	if stored.ProvisionState != domain.SessionProvisionFailed || stored.Metadata.WorkspacePath != ws.path {
 		t.Fatalf("failed cleanup lost workspace: %+v", stored)
+	}
+	if !unfinishedWorkspaceSetup(stored) {
+		t.Fatal("failed hook left no incomplete setup checkpoint")
+	}
+	st.updateSessionErr = nil
+	project.Config.PostCreate = []string{"printf x >> retried-setup"}
+	st.projects[string(chatTestProject)] = project
+	if _, err := m.ResumeAgentWithMode(context.Background(), rec.ID); err != nil {
+		t.Fatal(err)
+	}
+	(*deferred)[1]()
+	if body, err := os.ReadFile(filepath.Join(ws.path, "retried-setup")); err != nil || string(body) != "x" {
+		t.Fatalf("failed setup was not rerun on retained workspace: %q, %v", body, err)
+	}
+	if ws.createCount != 1 || st.sessions[rec.ID].ProvisionState != domain.SessionProvisionReady {
+		t.Fatalf("retry did not reuse retained workspace: creates=%d record=%+v", ws.createCount, st.sessions[rec.ID])
 	}
 }
 
@@ -1045,4 +1117,30 @@ func TestSpawnAsyncChat_PreparedWorktreeChecklistSkipsFetch(t *testing.T) {
 	if got := provisionStepIDs(st.sessions[rec.ID].ProvisionSteps); !slices.Equal(got, want) {
 		t.Fatalf("steps = %q, want %q", got, want)
 	}
+}
+
+func TestSpawnOrchestratorPrefersAsyncChat(t *testing.T) {
+	testAsyncChatAnswersBeforeWorkspaceAndController(t, domain.KindOrchestrator)
+}
+
+func TestSpawnOrchestratorFallsBackToTerminalWhenChatUnsupported(t *testing.T) {
+	launcher := &recordingLauncher{preflightErr: ports.ErrChatUnsupported}
+	m, _, rt := newChatManager(launcher)
+	cfg := asyncChatSpawnConfig("")
+	cfg.Kind = domain.KindOrchestrator
+	cfg.RequestedMode = ""
+	rec, _, _, err := m.Spawn(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.Mode != domain.SessionModeTUI || rt.created != 1 {
+		t.Fatalf("mode/runtime = %s/%d", rec.Mode, rt.created)
+	}
+	if len(launcher.started) != 0 {
+		t.Fatal("unsupported Chat launched a controller")
+	}
+}
+
+func TestSpawnOrchestratorAsyncFailurePreservesSessionForRetry(t *testing.T) {
+	testResumeFailedAsyncChatSpawn(t, domain.KindOrchestrator)
 }

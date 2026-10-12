@@ -4,15 +4,21 @@ package e2e
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 )
 
 // TestFakeApprovalACP is launched by the disposable opencode shim below. It
@@ -37,6 +43,12 @@ func TestFakeApprovalACP(t *testing.T) {
 		var frame struct {
 			ID     json.RawMessage `json:"id"`
 			Method string          `json:"method"`
+			Params struct {
+				Prompt []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"prompt"`
+			} `json:"params"`
 		}
 		if json.Unmarshal(scanner.Bytes(), &frame) != nil {
 			continue
@@ -53,7 +65,17 @@ func TestFakeApprovalACP(t *testing.T) {
 			_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":{}}},"authMethods":[]}}`+"\n", frame.ID)
 		case "session/new", "session/load", "session/resume":
 			_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"fake-provider-session"}}`+"\n", frame.ID)
+		case "session/cancel":
+			_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"cancelled"}}`+"\n", promptID)
 		case "session/prompt":
+			var text strings.Builder
+			for _, block := range frame.Params.Prompt {
+				if block.Type == "text" {
+					text.WriteString(block.Text)
+				}
+			}
+			encoded, _ := json.Marshal(text.String())
+			record("prompt-text:" + string(encoded))
 			promptID = append(promptID[:0], frame.ID...)
 			record("session/request_permission")
 			_, _ = fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","id":"permission-1","method":"session/request_permission","params":{"sessionId":"fake-provider-session","toolCall":{"toolCallId":"tool-1","title":"Approve restart","kind":"edit"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"reject","name":"Reject","kind":"reject_once"}]}}`)
@@ -64,6 +86,185 @@ func TestFakeApprovalACP(t *testing.T) {
 		}
 	}
 	os.Exit(0)
+}
+
+func TestInterruptSendReachesACPAndKeepsOlderQueue(t *testing.T) {
+	binDir := t.TempDir()
+	testBinary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	shim := "#!/bin/sh\ncase \"$1\" in\n  acp) exec \"$AO_E2E_TEST_BINARY\" -test.run='^TestFakeApprovalACP$' ;;\n  auth) printf '0 credentials\\n' ;;\n  --version) printf '1.0.0\\n' ;;\n  *) exit 2 ;;\nesac\n"
+	if err := os.WriteFile(filepath.Join(binDir, "opencode"), []byte(shim), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("OPENCODE_DATA_DIR", t.TempDir())
+	t.Setenv("OPENCODE_CONFIG_CONTENT", "")
+	t.Setenv("AO_E2E_TEST_BINARY", testBinary)
+	t.Setenv("AO_E2E_FAKE_APPROVAL_ACP", "1")
+	callsPath := filepath.Join(t.TempDir(), "provider-calls.log")
+	t.Setenv("AO_E2E_ACP_CALLS", callsPath)
+	d := startDaemon(t, t.TempDir())
+	project := seedProject(t, d, "interrupt-send")
+	setPermissions(t, d, project, "default")
+	session := spawn(t, d, map[string]any{"projectId": project, "kind": "worker", "harness": "opencode", "mode": "chat", "prompt": "running"}).Session.ID
+	d.awaitConversation(session, 30*time.Second, "running approval", func(s snapshot) bool { _, ok := s.pendingApproval(); return ok })
+	send(t, d, session, "older queued", "older")
+	var accepted struct {
+		TurnID string `json:"turnId"`
+	}
+	d.mustCall("POST", "/sessions/"+session+"/conversation/messages", http.StatusAccepted,
+		map[string]any{"text": "new prompt", "clientMessageId": "interrupt-next", "interruptAndSend": true}, &accepted)
+	d.awaitConversation(session, 30*time.Second, "priority prompt without losing queue", func(s snapshot) bool {
+		states := s.userTurnStates()
+		return states["running"] == "interrupted" && states["new prompt"] == "running" && states["older queued"] == "queued"
+	})
+	before, err := os.ReadFile(callsPath)
+	if err != nil || strings.Count(string(before), "session/cancel") != 1 {
+		t.Fatalf("cancellation calls: %v\n%s", err, before)
+	}
+	d.mustCall("POST", "/sessions/"+session+"/conversation/messages", http.StatusAccepted,
+		map[string]any{"text": "new prompt", "clientMessageId": "interrupt-next", "interruptAndSend": true}, nil)
+	after, err := os.ReadFile(callsPath)
+	if err != nil || strings.Count(string(after), "session/cancel") != 1 {
+		t.Fatalf("duplicate cancelled new turn: %v\n%s", err, after)
+	}
+	ready := d.awaitConversation(session, 30*time.Second, "new prompt approval", func(s snapshot) bool { _, ok := s.pendingApproval(); return ok })
+	approval, _ := ready.pendingApproval()
+	d.mustCall("POST", "/sessions/"+session+"/conversation/approvals/"+approval.RequestID+"/resolve", http.StatusNoContent, map[string]any{"decisionId": "allow"}, nil)
+	d.awaitConversation(session, 30*time.Second, "retained older queue", func(s snapshot) bool { return s.userTurnStates()["older queued"] == "running" })
+	d.mustCall("POST", "/sessions/"+session+"/kill", http.StatusOK, nil, nil)
+}
+
+func TestOrchestratorSendsOnlyTypedTextAndKeepsReportsManual(t *testing.T) {
+	binDir := t.TempDir()
+	testBinary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	shim := "#!/bin/sh\ncase \"$1\" in\n  acp) exec \"$AO_E2E_TEST_BINARY\" -test.run='^TestFakeApprovalACP$' ;;\n  auth) printf '0 credentials\\n' ;;\n  --version) printf '1.0.0\\n' ;;\n  *) exit 2 ;;\nesac\n"
+	if err := os.WriteFile(filepath.Join(binDir, "opencode"), []byte(shim), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("OPENCODE_DATA_DIR", t.TempDir())
+	t.Setenv("OPENCODE_CONFIG_CONTENT", "")
+	t.Setenv("AO_E2E_TEST_BINARY", testBinary)
+	t.Setenv("AO_E2E_FAKE_APPROVAL_ACP", "1")
+	callsPath := filepath.Join(t.TempDir(), "provider-calls.log")
+	t.Setenv("AO_E2E_ACP_CALLS", callsPath)
+	dataDir := t.TempDir()
+	d := startDaemon(t, dataDir)
+	project := seedProject(t, d, "manual-reports")
+	setPermissions(t, d, project, "default")
+	worker := spawn(t, d, map[string]any{
+		"projectId": project, "kind": "worker", "harness": "opencode", "mode": "chat",
+		"prompt": "Worker opening prompt",
+	}).Session.ID
+	orchestrator := spawn(t, d, map[string]any{
+		"projectId": project, "kind": "orchestrator", "harness": "opencode", "mode": "chat",
+		"prompt": "Orchestrator opening prompt",
+	}).Session.ID
+	d.awaitConversation(orchestrator, 30*time.Second, "orchestrator approval", func(s snapshot) bool {
+		_, ok := s.pendingApproval()
+		return ok
+	})
+	for _, state := range []string{"checkpoint", "needs_input"} {
+		d.mustCall("POST", "/reports", http.StatusCreated, map[string]any{
+			"sessionId": worker, "state": state, "note": "Stored report " + state,
+		}, nil)
+	}
+	// Recreate one accepted report turn left queued by the prior build.
+	st, err := sqlite.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	batch, err := st.ClaimPendingReportBatch(ctx, domain.ProjectID(project), "legacy-claim", time.Now())
+	if err != nil || len(batch) != 2 || batch[0].DeliveryBatchID == "" {
+		t.Fatalf("claim legacy report: %+v, err=%v", batch, err)
+	}
+	rec, found, err := st.GetSession(ctx, domain.SessionID(orchestrator))
+	if err != nil || !found {
+		t.Fatalf("read orchestrator: found=%v err=%v", found, err)
+	}
+	conversation, err := st.ConversationForSession(ctx, rec.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := st.AppendUserMessage(ctx, conversation.ID, rec.ID, rec.Metadata.ControllerGeneration,
+		domain.ConversationMessage{ID: "legacy-report-message", Text: "Legacy automatic worker report",
+			Origin: domain.MessageOriginAutomation, ClientMessageID: batch[0].DeliveryBatchID},
+		"legacy-report-turn", time.Now())
+	if err != nil || !created {
+		t.Fatalf("seed legacy queue: created=%v err=%v", created, err)
+	}
+	if _, err := st.AcknowledgeReportBatch(ctx, domain.ProjectID(project), "legacy-claim", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	typed := "  Only my typed words\n\n  Preserve this spacing.\n\n"
+	send(t, d, orchestrator, typed, "verbatim-human")
+	// Restart only the daemon; the fake provider host survives like production ACP.
+	if err := d.cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = d.cmd.Process.Wait()
+	d.cmd = nil
+	d.waitPortFree()
+	d = startDaemon(t, dataDir)
+	d.awaitLiveController(orchestrator, 30*time.Second)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		snap := d.conversation(orchestrator)
+		var userMessages []string
+		for _, message := range snap.Messages {
+			if message.Role == "user" {
+				userMessages = append(userMessages, message.Text)
+			}
+		}
+		if len(userMessages) != 3 || userMessages[0] != "Orchestrator opening prompt" || userMessages[1] != "Legacy automatic worker report" || userMessages[2] != typed {
+			t.Fatalf("human send or automatic report delivery changed conversation: %q", userMessages)
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var reports struct {
+		Reports []struct {
+			Note string `json:"note"`
+		} `json:"reports"`
+	}
+	d.mustCall("GET", "/reports?projectId="+project, http.StatusOK, nil, &reports)
+	if len(reports.Reports) != 2 {
+		t.Fatalf("manual report retrieval returned %d reports", len(reports.Reports))
+	}
+	for index := 0; index < 2; index++ {
+		ready := d.awaitConversation(orchestrator, 30*time.Second, "approval before next turn", func(s snapshot) bool {
+			_, ok := s.pendingApproval()
+			return ok
+		})
+		approval, _ := ready.pendingApproval()
+		d.mustCall("POST", "/sessions/"+orchestrator+"/conversation/approvals/"+approval.RequestID+"/resolve",
+			http.StatusNoContent, map[string]any{"decisionId": "allow"}, nil)
+		if index == 0 {
+			d.awaitConversation(orchestrator, 30*time.Second, "typed prompt dispatch", func(s snapshot) bool {
+				states := s.userTurnStates()
+				return len(s.Turns) == 3 && states["Orchestrator opening prompt"] == "completed" && states["Legacy automatic worker report"] == "queued" && states[typed] == "running"
+			})
+		}
+	}
+	encoded, _ := json.Marshal(typed)
+	calls, err := os.ReadFile(callsPath)
+	if err != nil || strings.Count(string(calls), "prompt-text:"+string(encoded)) != 1 || strings.Contains(string(calls), "Legacy automatic worker report") {
+		t.Fatalf("provider did not receive exact typed text once: err=%v\n%s", err, calls)
+	}
+	d.mustCall("POST", "/sessions/"+orchestrator+"/kill", http.StatusOK, nil, nil)
+	d.mustCall("POST", "/sessions/"+worker+"/kill", http.StatusOK, nil, nil)
 }
 
 func TestPendingACPApprovalSurvivesDaemonSIGKILL(t *testing.T) {
@@ -151,9 +352,9 @@ func TestPendingACPApprovalSurvivesDaemonSIGKILL(t *testing.T) {
 	restarted.mustCall("POST", "/sessions/"+session+"/kill", http.StatusOK, nil, nil)
 }
 
-// An unacknowledged first task can be retried with the same clientRequestId
-// after a daemon crash during workspace setup, without duplicate workers.
-func TestFirstTaskStartupRetryAfterDaemonSIGKILL(t *testing.T) {
+// A daemon-only crash can leave the real setup shell alive. Preserve its
+// ownership and payload; neither client replay nor manual resume proves it stopped.
+func TestFirstTaskWorkspacePreservedAfterDaemonOnlySIGKILL(t *testing.T) {
 	binDir := t.TempDir()
 	testBinary, err := os.Executable()
 	if err != nil {
@@ -176,7 +377,7 @@ func TestFirstTaskStartupRetryAfterDaemonSIGKILL(t *testing.T) {
 	project := seedProject(t, d, "first-task-kill")
 	marker := filepath.Join(t.TempDir(), "provisioning")
 	release := filepath.Join(t.TempDir(), "release")
-	postCreate := fmt.Sprintf("printf ready > %q; while [ ! -e %q ]; do sleep 0.05; done", marker, release)
+	postCreate := fmt.Sprintf("printf '%%s\\n%%s\\n%%s\\n' \"$$\" \"$AO_WORKSPACE_PATH\" \"$AO_SESSION_ID\" > %q; while [ ! -e %q ]; do sleep 0.05; done; printf 'surviving-hook-wrote' > orphan-payload", marker, release)
 	d.mustCall("PUT", "/projects/"+project+"/config", http.StatusOK, map[string]any{
 		"config": map[string]any{"postCreate": []string{postCreate}},
 	}, nil)
@@ -189,65 +390,158 @@ func TestFirstTaskStartupRetryAfterDaemonSIGKILL(t *testing.T) {
 		_, _ = d.call("POST", "/sessions", req, nil)
 		close(done)
 	}()
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(marker); err == nil {
-			break
+	var owner []string
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); {
+		body, err := os.ReadFile(marker)
+		if err == nil {
+			owner = strings.Split(strings.TrimSpace(string(body)), "\n")
+			if len(owner) == 3 && owner[2] != "" {
+				break
+			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("first task never entered postCreate: %v\n%s", err, d.tailLog())
+	if len(owner) != 3 {
+		t.Fatalf("real setup never reported its PID/path/session: %v\n%s", owner, d.tailLog())
 	}
-	d.kill()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("first task HTTP request did not end after daemon kill")
-	}
-	if err := os.WriteFile(release, nil, 0o600); err != nil {
+	hookPID, err := strconv.Atoi(owner[0])
+	if err != nil {
 		t.Fatal(err)
 	}
-	restarted := startDaemon(t, dataDir)
-	var sessions struct {
-		Sessions []struct {
-			ID string `json:"id"`
-		} `json:"sessions"`
+	pgid := d.pgid
+	defer func() {
+		// Own only this test's daemon group, including the surviving shell.
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		for deadline := time.Now().Add(5 * time.Second); processAlive(hookPID); {
+			if time.Now().After(deadline) {
+				t.Errorf("test-owned hook %d remains alive", hookPID)
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+	st, err := sqlite.Open(dataDir)
+	if err != nil {
+		t.Fatal(err)
 	}
-	var retry spawned
-	status, err := restarted.call("POST", "/sessions", req, &retry)
-	if err != nil || status != http.StatusCreated || retry.Session.ID == "" {
-		t.Fatalf("first-start retry did not create a session: status=%d err=%v session=%q\n%s", status, err, retry.Session.ID, restarted.tailLog())
-	}
-	restarted.mustCall("GET", "/sessions", http.StatusOK, nil, &sessions)
-	if len(sessions.Sessions) != 1 || sessions.Sessions[0].ID != retry.Session.ID {
-		t.Fatalf("sessions after retry = %+v, want one %q", sessions.Sessions, retry.Session.ID)
-	}
-	finished := restarted.awaitConversation(retry.Session.ID, 30*time.Second, "first task after restart", func(s snapshot) bool {
-		return len(s.Turns) == 1 && terminal(s.Turns[0].State) && contains(s.assistantText(), "approved once")
-	})
-	if finished.Turns[0].State != "completed" || !contains(finished.assistantText(), "approved once") {
-		t.Fatalf("first task not completed after restart:\n%s", describe(finished))
+	defer st.Close()
+	before, ok, err := st.GetSession(context.Background(), domain.SessionID(owner[2]))
+	if err != nil || !ok || before.Metadata.WorkspacePath != owner[1] || before.ClientRequestCommitted {
+		t.Fatalf("real hook ownership not published: %+v found=%v error=%v", before, ok, err)
 	}
 	var projectResponse struct {
 		Project struct {
 			Path string `json:"path"`
 		} `json:"project"`
 	}
-	restarted.mustCall("GET", "/projects/"+project, http.StatusOK, nil, &projectResponse)
-	worktrees, err := exec.Command("git", "-C", projectResponse.Project.Path, "worktree", "list", "--porcelain").Output()
-	if err != nil {
+	d.mustCall("GET", "/projects/"+project, http.StatusOK, nil, &projectResponse)
+	assertPreserved := func(dirty bool) {
+		t.Helper()
+		current, ok, err := st.GetSession(context.Background(), before.ID)
+		if err != nil || !ok || current.Metadata.WorkspacePath != before.Metadata.WorkspacePath ||
+			current.Metadata.Branch != before.Metadata.Branch || current.IsTerminated || current.ClientRequestCommitted ||
+			current.Metadata.ControllerGeneration != "" || current.Metadata.ProviderConversationID != "" {
+			t.Fatalf("uncertain row lost ownership or launched: %+v found=%v error=%v", current, ok, err)
+		}
+		if info, err := os.Stat(owner[1]); err != nil || !info.IsDir() {
+			t.Fatalf("actual workspace disappeared: %v", err)
+		}
+		registrations, err := exec.Command("git", "-C", projectResponse.Project.Path, "worktree", "list", "--porcelain").Output()
+		if err != nil || !strings.Contains(string(registrations), "worktree "+owner[1]+"\n") ||
+			strings.Count("\n"+string(registrations), "\nworktree ") != 2 {
+			t.Fatalf("captured Git registration changed: %v\n%s", err, registrations)
+		}
+		status, err := exec.Command("git", "-C", owner[1], "status", "--porcelain", "--untracked-files=all").Output()
+		if err != nil || (!dirty && len(status) != 0) || (dirty && !strings.Contains(string(status), "orphan-payload")) {
+			t.Fatalf("independent dirty/clean oracle failed: dirty=%v status=%q error=%v", dirty, status, err)
+		}
+		if dirty {
+			body, err := os.ReadFile(filepath.Join(owner[1], "orphan-payload"))
+			if err != nil || string(body) != "surviving-hook-wrote" {
+				t.Fatalf("dirty payload lost: %q %v", body, err)
+			}
+		}
+	}
+	assertPreserved(false)
+	daemonPID := d.cmd.Process.Pid
+	if err := d.cmd.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Count("\n"+string(worktrees), "\nworktree "); got != 2 {
-		t.Fatalf("git worktree count = %d, want base repo + one worker:\n%s", got, worktrees)
+	_, _ = d.cmd.Process.Wait()
+	d.cmd = nil
+	d.waitPortFree()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first task request did not end after daemon-only SIGKILL")
+	}
+	if !processAlive(hookPID) {
+		t.Fatal("test did not retain the controlled surviving hook")
+	}
+	restarted := startDaemon(t, dataDir)
+	// Observe completion of the actual background health pass, not a timed
+	// assumption or row-disappearance proxy for physical safety.
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		log, err := os.ReadFile(restarted.logPath)
+		if err == nil && strings.Contains(string(log), "writer stop is unproven") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("background health did not report missing writer-stop evidence:\n%s", restarted.tailLog())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	assertPreserved(false)
+	refuse := func() {
+		t.Helper()
+		var response apiError
+		status, err := restarted.call("POST", "/sessions", req, &response)
+		if err != nil || status != http.StatusConflict || response.Code != "CLIENT_REQUEST_INCOMPLETE" {
+			t.Fatalf("same request replay was not refused: status=%d response=%+v error=%v", status, response, err)
+		}
+		status, err = restarted.call("POST", "/sessions/"+owner[2]+"/resume-agent", nil, &response)
+		if err != nil || status < 400 || !strings.Contains(response.Message, "writer stop is unproven") {
+			t.Fatalf("manual resume did not report missing writer-stop evidence: status=%d response=%+v error=%v", status, response, err)
+		}
+		status, err = restarted.call("POST", "/sessions/"+owner[2]+"/kill", nil, nil)
+		if err != nil || status < 400 {
+			t.Fatalf("cleanup removed a possible setup writer: status=%d error=%v", status, err)
+		}
+	}
+	refuse()
+	assertPreserved(false)
+	if !processAlive(hookPID) {
+		t.Fatal("recovery stopped the controlled hook instead of preserving it")
+	}
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		if body, _ := os.ReadFile(filepath.Join(owner[1], "orphan-payload")); string(body) == "surviving-hook-wrote" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("surviving hook could not write its captured workspace")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	refuse()
+	assertPreserved(true)
+	var sessions struct {
+		Sessions []struct {
+			ID string `json:"id"`
+		} `json:"sessions"`
+	}
+	restarted.mustCall("GET", "/sessions", http.StatusOK, nil, &sessions)
+	if len(sessions.Sessions) != 1 || sessions.Sessions[0].ID != owner[2] {
+		t.Fatalf("replay duplicated or lost the original session: %+v", sessions.Sessions)
 	}
 	calls, err := os.ReadFile(callsPath)
-	if err != nil {
+	if err != nil && !os.IsNotExist(err) {
 		t.Fatal(err)
 	}
-	if got := strings.Count(string(calls), "session/prompt"); got != 1 {
-		t.Fatalf("provider got %d prompts, want one:\n%s", got, calls)
+	if len(calls) != 0 {
+		t.Fatalf("uncertain launch started a provider: %s", calls)
 	}
-	restarted.mustCall("POST", "/sessions/"+retry.Session.ID+"/kill", http.StatusOK, nil, nil)
+	t.Logf("daemon-only SIGKILL pid=%d; preserved real hook pid=%d, row, path, registration and dirty payload; replay/resume/cleanup refused", daemonPID, hookPID)
 }

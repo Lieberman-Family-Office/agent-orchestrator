@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "goal": "Finish one fork-only pull request containing all current AO customizations. Keep AO stopped. Do not install, release, merge, or open an upstream PR.",
+  "operator_instruction_verbatim": "im going to restart my computer now. create a checkpoint with all work to resume from after the restart is complete",
+  "operator_turn": "2026-10-12T17:26:00-04:00",
+  "prior_pr_instruction_verbatim": "create pr on forked repo with all changes",
+  "measured_git": {
+    "worktree": "$HOME/dev/worktrees/ao_false_stop_20261012",
+    "branch": "rollup/ao-customizations-20261012",
+    "head_before_checkpoint": "7fee8753f8ea3e273ccf7003d1034a20e25303e2",
+    "tree": "3ceaf8d7336a14a3ab328d060509e05e7eb6c6aa",
+    "fork_main": "c7f447385f9b679781ee067573de1945426da0e7",
+    "origin_url": "https://github.com/OrchestratorInc/agent-orchestrator.git",
+    "contribution_url": "https://github.com/jlieberman2323/agent-orchestrator.git",
+    "fork_pr_exists": false,
+    "rollup_remote_ref_before_checkpoint": "absent in exact git ls-remote query",
+    "uncommitted_tracked_path": "backend/internal/adapters/chatdriver/acp/client_connection_test.go",
+    "uncommitted_change": "Preexisting formatting-only one-line collapse. Preserve it. Do not stage, discard, or reformat it. It is excluded from the PR.",
+    "checkpoint_scope": "This file records the checkpoint's parent commit. Read live HEAD after restart; the checkpoint commit follows it."
+  },
+  "integration": {
+    "method": "Native git merge-tree and commit-tree preserved branch histories without changing source files. Both merges were conflict-free.",
+    "main_customizations_head": "5bd1d1e0656d89c295098e2e5ebdd3d0e72cd194",
+    "worker_delegation_head": "bb8084ade2a6ae511ebf580ebecc0f291bfff1af",
+    "configured_daemon_cwd_head": "2938440fc66b1caa0b6a49d1e1dea2c9abcabc4c",
+    "intermediate_merge": "77e5691d30bbd3445bb7c9fc6c1f4345dfb061a4",
+    "included": [
+      "Persistent automation visibility and recovery/warning exceptions",
+      "Verbatim orchestrator prompts and manual report delivery",
+      "Single-enter steer/interrupt composer mode and durable cancellation/replay",
+      "File links and persistent unanswered questions",
+      "Claude safe-boundary worker and ordinary human guidance",
+      "Atomic Stop cancellation, local input cancellation, definite native cancellation fates, repeated-Stop seed idempotency, raw receipt validation and failed-Stop query fencing",
+      "Model-pin preservation during unrelated options; ID-or-category explicit Default resets",
+      "Bounded harness-native worker delegation in local and cloud prompts",
+      "Configured packaged daemon working-directory fix"
+    ],
+    "legacy_ports": "v0.13.3 compatibility branches remain preserved. Do not reapply old-port adaptations over the newer feature equivalents.",
+    "post_create_context": "All six custom changes on fix/post-create-session-context are patch-equivalent to work already in the rollup.",
+    "base_scope": "Fork main is older than the integrated source. The PR diff includes intervening upstream updates. Do not update fork main or conceal this broader diff.",
+    "pre_checkpoint_diff": {
+      "changed_files": 921,
+      "binary_files": 0,
+      "code_additions": 28885,
+      "code_deletions": 4571,
+      "test_additions": 33344,
+      "test_deletions": 1226,
+      "other_additions": 8115,
+      "other_deletions": 1015,
+      "instruction": "Recalculate category counts after this checkpoint commit and after any later changes."
+    }
+  },
+  "validation": {
+    "rollup_cloud_tests_and_vet": {"result": "passed", "job": "448015"},
+    "rollup_cloud_uncached_race_suite": {"result": "passed", "job": "448019"},
+    "committed_backend_whole_lint": {"result": "passed: 0 issues on clean git-archive snapshot", "job": "448023", "pinned_version": "golangci-lint v2.13.2"},
+    "working_tree_backend_whole_lint": {"result": "failed only on the preexisting uncommitted formatting edit", "job": "448020", "do_not_fix_foreign_edit": true},
+    "rollup_frontend_unit_suite": {"result": "passed: 6896 tests, 7 skipped, 424 files", "job": "448016"},
+    "rollup_frontend_typechecks": {"result": "in progress at checkpoint; no final verdict read", "job": "448016"},
+    "rollup_backend_tests_and_vet": {"result": "in progress at checkpoint; no final verdict read", "job": "448014"},
+    "rollup_backend_uncached_race_suite": {"result": "in progress at checkpoint; no final verdict read", "job": "448018"},
+    "pure_verdict_and_native_helper_checks": {"result": "started; verdict not yet read", "job": "448022"},
+    "docker_checks": {"result": "unavailable: Colima Docker socket missing; Docker/Expat/fresh-install lanes not run", "job": "448021"},
+    "other_ci_lanes": "Mobile, generated cloud client, product UI, docs and native OS build parity are not all proven on this rollup. Report exact gaps and verify in remote CI; do not mark them passed.",
+    "real9router_e2e_latest_custom_source": {"result": "passed both real daemon/SQLite/native tests at source5bd1d1e06", "job": "447988", "rollup_rerun": "not yet run"},
+    "rollup_disposable_runtime": "Prepared under system temporary storage; do not depend on it surviving restart. Rebuild using tracked patch helpers if needed.",
+    "secret_scan": {
+      "job": "448017",
+      "scope": "137 commits in actual fork-main to rollup history; 3.32 MB scanned with gitleaks8.30.1",
+      "result": "four synthetic test-fixture findings independently verified from exact historical bytes; no actual secret identified by this scan",
+      "findings": [
+        {"commit": "db87ff4ab3a5f526a37869748b32a2bdad44c417", "file": "backend/internal/cli/render_images_test.go", "lines": [186, 253], "reason": "Synthetic API_KEY=abc123 temporary image/symlink fixtures"},
+        {"commit": "07bcc95312c0f5cd737210ac7acfd93144351c78", "file": "backend/internal/adapters/agent/openhands/openhands_test.go", "lines": [36], "reason": "Native session UUID restore fixture, not a credential"},
+        {"commit": "bf5550d1520622ffaa92c9e4049bd223dafe5dc0", "file": "frontend/src/renderer/components/SwitchAgentDialog.test.tsx", "lines": [304], "reason": "Mock idempotency-1 literal, not an authentication key"}
+      ]
+    }
+  },
+  "independent_reviews": {
+    "status": "latest5bd1d1e06 re-reviews were still pending; an additional dispatch failed with API rate limit. Do not claim final approval.",
+    "accounting_reviewer": "7a4fac3c-dfc4-40f6-abb4-58b4373df966",
+    "raw_receipt_reviewer": "1287ef79-07b2-4145-83ab-da7c8dcf4d27",
+    "acceptance_reviewer": "bced4186-9c2e-41d2-8943-ec3b55308076",
+    "invalidated_prior_approval": "f07935587 scoped approval was reopened by late repeated-Stop/lifecycle-backlog/raw-receipt counterexamples.",
+    "remaining_risk": "Latest fixes reproduced prior failures and passed offline/native tests, but finish the outstanding exact-source re-reviews before describing the rollup as merge-ready."
+  },
+  "preservation": {
+    "fork": "https://github.com/jlieberman2323/agent-orchestrator",
+    "remote_branches": "14 frozen branches under preservation/20261012T200506Z; exact remote SHAs verified",
+    "local_root": "$HOME/.ao/backups/ao_preservation_20261012T200506Z",
+    "external_root": "/Volumes/T7 Shield/AO_Backups/ao_preservation_20261012T204840Z",
+    "external_archive": "/Volumes/T7 Shield/AO_Backups/ao_preservation_20261012T204840Z/ao_preservation.tar",
+    "archive_bytes": 55120281600,
+    "archive_sha256": "7507cc4725e91bee4a909b375a67de61d93fe6927b1988c773b23f9efc2d733f",
+    "archive_entries_verified": 1069308,
+    "git_refs_restored_and_verified": 449,
+    "sqlite": "Transaction-consistent snapshot, schema196, integrity/foreign-key checks passed",
+    "encryption": "Plain backup selected by operator; external drive is not encrypted",
+    "limits": "Two vanished transient session files and two mode000 generated scratch-test indexes excluded. Filesystem snapshot was per-file while AO ran, not globally simultaneous. Abandoned partial SQLite backup excluded.",
+    "private_runtime_in_public_pr": false
+  },
+  "shutdown": {
+    "verified": true,
+    "agents_exited": 18,
+    "nonterminated_sessions_preserved": 24,
+    "app_daemon_native_provider_processes_remaining": 0,
+    "port3001_closed": true,
+    "receipt": "$HOME/.ao/backups/ao_preservation_20261012T200506Z/shutdown_20261012T210521Z.json",
+    "installed_build": "4fb6bb38b, not replaced by later fixes",
+    "resume_constraint": "Do not start installed AO or restart checkpointed workers as part of creating this PR."
+  },
+  "resume_steps": [
+    "Open $HOME/dev/worktrees/ao_false_stop_20261012.",
+    "Read this checkpoint, git status, git diff, git branch -vv, and git log -5.",
+    "Verify the checkpoint commit, rollup branch, dirty-file hash and fork main from fresh Git measurements.",
+    "Read saved logs in private restart checkpoint. Treat jobs interrupted by restart as did-not-finish, not pass.",
+    "Finish backend tests/vet/race and frontend typechecks; rerun interrupted jobs. Do not weaken assertions or timeouts.",
+    "Read late independent-review results and reconcile them against latest source. Do not install.",
+    "Recalculate PR header category counts from contribution/main...HEAD using .agents/skills/pr-description/SKILL.md.",
+    "Secret-check outgoing history including this checkpoint. No credentials, runtime data, checkpoints from live workers, or private database in the public branch.",
+    "Push rollup/ao-customizations-20261012 to contribution without force. Verify live remote SHA.",
+    "Open one ready PR in jlieberman2323/agent-orchestrator, base main, head rollup/ao-customizations-20261012. Explicitly target the fork, never origin/upstream.",
+    "Describe imported upstream updates and legacy-port exclusions. Carry pending reviews and unavailable CI lanes honestly. Do not merge or release as part of this request.",
+    "Read the published PR head/body/file counts and checks. Report the linked PR and open blockers."
+  ]
+}

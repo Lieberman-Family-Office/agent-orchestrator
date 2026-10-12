@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	persistentInteractionApproval = "approval"
-	persistentInteractionInput    = "input"
+	persistentInteractionApproval         = "approval"
+	persistentInteractionInput            = "input"
+	persistentInteractionQuestionDeferred = "question_deferred"
 )
 
 type persistentInteractionCommand struct {
@@ -25,6 +26,7 @@ type persistentInteractionCommand struct {
 	ProviderPending bool                     `json:"providerPending,omitempty"`
 	Decision        *persistentDecision      `json:"decision,omitempty"`
 	Input           *ports.ChatInputResponse `json:"input,omitempty"`
+	Request         *ports.ChatInputRequest  `json:"request,omitempty"`
 }
 
 type persistentDecision struct {
@@ -88,13 +90,27 @@ func (c *conversation) HandleExtensionMethod(
 	method string,
 	params json.RawMessage,
 ) (any, error) {
+	if method == localNotificationBarrierMethod {
+		var ackID string
+		if err := json.Unmarshal(params, &ackID); err != nil {
+			return nil, err
+		}
+		select {
+		case c.updateProcessed <- ackID:
+		case <-c.streamDone:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return nil, nil
+	}
 	if method == persistenthost.ACPInteractionCommandMethod {
 		var command persistentInteractionCommand
 		if err := json.Unmarshal(params, &command); err != nil {
 			return nil, err
 		}
 		validPayload := (command.Kind == persistentInteractionApproval && command.Decision != nil && command.Decision.ID != "") ||
-			(command.Kind == persistentInteractionInput && command.Input != nil && command.Input.Action.Valid())
+			(command.Kind == persistentInteractionInput && command.Input != nil && command.Input.Action.Valid()) ||
+			(command.Kind == persistentInteractionQuestionDeferred && command.Request != nil && command.Request.PersistentQuestion())
 		if command.EventID == "" || command.RequestID == "" || !validPayload {
 			return nil, errors.New("invalid persistent ACP interaction command")
 		}
@@ -177,6 +193,38 @@ func (c *conversation) recordPersistentInteraction(
 }
 
 func (c *conversation) applyPersistentInteraction(command persistentInteractionCommand) {
+	if command.Kind == persistentInteractionQuestionDeferred {
+		c.mu.Lock()
+		if c.deferredQuestions == nil {
+			c.deferredQuestions = make(map[string]struct{})
+		}
+		c.deferredQuestions[command.RequestID] = struct{}{}
+		request := c.pendingInputs[command.RequestID]
+		if command.ProviderPending && request == nil {
+			if c.accepted == nil {
+				c.accepted = make(map[string]persistentInteractionCommand)
+			}
+			c.accepted[command.RequestID] = command
+		}
+		turnID := c.activeTurn
+		c.mu.Unlock()
+		if command.ProviderPending && request != nil {
+			request.mu.Lock()
+			if request.workerYield != nil && !request.workerYielded && !request.resolved {
+				request.workerYielded = true
+				close(request.workerYield)
+			}
+			request.mu.Unlock()
+		}
+		if command.ProviderPending {
+			return // The replayed callback emits its ordered request and deferral.
+		}
+		// Recreate the form before projecting its deferral, even if the crash
+		// preceded the first InputRequested commit. Replay must not invent an answer.
+		c.emit(ports.ChatEvent{Kind: ports.ChatEventInputRequested, ProviderEventID: command.RequestID + ":question", ProviderTurnID: turnID, RequestID: command.RequestID, Input: command.Request, Summary: command.Request.Message})
+		c.emit(ports.ChatEvent{Kind: ports.ChatEventInputResolved, ProviderEventID: command.EventID, RequestID: command.RequestID})
+		return
+	}
 	if command.ProviderPending {
 		c.mu.Lock()
 		switch command.Kind {
@@ -206,9 +254,17 @@ func (c *conversation) applyPersistentInteraction(command persistentInteractionC
 				c.mu.Unlock()
 				return
 			}
-			delete(c.pendingInputs, command.RequestID)
 			c.mu.Unlock()
 			<-request.ready
+			request.mu.Lock()
+			if request.resolved {
+				request.mu.Unlock()
+				return
+			}
+			request.resolved = true
+			request.accepted = command.Input
+			request.mu.Unlock()
+			c.discardInput(command.RequestID)
 			c.emit(persistentInteractionEvent(command))
 			request.result <- *command.Input
 			return

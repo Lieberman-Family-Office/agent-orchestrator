@@ -364,24 +364,26 @@ type ConversationSteerDelivery struct {
 }
 
 type ConversationTurn struct {
-	ID                   string
-	ConversationID       string
-	HandledBySessionID   domain.SessionID
-	ProviderTurnID       string
-	ControllerGeneration string
-	State                domain.TurnState
-	ErrorMessage         string
-	RequestedAt          time.Time
-	StartedAt            sql.NullTime
-	CompletedAt          sql.NullTime
-	DiffJson             string
-	RolledBackAt         sql.NullTime
-	PlanJson             string
-	BranchID             string
-	PromotionStartedAt   sql.NullTime
-	PromotedToTurnID     sql.NullString
-	RetryOfTurnID        sql.NullString
-	HandledByReviewID    sql.NullString
+	ID                            string
+	ConversationID                string
+	HandledBySessionID            domain.SessionID
+	ProviderTurnID                string
+	ControllerGeneration          string
+	State                         domain.TurnState
+	ErrorMessage                  string
+	RequestedAt                   time.Time
+	StartedAt                     sql.NullTime
+	CompletedAt                   sql.NullTime
+	DiffJson                      string
+	RolledBackAt                  sql.NullTime
+	PlanJson                      string
+	BranchID                      string
+	PromotionStartedAt            sql.NullTime
+	PromotedToTurnID              sql.NullString
+	RetryOfTurnID                 sql.NullString
+	HandledByReviewID             sql.NullString
+	InterruptTargetProviderTurnID string
+	InterruptDelivered            bool
 }
 
 type Cue struct {
@@ -546,6 +548,7 @@ type Project struct {
 	ArchivedAt    sql.NullTime
 	Config        sql.NullString
 	Kind          string
+	Revision      int64
 }
 
 type Report struct {
@@ -687,6 +690,8 @@ type Session struct {
 	ArtifactDir                      string
 	SessionOutputType                string
 	LatestInteractionAt              sql.NullTime
+	HibernatedAt                     sql.NullTime
+	BranchState                      string
 }
 
 type SessionCleanupFact struct {

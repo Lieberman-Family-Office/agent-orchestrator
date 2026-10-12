@@ -266,8 +266,19 @@ func TestACPReplayLoadLargeHistoryThroughSDK(t *testing.T) {
 	agentR, agentW := io.Pipe()
 	agent := &fakeAgent{loadUpdates: updates}
 	agent.conn = acpsdk.NewAgentSideConnection(agent, agentW, clientR)
-	conv.conn = acpsdk.NewClientSideConnection(conv, clientW, agentR)
-	t.Cleanup(func() { _ = clientR.Close(); _ = clientW.Close(); _ = agentR.Close(); _ = agentW.Close() })
+	conv.updateProcessed = make(chan string, 1)
+	conv.streamDone = make(chan struct{})
+	transport, sdkWriter, sdkReader := newLegacyACPTransport(clientW, agentR, conv.updateProcessed, conv.streamDone)
+	conv.legacyWire = transport
+	conv.conn = acpsdk.NewClientSideConnection(conv, sdkWriter, sdkReader)
+	t.Cleanup(func() {
+		close(conv.streamDone)
+		_ = clientR.Close()
+		_ = clientW.Close()
+		_ = agentR.Close()
+		_ = agentW.Close()
+		_ = transport.reader.Close()
+	})
 	loader := newRefreshableConversation(conv, acpsdk.LoadSessionRequest{SessionId: "session-1", Cwd: t.TempDir(), McpServers: []acpsdk.McpServer{}})
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()

@@ -10,7 +10,7 @@ import (
 )
 
 // clientPayloadHash binds a client message ID to the request as received,
-// before AO may append worker reports or edit a queued message.
+// before any explicit queued-message edit.
 func clientPayloadHash(msg ports.ChatUserMessage) (string, error) {
 	if msg.ClientMessageID == "" {
 		return "", nil
@@ -20,13 +20,15 @@ func clientPayloadHash(msg ports.ChatUserMessage) (string, error) {
 		content = nil
 	}
 	payload, err := json.Marshal(struct {
-		Text            string
-		Content         []ports.ChatContent
-		Origin          domain.MessageOrigin
-		SenderSessionID string `json:",omitempty"`
-		AuthoredByUser  bool
-		Settings        ports.ChatTurnSettings
-	}{msg.Text, content, normalizeOrigin(msg.Origin), msg.SenderSessionID, msg.AuthoredByUser, msg.Settings})
+		Excerpts         []ports.ChatExcerptReference `json:",omitempty"`
+		Text             string
+		Content          []ports.ChatContent
+		Origin           domain.MessageOrigin
+		SenderSessionID  string `json:",omitempty"`
+		AuthoredByUser   bool
+		Settings         ports.ChatTurnSettings
+		InterruptAndSend bool `json:",omitempty"`
+	}{msg.Excerpts, msg.Text, content, normalizeOrigin(msg.Origin), msg.SenderSessionID, msg.AuthoredByUser, msg.Settings, msg.InterruptAndSend})
 	if err != nil {
 		return "", fmt.Errorf("encode client message payload: %w", err)
 	}

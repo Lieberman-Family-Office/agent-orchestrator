@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -18,6 +19,41 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	chatsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/chat"
 )
+
+func TestConversationSendCarriesInterruptAndSendMode(t *testing.T) {
+	service := &fakeConversationService{}
+	server := conversationTestServer(t, service)
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/sessions/session-1/conversation/messages", bytes.NewBufferString(`{"text":"  exact text\n\n","clientMessageId":"interrupt-one","interruptAndSend":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusAccepted || !service.sent.InterruptAndSend || service.sent.Text != "  exact text\n\n" {
+		t.Fatalf("send mode was lost: status=%d message=%+v", response.StatusCode, service.sent)
+	}
+}
+
+func TestAcceptedInterruptSendDoesNotExposePreIntakeRejection(t *testing.T) {
+	service := &fakeConversationService{sendErr: errors.Join(chatsvc.ErrInterruptSendUncertain, chatsvc.ErrControllerHandoff)}
+	server := conversationTestServer(t, service)
+	response, err := server.Client().Post(server.URL+"/api/v1/sessions/session-1/conversation/messages", "application/json", bytes.NewBufferString(`{"text":"accepted prompt","clientMessageId":"accepted-interrupt","interruptAndSend":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusConflict || !bytes.Contains(body, []byte("CHAT_INTERRUPT_SEND_UNCERTAIN")) || bytes.Contains(body, []byte("CHAT_INTERFACE_TRANSITION")) {
+		t.Fatalf("accepted prompt reported unaccepted: status=%d body=%s", response.StatusCode, body)
+	}
+}
 
 func conversationTestServer(t *testing.T, service *fakeConversationService) *httptest.Server {
 	t.Helper()
@@ -35,6 +71,10 @@ func conversationTestServer(t *testing.T, service *fakeConversationService) *htt
 // JSON a client actually parses is what is checked.
 
 type fakeConversationService struct {
+	viewID            string
+	viewActive        bool
+	viewSessionID     domain.SessionID
+	viewCalls         int
 	snapshot          chatsvc.Snapshot
 	sendErr           error
 	skills            []ports.ChatSkill
@@ -58,6 +98,53 @@ type fakeConversationService struct {
 	reviewOwner       domain.ConversationOwner
 	reviewRequestID   string
 	reviewInterrupted bool
+}
+
+func (f *fakeConversationService) SetChatView(_ context.Context, sessionID domain.SessionID, viewID string, active bool) error {
+	f.viewSessionID = sessionID
+	f.viewID = viewID
+	f.viewActive = active
+	f.viewCalls++
+	return nil
+}
+
+func TestChatViewRouteValidatesAndForwardsLease(t *testing.T) {
+	service := &fakeConversationService{}
+	server := conversationTestServer(t, service)
+	for _, tc := range []struct {
+		body       string
+		status     int
+		code       string
+		wantActive bool
+	}{
+		{body: `{"viewId":"","active":true}`, status: http.StatusBadRequest},
+		{body: `{"viewId":"viewer-1"}`, status: http.StatusBadRequest, code: "CHAT_VIEW_ACTIVE_INVALID"},
+		{body: `{"viewId":"viewer-1","active":null}`, status: http.StatusBadRequest, code: "CHAT_VIEW_ACTIVE_INVALID"},
+		{body: `{"viewId":"viewer-1","active":true}`, status: http.StatusNoContent, wantActive: true},
+		{body: `{"viewId":"viewer-1","active":false}`, status: http.StatusNoContent},
+	} {
+		resp, err := http.Post(server.URL+"/api/v1/sessions/p1-1/chat-view", "application/json", bytes.NewBufferString(tc.body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != tc.status {
+			t.Fatalf("POST %s status = %d, want %d", tc.body, resp.StatusCode, tc.status)
+		}
+		if tc.code != "" && !bytes.Contains(body, []byte(`"code":"`+tc.code+`"`)) {
+			t.Fatalf("POST %s body = %s, want code %s", tc.body, body, tc.code)
+		}
+		if tc.status == http.StatusNoContent && service.viewActive != tc.wantActive {
+			t.Fatalf("POST %s active = %v, want %v", tc.body, service.viewActive, tc.wantActive)
+		}
+	}
+	if service.viewCalls != 2 || service.viewSessionID != "p1-1" || service.viewID != "viewer-1" || service.viewActive {
+		t.Fatalf("forwarded view = %+v", service)
+	}
 }
 
 func (f *fakeConversationService) EditMessage(context.Context, domain.SessionID, string, ports.ChatUserMessage) (chatsvc.EditMessageResult, error) {
@@ -198,6 +285,26 @@ func conversationSnapshotBody(t *testing.T, snapshot chatsvc.Snapshot) map[strin
 		t.Fatalf("decode: %v", err)
 	}
 	return decoded
+}
+
+func TestConversationSnapshotCarriesTheSendersClientMessageID(t *testing.T) {
+	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
+	body := conversationSnapshotBody(t, chatsvc.Snapshot{
+		Conversation: domain.ConversationRecord{ID: "conversation-1"},
+		SessionID:    domain.SessionID("p1-1"),
+		Messages: []domain.ConversationMessage{
+			{ID: "sent", TurnID: "t1", Sequence: 1, Role: domain.MessageRoleUser, Origin: domain.MessageOriginHuman, Text: "hi", ClientMessageID: "client-key-1", CreatedAt: now},
+			{ID: "reply", TurnID: "t1", Sequence: 2, Role: domain.MessageRoleAssistant, Origin: domain.MessageOriginProvider, Text: "hello", CreatedAt: now},
+		},
+	})
+
+	messages := body["messages"].([]any)
+	if got := messages[0].(map[string]any)["clientMessageId"]; got != "client-key-1" {
+		t.Fatalf("user message clientMessageId = %#v, want client-key-1: the renderer matches its optimistic echo on it", got)
+	}
+	if _, exists := messages[1].(map[string]any)["clientMessageId"]; exists {
+		t.Fatalf("a message with no sender key must omit clientMessageId, got %#v", messages[1])
+	}
 }
 
 func TestConversationSnapshotExposesSafeEditContentAndBranchMetadata(t *testing.T) {

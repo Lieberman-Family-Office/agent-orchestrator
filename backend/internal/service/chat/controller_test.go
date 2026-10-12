@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/attachmentstore"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
@@ -77,6 +78,10 @@ func fullSnapshotReader(st *sqlite.Store) chatsvc.SnapshotReader {
 /* ---- a fake conversation the controller can drive ---------------------- */
 
 type fakeConversation struct {
+	// noNetwork makes SandboxAllowsNetwork report a sandbox with no network.
+	noNetwork bool
+	// networkMode, when set, is the one approval mode whose sandbox has network.
+	networkMode            ports.PermissionMode
 	events                 chan ports.ChatEvent
 	providerConversationID string
 
@@ -236,6 +241,24 @@ func (c *terminatingConversation) Terminate() error {
 
 func (c *terminatingConversation) PreservesProviderOnClose() bool { return true }
 
+type recoveryDetachedConversation struct {
+	*terminatingConversation
+	retained atomic.Bool
+}
+
+func (c *recoveryDetachedConversation) ProviderRetained() bool { return c.retained.Load() }
+
+type recoveryStopConversation struct {
+	*recoveryDetachedConversation
+}
+
+func (c *recoveryStopConversation) Terminate() error {
+	// Recovery already consumed the adapter's closeOnce. Terminate cannot
+	// destroy its retained host, even though closing the stream completes.
+	c.retained.Store(true)
+	return c.Close()
+}
+
 type liveReconnectedConversation struct{ *nativeHistoryConversation }
 
 func (c *liveReconnectedConversation) ReconnectedLive() bool { return true }
@@ -255,6 +278,15 @@ func newFakeConversation() *fakeConversation {
 }
 
 func (f *fakeConversation) ProviderConversationID() string { return f.providerConversationID }
+
+// SandboxAllowsNetwork is the agent sandbox's network, as Codex reports it;
+// noNetwork plays a Codex thread in accept-edits or auto.
+func (f *fakeConversation) SandboxAllowsNetwork(mode ports.PermissionMode) bool {
+	if f.networkMode != "" {
+		return mode == f.networkMode
+	}
+	return !f.noNetwork
+}
 func (f *fakeConversation) Capabilities() ports.ChatCapabilities {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -3099,12 +3131,18 @@ func TestFreshProjectControllerStartFailureKeepsPreviousHistoryHidden(t *testing
 /* ---- harness ----------------------------------------------------------- */
 
 type harness struct {
-	svc       *chatsvc.Service
-	st        *sqlite.Store
-	conv      *fakeConversation
-	ctrl      *chatsvc.Controller
-	activity  *recordingActivity
-	hostStops atomic.Int32
+	svc        *chatsvc.Service
+	st         *sqlite.Store
+	conv       *fakeConversation
+	ctrl       *chatsvc.Controller
+	activity   *recordingActivity
+	hostStops  atomic.Int32
+	renders    *attachmentstore.Store
+	rendersDir string
+	// reconciled lists the sessions whose output type a save asked to update;
+	// reconcileErr is what that update returns.
+	reconciled   []domain.SessionID
+	reconcileErr error
 
 	clockMu sync.Mutex
 	clock   time.Time
@@ -3171,6 +3209,8 @@ func newHarnessWithConversationAndStoreForHarness(
 		activity: &recordingActivity{},
 		clock:    time.Date(2026, 8, 2, 10, 0, 0, 0, time.UTC),
 	}
+	h.rendersDir = t.TempDir()
+	h.renders = attachmentstore.New(h.rendersDir)
 
 	// Guarded because the id factory is called from both the projection goroutine and
 	// whichever goroutine a test drives commands from, and an unsynchronized counter
@@ -3196,7 +3236,13 @@ func newHarnessWithConversationAndStoreForHarness(
 			counter++
 			return fmt.Sprintf("id-%03d", counter)
 		},
-		Now: h.now,
+		Now:     h.now,
+		Renders: h.renders,
+		DataDir: h.rendersDir,
+		ReconcileOutputType: func(_ context.Context, id domain.SessionID) error {
+			h.reconciled = append(h.reconciled, id)
+			return h.reconcileErr
+		},
 	})
 
 	ctrl, err := svc.Start(context.Background(), chatsvc.StartConfig{
@@ -3264,6 +3310,67 @@ func TestStaleControllerEventsDoNotReachTheTimeline(t *testing.T) {
 }
 
 /* ---- tests ------------------------------------------------------------- */
+
+func TestSendVerifiesExcerptAndFallsBackToTextForProvider(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	seed, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+		Text: "seed", ClientMessageID: "excerpt-seed", Origin: domain.MessageOriginHuman,
+	})
+	if err != nil {
+		t.Fatalf("send seed: %v", err)
+	}
+	h.conv.emit(
+		ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: seed.ProviderTurnID},
+		ports.ChatEvent{Kind: ports.ChatEventMessageDelta, ProviderTurnID: seed.ProviderTurnID,
+			ProviderItemID: "excerpt-source", Delta: "Keep this exact sentence."},
+		ports.ChatEvent{Kind: ports.ChatEventMessageCompleted, ProviderTurnID: seed.ProviderTurnID,
+			ProviderItemID: "excerpt-source", Text: "Keep this exact sentence."},
+		ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: seed.ProviderTurnID,
+			TurnState: domain.TurnStateCompleted},
+	)
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Messages) == 2 && len(s.Turns) == 1 && s.Turns[0].State == domain.TurnStateCompleted
+	})
+	source := snapshot.Messages[1]
+
+	_, err = h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+		Text: "Use it", ClientMessageID: "excerpt-followup", Origin: domain.MessageOriginHuman,
+		Excerpts: []ports.ChatExcerptReference{{
+			ConversationID: h.ctrl.ConversationID(), MessageID: source.ID,
+			Revision: source.Revision, Text: "exact sentence",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("send with excerpt: %v", err)
+	}
+	sent := h.conv.sentMessages()
+	if len(sent) != 2 || !strings.Contains(sent[1].Text, "Referenced chat excerpt") ||
+		!strings.Contains(sent[1].Text, "exact sentence") || len(sent[1].Content) != 0 {
+		t.Fatalf("provider delivery = %#v", sent)
+	}
+	duplicate, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+		Text: "Use it", ClientMessageID: "excerpt-followup", Origin: domain.MessageOriginHuman,
+		Excerpts: []ports.ChatExcerptReference{{
+			ConversationID: h.ctrl.ConversationID(), MessageID: source.ID,
+			Revision: source.Revision + 1, Text: "no longer relevant to the accepted retry",
+		}},
+	})
+	if err != nil || duplicate.ID != "" {
+		t.Fatalf("idempotent excerpt retry = (%+v, %v), want duplicate success", duplicate, err)
+	}
+
+	_, err = h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+		Text: "stale", Origin: domain.MessageOriginHuman,
+		Excerpts: []ports.ChatExcerptReference{{
+			ConversationID: h.ctrl.ConversationID(), MessageID: source.ID,
+			Revision: source.Revision + 1, Text: "exact sentence",
+		}},
+	})
+	if !errors.Is(err, chatsvc.ErrExcerptStale) {
+		t.Fatalf("stale excerpt error = %v, want ErrExcerptStale", err)
+	}
+}
 
 func TestProviderPromptFailureSettlesTurnAndRecordsRecoveryOnce(t *testing.T) {
 	h := newHarness(t)
@@ -3671,6 +3778,305 @@ func TestApprovalIsStoredPendingWithProviderDecisions(t *testing.T) {
 	}
 	if !hasActivitySignal(h.activity.snapshot(), domain.ActivityActive, "chat.approval.resolved") {
 		t.Fatalf("activity signals = %v, want active after approval resolve", h.activity.snapshot())
+	}
+}
+
+type cancelledQuestionProvider struct {
+	*steerRecorder
+	deferred bool
+}
+
+func (p *cancelledQuestionProvider) ResolveInput(context.Context, string, ports.ChatInputResponse) error {
+	if p.deferred {
+		return ports.ErrChatQuestionDeferred
+	}
+	return ports.ErrChatRequestNotPending
+}
+
+type resolvingQuestionProvider struct {
+	*steerRecorder
+	answers atomic.Int32
+}
+
+func (p *resolvingQuestionProvider) ResolveInput(context.Context, string, ports.ChatInputResponse) error {
+	p.answers.Add(1)
+	return nil
+}
+
+func TestQuestionResolutionRefusesStaleOwnerAndHandoff(t *testing.T) {
+	for _, boundary := range []string{"generation", "handoff"} {
+		t.Run(boundary, func(t *testing.T) {
+			provider := &resolvingQuestionProvider{steerRecorder: newSteerRecorder()}
+			h := newHarnessWithConversationAndStoreForHarness(t, provider, func(st *sqlite.Store) chatsvc.Store { return st }, domain.HarnessClaudeCode)
+			ctx := context.Background()
+			schema := map[string]any{"type": "object", "properties": map[string]any{
+				"question_0":        map[string]any{"type": "string", "oneOf": []any{map[string]any{"const": "native"}}},
+				"question_0_custom": map[string]any{"type": "string", "_meta": map[string]any{"_askUserQuestionCustomAnswer": map[string]any{"isCustomAnswer": true, "questionId": "question_0"}}},
+			}}
+			provider.emit(ports.ChatEvent{Kind: ports.ChatEventInputRequested, RequestID: "boundary-question", Input: &ports.ChatInputRequest{Mode: ports.ChatInputModeForm, Message: "Choice?", Schema: schema}})
+			h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Activities) == 1 })
+			if boundary == "generation" {
+				if err := h.st.ClaimChatControllerGeneration(ctx, testSession, "replacement"); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := h.ctrl.ArmHandoff(ctx, domain.SessionInterfaceTransitionDrain); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := h.ctrl.ResolveInput(ctx, "boundary-question", ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"question_0": "native"}}); err == nil {
+				t.Fatal("answer crossed owner transition")
+			}
+			if provider.answers.Load() != 0 {
+				t.Fatal("stale provider received human answer")
+			}
+			activity, err := h.st.ConversationInput(ctx, h.ctrl.ConversationID(), "boundary-question")
+			if err != nil || activity.Status != domain.ActivityStatusPending {
+				t.Fatalf("transition resolved unanswered question: %+v %v", activity, err)
+			}
+		})
+	}
+}
+
+type validatingQuestionProvider struct{ *steerRecorder }
+
+func (p *validatingQuestionProvider) ResolveInput(_ context.Context, _ string, response ports.ChatInputResponse) error {
+	if response.Content["choice"] != "valid" {
+		return ports.ErrChatDecisionNotOffered
+	}
+	return nil
+}
+
+func TestRejectedOrdinaryInputCanBeCorrected(t *testing.T) {
+	provider := &validatingQuestionProvider{newSteerRecorder()}
+	h := newHarnessWithConversationAndStoreForHarness(t, provider, func(st *sqlite.Store) chatsvc.Store { return st }, domain.HarnessClaudeCode)
+	ctx := context.Background()
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventInputRequested, RequestID: "ordinary", Input: &ports.ChatInputRequest{Mode: ports.ChatInputModeForm, Schema: map[string]any{"type": "object", "properties": map[string]any{"choice": map[string]any{"type": "string"}}}}})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Activities) == 1 })
+	if err := h.ctrl.ResolveInput(ctx, "ordinary", ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"choice": "invalid"}}); !errors.Is(err, ports.ErrChatDecisionNotOffered) {
+		t.Fatalf("invalid response error=%v", err)
+	}
+	if err := h.ctrl.ResolveInput(ctx, "ordinary", ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"choice": "valid"}}); err != nil {
+		t.Fatalf("corrected answer refused: %v", err)
+	}
+}
+
+type deferredQuestionProvider struct{ *cancelledQuestionProvider }
+
+func (p *deferredQuestionProvider) StartDeferredTurn(string) error { return nil }
+func (p *deferredQuestionProvider) DiscardDeferredTurn(string)     {}
+
+func TestDeferredQuestionAnswerWaitsForCompletion(t *testing.T) {
+	provider := &deferredQuestionProvider{&cancelledQuestionProvider{steerRecorder: newSteerRecorder()}}
+	h := newHarnessWithConversationAndStoreForHarness(t, provider, func(st *sqlite.Store) chatsvc.Store { return st }, domain.HarnessClaudeCode)
+	ctx := context.Background()
+	schema := map[string]any{"type": "object", "properties": map[string]any{
+		"question_0":        map[string]any{"type": "string", "oneOf": []any{map[string]any{"const": "native"}}},
+		"question_0_custom": map[string]any{"type": "string", "_meta": map[string]any{"_askUserQuestionCustomAnswer": map[string]any{"isCustomAnswer": true, "questionId": "question_0"}}},
+	}}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventInputRequested, RequestID: "deferred-question", Input: &ports.ChatInputRequest{Mode: ports.ChatInputModeForm, Schema: schema}})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Activities) == 1 })
+	if _, err := h.st.DetachQuestion(ctx, h.ctrl.ConversationID(), "deferred-question", h.now()); err != nil {
+		t.Fatal(err)
+	}
+	answer := ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"question_0": "native"}}
+	if err := h.ctrl.ResolveInput(ctx, "deferred-question", answer); !errors.Is(err, chatsvc.ErrSteerDeliveryUncertain) {
+		t.Fatalf("deferred launch claimed acceptance: %v", err)
+	}
+	message, found, err := h.st.ConversationMessageByClientID(ctx, h.ctrl.ConversationID(), "question-answer/deferred-question")
+	if err != nil || !found {
+		t.Fatalf("missing durable answer: %v", err)
+	}
+	turn, err := h.st.TurnByID(ctx, message.TurnID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: turn.ProviderTurnID, TurnState: domain.TurnStateCompleted})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Turns) == 1 && s.Turns[0].State == domain.TurnStateCompleted
+	})
+	if err := h.ctrl.ResolveInput(ctx, "deferred-question", answer); err != nil {
+		t.Fatalf("completed answer recovery: %v", err)
+	}
+	if len(provider.sentMessages()) != 1 {
+		t.Fatal("answer delivered twice")
+	}
+}
+
+func TestFailedDelayedAnswerRetryDoesNotResolveQuestion(t *testing.T) {
+	provider := &cancelledQuestionProvider{steerRecorder: newSteerRecorder()}
+	h := newHarnessWithConversationAndStoreForHarness(t, provider, func(st *sqlite.Store) chatsvc.Store { return st }, domain.HarnessClaudeCode)
+	ctx := context.Background()
+	schema := map[string]any{"type": "object", "properties": map[string]any{
+		"question_0":        map[string]any{"type": "string", "oneOf": []any{map[string]any{"const": "native"}}},
+		"question_0_custom": map[string]any{"type": "string", "_meta": map[string]any{"_askUserQuestionCustomAnswer": map[string]any{"isCustomAnswer": true, "questionId": "question_0"}}},
+	}}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventInputRequested, RequestID: "failed-question", Input: &ports.ChatInputRequest{Mode: ports.ChatInputModeForm, Message: "Which approach?", Schema: schema}})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Activities) == 1 })
+	if _, err := h.st.DetachQuestion(ctx, h.ctrl.ConversationID(), "failed-question", h.now()); err != nil {
+		t.Fatal(err)
+	}
+	provider.fakeConversation.mu.Lock()
+	provider.sendErr = errors.New("provider dispatch refused")
+	provider.fakeConversation.mu.Unlock()
+	answer := ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"question_0": "native"}}
+	for range 2 {
+		if err := h.ctrl.ResolveInput(ctx, "failed-question", answer); err == nil {
+			t.Fatal("failed delayed answer was acknowledged as delivered")
+		}
+		activity, err := h.st.ConversationInput(ctx, h.ctrl.ConversationID(), "failed-question")
+		if err != nil || activity.Status != domain.ActivityStatusPending {
+			t.Fatalf("failed delivery resolved the question: activity=%+v error=%v", activity, err)
+		}
+	}
+}
+
+func TestQuestionDeferralReplayDoesNotReattachCommittedQuestion(t *testing.T) {
+	provider := &cancelledQuestionProvider{steerRecorder: newSteerRecorder(), deferred: true}
+	h := newHarnessWithConversationAndStoreForHarness(t, provider, func(st *sqlite.Store) chatsvc.Store { return st }, domain.HarnessClaudeCode)
+	turn, err := h.ctrl.Send(context.Background(), ports.ChatUserMessage{Text: "work", ClientMessageID: "replay-work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: turn.ProviderTurnID})
+	schema := map[string]any{"type": "object", "properties": map[string]any{
+		"question_0":        map[string]any{"type": "string", "oneOf": []any{map[string]any{"const": "Blue"}}},
+		"question_0_custom": map[string]any{"type": "string", "_meta": map[string]any{"_askUserQuestionCustomAnswer": map[string]any{"isCustomAnswer": true, "questionId": "question_0"}}},
+	}}
+	requested := ports.ChatEvent{Kind: ports.ChatEventInputRequested, ProviderEventID: "question:question", RequestID: "question", Input: &ports.ChatInputRequest{Mode: ports.ChatInputModeForm, Schema: schema}}
+	deferred := ports.ChatEvent{Kind: ports.ChatEventInputResolved, ProviderEventID: "host-deferral", RequestID: "question"}
+	provider.emit(requested, deferred)
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Activities) == 1 && strings.Contains(string(s.Activities[0].Detail), `"providerPending":false`)
+	})
+	provider.emit(requested, deferred, ports.ChatEvent{Kind: ports.ChatEventActivityStarted, ProviderItemID: "replay-fence", ActivityKind: domain.ActivityKindSystem, ActivityStatus: domain.ActivityStatusCompleted, Summary: "replay finished"})
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Activities) == 2 })
+	for _, a := range snapshot.Activities {
+		if a.RequestID == "question" && (!strings.Contains(string(a.Detail), `"providerPending":false`) || a.Status != domain.ActivityStatusPending) {
+			t.Fatalf("replay reattached or resolved retained form: %+v", a)
+		}
+	}
+	if err := h.ctrl.ResolveInput(context.Background(), "question", ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"question_0": "Blue"}}); err != nil {
+		t.Fatalf("replayed question cannot accept its delayed answer: %v", err)
+	}
+	if len(provider.steers()) != 1 {
+		t.Fatalf("delayed answer delivered %d times", len(provider.steers()))
+	}
+}
+
+func TestSubagentQuestionCannotResolveThroughParentFallback(t *testing.T) {
+	provider := &cancelledQuestionProvider{steerRecorder: newSteerRecorder(), deferred: true}
+	h := newHarnessWithConversationAndStoreForHarness(t, provider, func(st *sqlite.Store) chatsvc.Store { return st }, domain.HarnessClaudeCode)
+	ctx := context.Background()
+	schema := map[string]any{"type": "object", "properties": map[string]any{
+		"question_0":        map[string]any{"type": "string", "oneOf": []any{map[string]any{"const": "Blue"}}},
+		"question_0_custom": map[string]any{"type": "string", "_meta": map[string]any{"_askUserQuestionCustomAnswer": map[string]any{"isCustomAnswer": true, "questionId": "question_0"}}},
+	}}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventInputRequested, RequestID: "sub-question", Input: &ports.ChatInputRequest{Mode: ports.ChatInputModeForm, Schema: schema, QuestionAgentID: "subagent-7", QuestionParentToolUseID: "task-7"}})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Activities) == 1 })
+	if err := h.ctrl.ResolveInput(ctx, "sub-question", ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"question_0": "Blue"}}); !errors.Is(err, ports.ErrChatRequestNotPending) {
+		t.Fatalf("lost subagent callback must not claim parent delivery: %v", err)
+	}
+	if len(provider.steers()) != 0 {
+		t.Fatal("subagent answer was steered into the parent")
+	}
+	activity, err := h.st.ConversationInput(ctx, h.ctrl.ConversationID(), "sub-question")
+	if err != nil || activity.Status == domain.ActivityStatusResolved {
+		t.Fatalf("undelivered subagent answer marked resolved: %+v %v", activity, err)
+	}
+}
+
+func TestQuestionSurvivesBackgroundCancellationAndAnswerIsDeliveredOnce(t *testing.T) {
+	for _, scenario := range []struct{ rejected, detachFirst bool }{{false, true}, {true, true}, {false, false}} {
+		rejected := scenario.rejected
+		t.Run(fmt.Sprint(scenario), func(t *testing.T) {
+			provider := &cancelledQuestionProvider{steerRecorder: newSteerRecorder(), deferred: !scenario.detachFirst}
+			h := newHarnessWithConversationAndStoreForHarness(t, provider, func(st *sqlite.Store) chatsvc.Store { return st }, domain.HarnessClaudeCode)
+			ctx := context.Background()
+			turn, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "work", ClientMessageID: "question-work"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: turn.ProviderTurnID})
+			schema := map[string]any{"type": "object", "properties": map[string]any{
+				"question_0":        map[string]any{"type": "string", "title": "Choice", "description": "Which approach?", "oneOf": []any{map[string]any{"const": "native", "title": "Native"}}},
+				"question_0_custom": map[string]any{"type": "string", "_meta": map[string]any{"_askUserQuestionCustomAnswer": map[string]any{"isCustomAnswer": true, "questionId": "question_0"}}},
+			}}
+			provider.emit(ports.ChatEvent{Kind: ports.ChatEventInputRequested, ProviderTurnID: turn.ProviderTurnID, RequestID: "question-1", Input: &ports.ChatInputRequest{Mode: ports.ChatInputModeForm, Message: "Which approach?", Schema: schema}})
+			h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				return len(s.Activities) == 1 && s.Activities[0].Status == domain.ActivityStatusPending
+			})
+			update := ports.ChatUserMessage{Text: "worker finished", ClientMessageID: "question-worker-update", Origin: domain.MessageOriginAutomation}
+			if _, err := h.ctrl.SteerOrSend(ctx, update, false); err != nil {
+				t.Fatal(err)
+			}
+			if len(provider.steers()) != 1 {
+				t.Fatal("background update did not reach agent")
+			}
+			if scenario.detachFirst {
+				provider.emit(ports.ChatEvent{Kind: ports.ChatEventInputResolved, RequestID: "question-1"})
+			}
+			provider.emit(ports.ChatEvent{Kind: ports.ChatEventActivityStarted, ProviderTurnID: turn.ProviderTurnID, ProviderItemID: "after-question-cancel", ActivityKind: domain.ActivityKindSystem, ActivityStatus: domain.ActivityStatusRunning, Summary: "cancellation projected"})
+			snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				for _, activity := range s.Activities {
+					if activity.Summary == "cancellation projected" {
+						return true
+					}
+				}
+				return false
+			})
+			for _, activity := range snapshot.Activities {
+				if activity.RequestID == "question-1" && activity.Status != domain.ActivityStatusPending {
+					t.Fatalf("background cancellation removed unanswered question: %+v", activity)
+				}
+			}
+			for _, invalid := range []ports.ChatInputResponse{{Action: ports.ChatInputActionAccept}, {Action: ports.ChatInputActionAccept, Content: map[string]any{"question_0": "invented"}}, {Action: ports.ChatInputActionAccept, Content: map[string]any{"unknown": "native"}}} {
+				if err := h.ctrl.ResolveInput(ctx, "question-1", invalid); !errors.Is(err, ports.ErrChatDecisionNotOffered) {
+					t.Fatalf("invalid delayed answer accepted: %v", err)
+				}
+			}
+			answer := ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"question_0": "native"}}
+			if !scenario.detachFirst {
+				provider.deferred = false
+				if err := h.ctrl.ResolveInput(ctx, "question-1", answer); !errors.Is(err, ports.ErrChatRequestNotPending) {
+					t.Fatalf("unproven not-pending must not authorize fallback: %v", err)
+				}
+				provider.deferred = true
+			}
+			if rejected {
+				provider.failWith(ports.ErrChatTurnNotSteerable)
+				if err := h.ctrl.ResolveInput(ctx, "question-1", answer); !errors.Is(err, chatsvc.ErrTurnNotSteerable) {
+					t.Fatalf("refused answer=%v", err)
+				}
+				provider.failWith(nil)
+			}
+			if err := h.ctrl.ResolveInput(ctx, "question-1", answer); err != nil {
+				t.Fatalf("answer after cancellation: %v", err)
+			}
+			if err := h.ctrl.ResolveInput(ctx, "question-1", answer); err != nil {
+				t.Fatalf("safe duplicate answer: %v", err)
+			}
+			if err := h.ctrl.ResolveInput(ctx, "question-1", ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"question_0_custom": "different"}}); !errors.Is(err, domain.ErrClientMessageConflict) {
+				t.Fatalf("answered question changed: %v", err)
+			}
+			steers := provider.steers()
+			want := 2
+			if rejected {
+				want++
+			}
+			last := steers[len(steers)-1]
+			if len(steers) != want || last.msg.Origin != domain.MessageOriginHuman || !strings.Contains(last.msg.Text, "Which approach?") || !strings.Contains(last.msg.Text, "native") {
+				t.Fatalf("question answer attribution or idempotency failed: %+v", steers)
+			}
+			h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				for _, a := range s.Activities {
+					if a.RequestID == "question-1" {
+						return a.Status == domain.ActivityStatusResolved
+					}
+				}
+				return false
+			})
+		})
 	}
 }
 
@@ -4768,6 +5174,96 @@ func TestChatHandoffInterruptCompletionDuringProviderCancellationCannotPromoteQu
 	}
 }
 
+// ACP retains accepted cancellation until the root prompt returns a terminal result.
+type pendingACPCancellationConversation struct {
+	*interruptRecorder
+}
+
+func (c *pendingACPCancellationConversation) Interrupt(_ context.Context, target string) error {
+	c.activeMu.Lock()
+	defer c.activeMu.Unlock()
+	duplicate := slices.Contains(c.attempts, target)
+	c.attempts = append(c.attempts, target)
+	if duplicate {
+		return errors.New("injected ACP duplicate cancellation rejection")
+	}
+	if !c.active[target] {
+		return ports.ErrChatNoActiveTurn
+	}
+	return nil
+}
+
+func TestChatHandoffInterruptReusesAcceptedInterruptSendBeforeTerminalEvent(t *testing.T) {
+	provider := &pendingACPCancellationConversation{interruptRecorder: newInterruptRecorder()}
+	h := newHarnessWithConversation(t, provider)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	running, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "running", ClientMessageID: "handoff-accepted-running"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.markActive(running.ProviderTurnID)
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: running.ProviderTurnID})
+	older, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "older queue", ClientMessageID: "handoff-accepted-older"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	priority, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "priority", ClientMessageID: "handoff-accepted-priority", InterruptAndSend: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ctrl.BeginHandoff(ctx, domain.SessionInterfaceTransitionInterrupt); err != nil {
+		t.Fatalf("handoff repeated accepted cancellation: %v", err)
+	}
+	if count := provider.attemptCount(); count != 1 {
+		t.Fatalf("provider cancellations=%d, want 1", count)
+	}
+	snapshot, err := h.st.LoadConversationSnapshot(ctx, h.ctrl.ConversationID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	active, _ := turnByID(snapshot, running.ID)
+	if active.State != domain.TurnStateRunning {
+		t.Fatalf("invented terminal result: %+v", active)
+	}
+	for _, id := range []string{older.ID, priority.ID} {
+		turn, _ := turnByID(snapshot, id)
+		if turn.State != domain.TurnStateInterrupted {
+			t.Fatalf("handoff queue cancellation changed: %+v", turn)
+		}
+	}
+	accepted, err := h.st.TurnByID(ctx, priority.ID)
+	if err != nil || !accepted.InterruptDelivered {
+		t.Fatalf("lost durable cancellation acceptance: %+v err=%v", accepted, err)
+	}
+}
+
+type unreadableInterruptAcceptanceStore struct{ chatsvc.Store }
+
+func (s *unreadableInterruptAcceptanceStore) HasAcceptedInterrupt(context.Context, string, string) (bool, error) {
+	return false, errors.New("injected acceptance read failure")
+}
+
+func TestChatHandoffInterruptFailsClosedWhenAcceptanceCannotBeRead(t *testing.T) {
+	provider := newInterruptRecorder()
+	h := newHarnessWithConversationAndStore(t, provider, func(st *sqlite.Store) chatsvc.Store {
+		return &unreadableInterruptAcceptanceStore{Store: st}
+	})
+	ctx := context.Background()
+	turn, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "running", ClientMessageID: "handoff-read-failure"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.markActive(turn.ProviderTurnID)
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: turn.ProviderTurnID})
+	if err := h.ctrl.BeginHandoff(ctx, domain.SessionInterfaceTransitionInterrupt); err == nil || !strings.Contains(err.Error(), "acceptance read failure") {
+		t.Fatalf("unreadable acceptance treated as clear: %v", err)
+	}
+	if count := provider.attemptCount(); count != 0 {
+		t.Fatalf("unproven provider cancellation repeated %d times", count)
+	}
+}
+
 func TestChatHandoffInterruptDoesNotWaitForTurnCompletion(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
@@ -4967,6 +5463,198 @@ func TestServiceStopTerminatesPersistentConversation(t *testing.T) {
 	}
 	if !provider.terminated.Load() {
 		t.Fatal("explicit session stop detached persistent conversation instead of terminating it")
+	}
+}
+
+func TestExplicitStopShutsRetainedHostAfterRecoveryRace(t *testing.T) {
+	for _, notification := range []string{"explicit", "unmarked", "omitted"} {
+		t.Run(notification, func(t *testing.T) {
+			provider := &recoveryStopConversation{recoveryDetachedConversation: &recoveryDetachedConversation{terminatingConversation: &terminatingConversation{fakeConversation: newFakeConversation()}}}
+			h := newHarnessWithConversation(t, provider)
+			running, err := h.ctrl.Send(context.Background(), ports.ChatUserMessage{Text: "running at detach", ClientMessageID: "stop-recovery-work"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: running.ProviderTurnID})
+			h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				return len(s.Turns) == 1 && s.Turns[0].State == domain.TurnStateRunning
+			})
+			if _, err := h.ctrl.Send(context.Background(), ports.ChatUserMessage{Text: "queued at detach", ClientMessageID: "stop-recovery-queue"}); err != nil {
+				t.Fatal(err)
+			}
+			if notification != "omitted" {
+				provider.onClose = func() {
+					provider.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: ports.ChatControllerStopped, ProviderRetained: notification == "explicit"})
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if err := h.svc.Stop(ctx, testSession); err != nil {
+				t.Fatalf("explicit Stop: %v", err)
+			}
+			if h.hostStops.Load() != 1 {
+				t.Fatalf("Stop missed retained host or shut it twice: calls=%d", h.hostStops.Load())
+			}
+			if provider.terminated.Load() {
+				t.Fatal("fixture must exercise already-consumed adapter closeOnce")
+			}
+			snapshot, err := h.st.LoadConversationSnapshot(context.Background(), h.ctrl.ConversationID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			states := turnStateByText(t, snapshot)
+			if states["running at detach"] == domain.TurnStateRunning || states["queued at detach"] == domain.TurnStateQueued {
+				t.Fatalf("explicit Stop left live durable work: %+v", states)
+			}
+		})
+	}
+}
+
+func TestExplicitStopDoesNotCleanRetainedWorkAfterHostShutdownFailure(t *testing.T) {
+	provider := &recoveryStopConversation{recoveryDetachedConversation: &recoveryDetachedConversation{terminatingConversation: &terminatingConversation{fakeConversation: newFakeConversation()}}}
+	st := openStore(t)
+	var calls atomic.Int32
+	var retrySucceeds atomic.Bool
+	var ids atomic.Int32
+	svc := chatsvc.New(chatsvc.Options{Store: st, Sessions: st, Drivers: fakeRegistry{driver: fakeDriver{conv: provider}}, Log: slog.New(slog.DiscardHandler), NewID: func() string { return fmt.Sprintf("failed-host-stop-%d", ids.Add(1)) }, StopProviderHost: func(context.Context, domain.SessionID) error {
+		calls.Add(1)
+		if retrySucceeds.Load() {
+			return nil
+		}
+		return errors.New("host shutdown failed")
+	}})
+	ctrl, err := svc.Start(context.Background(), chatsvc.StartConfig{SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex, WorkspacePath: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	turn, err := ctrl.Send(context.Background(), ports.ChatUserMessage{Text: "retained running", ClientMessageID: "host-fail-work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: turn.ProviderTurnID})
+	awaitStoreSnapshot(t, st, ctrl.ConversationID(), func(s store.ConversationSnapshot) bool {
+		return len(s.Turns) == 1 && s.Turns[0].State == domain.TurnStateRunning
+	})
+	if err := svc.Stop(context.Background(), testSession); err == nil {
+		t.Fatal("failed host shutdown reported success")
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("host shutdown calls=%d", calls.Load())
+	}
+	snapshot, err := st.LoadConversationSnapshot(context.Background(), ctrl.ConversationID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if states := turnStateByText(t, snapshot); states["retained running"] != domain.TurnStateRunning {
+		t.Fatalf("failed host shutdown destroyed retained ownership: %+v", states)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := svc.Controller(testSession); errors.Is(err, chatsvc.ErrNoController) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	retrySucceeds.Store(true)
+	if err := svc.Stop(context.Background(), testSession); err != nil {
+		t.Fatalf("successful host shutdown retry: %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("one host shutdown per Stop attempt, calls=%d", calls.Load())
+	}
+	snapshot, err = st.LoadConversationSnapshot(context.Background(), ctrl.ConversationID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if states := turnStateByText(t, snapshot); states["retained running"] == domain.TurnStateRunning {
+		t.Fatalf("successful retry left live durable work: %+v", states)
+	}
+}
+
+func TestStopAfterRecoveryAutoDropConfirmsHostBeforeOwnedCleanup(t *testing.T) {
+	for _, scenario := range []string{"success", "no-shutdown", "generation-changed"} {
+		t.Run(scenario, func(t *testing.T) {
+			provider := &recoveryDetachedConversation{terminatingConversation: &terminatingConversation{fakeConversation: newFakeConversation()}}
+			h := newHarnessWithConversation(t, provider)
+			ctx := context.Background()
+			turn, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "auto-drop running", ClientMessageID: "auto-drop-work"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: turn.ProviderTurnID})
+			h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				return len(s.Turns) == 1 && s.Turns[0].State == domain.TurnStateRunning
+			})
+			if _, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "auto-drop queued", ClientMessageID: "auto-drop-queue"}); err != nil {
+				t.Fatal(err)
+			}
+			provider.emit(ports.ChatEvent{Kind: ports.ChatEventApprovalRequested, ProviderTurnID: turn.ProviderTurnID, RequestID: "auto-drop-approval", Summary: "Approval stays pending", Decisions: []ports.ChatDecisionOption{{ID: "allow", Label: "Allow", Kind: ports.ChatDecisionAllowOnce}}})
+			h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				return len(s.Activities) == 1 && s.Activities[0].Status == domain.ActivityStatusPending
+			})
+			provider.retained.Store(true)
+			if err := provider.Close(); err != nil {
+				t.Fatal(err)
+			}
+			h.ctrl.Wait()
+			deadline := time.Now().Add(time.Second)
+			for {
+				if _, err := h.svc.Controller(testSession); errors.Is(err, chatsvc.ErrNoController) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("recovery controller was not auto-dropped")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			var calls atomic.Int32
+			shutdown := func(context.Context, domain.SessionID) error {
+				calls.Add(1)
+				if scenario == "generation-changed" {
+					record, found, err := h.st.GetSession(ctx, testSession)
+					if err != nil || !found {
+						return fmt.Errorf("read generation: found=%v: %w", found, err)
+					}
+					record.Metadata.ControllerGeneration = "replacement-generation"
+					return h.st.UpdateSession(ctx, record)
+				}
+				return nil
+			}
+			if scenario == "no-shutdown" {
+				shutdown = nil
+			}
+			// This new service has no volatile controller; it must use captured durable ownership.
+			svc := chatsvc.New(chatsvc.Options{Store: h.st, Sessions: h.st, StopProviderHost: shutdown})
+			err = svc.Stop(ctx, testSession)
+			if scenario == "no-shutdown" && err == nil {
+				t.Fatal("missing host shutdown fallback reported success")
+			}
+			if scenario == "generation-changed" && err == nil {
+				t.Fatal("changed controller ownership reported successful Stop")
+			}
+			if scenario == "success" && err != nil {
+				t.Fatalf("Stop: %v", err)
+			}
+			wantCalls := int32(1)
+			if scenario == "no-shutdown" {
+				wantCalls = 0
+			}
+			if calls.Load() != wantCalls {
+				t.Fatalf("host shutdown calls=%d want=%d", calls.Load(), wantCalls)
+			}
+			snapshot, err := h.st.LoadConversationSnapshot(ctx, h.ctrl.ConversationID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			states := turnStateByText(t, snapshot)
+			if scenario == "success" {
+				if !states["auto-drop running"].Terminal() || !states["auto-drop queued"].Terminal() || snapshot.Activities[0].Status == domain.ActivityStatusPending {
+					t.Fatalf("confirmed Stop left retained work: turns=%+v activity=%+v", states, snapshot.Activities[0])
+				}
+			} else if states["auto-drop running"] != domain.TurnStateRunning || states["auto-drop queued"] != domain.TurnStateQueued || snapshot.Activities[0].Status != domain.ActivityStatusPending {
+				t.Fatalf("Stop cleaned unconfirmed or replacement-owned work: turns=%+v activity=%+v", states, snapshot.Activities[0])
+			}
+		})
 	}
 }
 
@@ -5414,6 +6102,69 @@ func TestServiceLiveReconnectKeepsDurableRunningTurnBusy(t *testing.T) {
 	}
 }
 
+func TestAdapterRecoveryDetachPreservesRunningTurnForAdoption(t *testing.T) {
+	for _, stoppedEvent := range []string{"explicit", "unmarked", "omitted"} {
+		t.Run(stoppedEvent, func(t *testing.T) { testAdapterRecoveryDetachPreservesRunningTurnForAdoption(t, stoppedEvent) })
+	}
+}
+
+func testAdapterRecoveryDetachPreservesRunningTurnForAdoption(t *testing.T, stoppedEvent string) {
+	provider := &recoveryDetachedConversation{terminatingConversation: &terminatingConversation{fakeConversation: newFakeConversation()}}
+	h := newHarnessWithConversation(t, provider)
+	ctx := context.Background()
+	running, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "keep running", ClientMessageID: "retain-running"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: running.ProviderTurnID})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Turns) == 1 && s.Turns[0].State == domain.TurnStateRunning
+	})
+	queued, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "after recovery", ClientMessageID: "retain-queued"})
+	if err != nil || queued.State != domain.TurnStateQueued {
+		t.Fatalf("queue: %+v %v", queued, err)
+	}
+	// A receipt failure makes the adapter detach itself, not Controller.Close.
+	provider.retained.Store(true)
+	if stoppedEvent != "omitted" {
+		provider.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: ports.ChatControllerStopped, ProviderRetained: stoppedEvent == "explicit"})
+	}
+	if err := provider.Close(); err != nil {
+		t.Fatal(err)
+	}
+	h.ctrl.Wait()
+	before, err := h.st.LoadConversationSnapshot(ctx, h.ctrl.ConversationID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	states := turnStateByText(t, before)
+	if states["keep running"] != domain.TurnStateRunning || states["after recovery"] != domain.TurnStateQueued {
+		t.Fatalf("recovery detach destroyed durable ownership: %+v", states)
+	}
+	if provider.terminated.Load() || h.hostStops.Load() != 0 {
+		t.Fatal("recovery terminated the retained provider")
+	}
+	adopted := &liveReconnectedConversation{nativeHistoryConversation: &nativeHistoryConversation{fakeConversation: newFakeConversation()}}
+	var ids atomic.Int32
+	replacement := chatsvc.New(chatsvc.Options{Store: h.st, Reader: fullSnapshotReader(h.st), Sessions: h.st, Drivers: fakeRegistry{driver: fakeDriver{conv: adopted}}, Log: slog.New(slog.DiscardHandler), NewID: func() string { return fmt.Sprintf("recovery-adoption-%d", ids.Add(1)) }})
+	t.Cleanup(func() { replacement.StopAll(context.Background()) })
+	ctrl, err := replacement.Start(ctx, chatsvc.StartConfig{SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex, WorkspacePath: t.TempDir(), ProviderConversationID: provider.ProviderConversationID()})
+	if err != nil {
+		t.Fatalf("retained host adoption: %v", err)
+	}
+	if ctrl.State() != ports.ChatControllerBusy || ctrl.ConversationID() != h.ctrl.ConversationID() {
+		t.Fatalf("adoption lost active conversation: state=%s conversation=%s", ctrl.State(), ctrl.ConversationID())
+	}
+	adopted.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: running.ProviderTurnID, TurnState: domain.TurnStateCompleted})
+	awaitStoreSnapshot(t, h.st, ctrl.ConversationID(), func(s store.ConversationSnapshot) bool {
+		states := turnStateByText(t, s)
+		return states["keep running"] == domain.TurnStateCompleted && states["after recovery"] == domain.TurnStateRunning
+	})
+	if sent := adopted.sentTexts(); !reflect.DeepEqual(sent, []string{"after recovery"}) {
+		t.Fatalf("retained queue delivery: %v", sent)
+	}
+}
+
 func TestStartWaitsForStoppedControllerCleanupBeforeRelaunch(t *testing.T) {
 	st := openStore(t)
 	first := newFakeConversation()
@@ -5845,6 +6596,518 @@ func (r *interruptRecorder) attemptCount() int {
 	return len(r.attempts)
 }
 
+type blockingInterruptAcceptance struct {
+	*fakeConversation
+	started chan string
+	release chan struct{}
+}
+
+func (c *blockingInterruptAcceptance) Interrupt(ctx context.Context, target string) error {
+	c.started <- target
+	select {
+	case <-c.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestHandoffFenceWaitsForInFlightInterruptAcceptance(t *testing.T) {
+	conv := &blockingInterruptAcceptance{fakeConversation: newFakeConversation(), started: make(chan string, 4), release: make(chan struct{})}
+	h := newHarnessWithConversation(t, conv)
+	ctx := context.Background()
+	first, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "running", ClientMessageID: "fence-running", Origin: domain.MessageOriginHuman})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: first.ProviderTurnID})
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "priority", ClientMessageID: "fence-priority", Origin: domain.MessageOriginHuman, InterruptAndSend: true})
+		done <- err
+	}()
+	select {
+	case target := <-conv.started:
+		if target != first.ProviderTurnID {
+			t.Fatal("wrong cancellation target")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no cancellation attempt")
+	}
+	armed := make(chan error, 1)
+	go func() { armed <- h.ctrl.ArmHandoff(ctx, domain.SessionInterfaceTransitionDrain) }()
+	select {
+	case err := <-armed:
+		close(conv.release)
+		<-done
+		t.Fatalf("handoff crossed pending cancellation acceptance: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	// Provider projection remains free while cancellation and handoff are serialized.
+	conv.emit(ports.ChatEvent{Kind: ports.ChatEventMessageDelta, ProviderTurnID: first.ProviderTurnID, ProviderItemID: "fence-stream", Delta: "still projecting"})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		for _, message := range s.Messages {
+			if message.Text == "still projecting" {
+				return true
+			}
+		}
+		return false
+	})
+	close(conv.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-armed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("handoff did not resume after cancellation acceptance")
+	}
+	h.ctrl.AbortHandoff()
+}
+
+func TestConcurrentInterruptSendsCaptureOriginalTargetBeforeCancellationFinishes(t *testing.T) {
+	conv := &blockingInterruptAcceptance{fakeConversation: newFakeConversation(), started: make(chan string, 4), release: make(chan struct{})}
+	h := newHarnessWithConversation(t, conv)
+	ctx := context.Background()
+	first, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "running", ClientMessageID: "concurrent-running", Origin: domain.MessageOriginHuman})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: first.ProviderTurnID})
+	done := make(chan error, 2)
+	go func() {
+		_, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "first priority", ClientMessageID: "first-priority", Origin: domain.MessageOriginHuman, InterruptAndSend: true})
+		done <- err
+	}()
+	select {
+	case target := <-conv.started:
+		if target != first.ProviderTurnID {
+			t.Fatal("wrong first target")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no cancel attempt")
+	}
+	go func() {
+		_, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "second priority", ClientMessageID: "second-priority", Origin: domain.MessageOriginHuman, InterruptAndSend: true})
+		done <- err
+	}()
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Turns) == 3 })
+	close(conv.release)
+	for range 2 {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case target := <-conv.started:
+		t.Fatalf("same running target cancelled twice: %q", target)
+	default:
+	}
+	snapshot, err := h.st.LoadConversationSnapshot(ctx, h.ctrl.ConversationID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, turn := range snapshot.Turns {
+		if turn.ID != first.ID && turn.InterruptTargetProviderTurnID != first.ProviderTurnID {
+			t.Fatalf("concurrent request retargeted: %+v", turn)
+		}
+	}
+	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: first.ProviderTurnID, TurnState: domain.TurnStateInterrupted})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return turnStateByText(t, s)["first priority"] == domain.TurnStateRunning
+	})
+	if !reflect.DeepEqual(conv.sentTexts(), []string{"running", "first priority"}) {
+		t.Fatalf("wrong concurrent order: %v", conv.sentTexts())
+	}
+}
+
+func TestSuccessiveInterruptBatchesRunNewestTargetFirst(t *testing.T) {
+	for _, failedHead := range []bool{false, true} {
+		t.Run(fmt.Sprintf("older-failed-target=%v", failedHead), func(t *testing.T) {
+			conv := newInterruptRecorder()
+			h := newHarnessWithConversation(t, conv)
+			ctx := context.Background()
+			send := func(text string, interrupt bool) domain.ConversationTurn {
+				t.Helper()
+				turn, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: text, ClientMessageID: text, Origin: domain.MessageOriginHuman, InterruptAndSend: interrupt})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return turn
+			}
+			if failedHead {
+				failed := send("failed target", false)
+				conv.markActive(failed.ProviderTurnID)
+				conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: failed.ProviderTurnID})
+				send("held failed batch", true)
+				conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: failed.ProviderTurnID, TurnState: domain.TurnStateFailed, Err: errors.New("outage")})
+				h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+					turn, _ := turnByID(s, failed.ID)
+					return turn.State == domain.TurnStateFailed
+				})
+			}
+			a := send("A", false)
+			conv.markActive(a.ProviderTurnID)
+			conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: a.ProviderTurnID})
+			p1 := send("P1", true)
+			p2 := send("P2", true)
+			conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: a.ProviderTurnID, TurnState: domain.TurnStateInterrupted})
+			snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				turn, _ := turnByID(s, p1.ID)
+				return turn.State == domain.TurnStateRunning
+			})
+			active, _ := turnByID(snapshot, p1.ID)
+			conv.markActive(active.ProviderTurnID)
+			conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: active.ProviderTurnID})
+			p3 := send("P3", true)
+			conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: active.ProviderTurnID, TurnState: domain.TurnStateInterrupted})
+			snapshot = h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				turn, _ := turnByID(s, p3.ID)
+				return turn.State == domain.TurnStateRunning
+			})
+			waiting, _ := turnByID(snapshot, p2.ID)
+			if waiting.State != domain.TurnStateQueued {
+				t.Fatalf("older batch changed: %+v", waiting)
+			}
+			current, _ := turnByID(snapshot, p3.ID)
+			conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: current.ProviderTurnID, TurnState: domain.TurnStateCompleted})
+			h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				turn, _ := turnByID(s, p2.ID)
+				return turn.State == domain.TurnStateRunning
+			})
+			if failedHead {
+				last, err := h.st.LoadConversationSnapshot(ctx, h.ctrl.ConversationID())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if turnStateByText(t, last)["held failed batch"] != domain.TurnStateQueued {
+					t.Fatal("failed batch was released")
+				}
+			}
+		})
+	}
+}
+
+func TestInterruptAndSendPrioritizesNewPromptAndPreservesQueue(t *testing.T) {
+	conv := newInterruptRecorder()
+	h := newHarnessWithConversation(t, conv)
+	ctx := context.Background()
+	first, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "running", ClientMessageID: "first", Origin: domain.MessageOriginHuman})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv.markActive(first.ProviderTurnID)
+	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: first.ProviderTurnID})
+	queued, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "older queue", ClientMessageID: "older", Origin: domain.MessageOriginHuman})
+	if err != nil || queued.State != domain.TurnStateQueued {
+		t.Fatalf("older queue: %+v err=%v", queued, err)
+	}
+	request := ports.ChatUserMessage{Text: "new interrupt prompt", ClientMessageID: "interrupt-request", Origin: domain.MessageOriginHuman, InterruptAndSend: true}
+	accepted, err := h.svc.Send(ctx, testSession, request)
+	if err != nil || accepted.ID == "" || conv.attemptCount() != 1 {
+		t.Fatalf("interrupt send: %+v err=%v attempts=%d", accepted, err, conv.attemptCount())
+	}
+	if _, err := h.svc.Send(ctx, testSession, request); err != nil || conv.attemptCount() != 1 {
+		t.Fatalf("duplicate while cancellation pending: err=%v attempts=%d", err, conv.attemptCount())
+	}
+	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: first.ProviderTurnID, TurnState: domain.TurnStateInterrupted})
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		for _, turn := range s.Turns {
+			if turn.ID == accepted.ID && turn.State == domain.TurnStateRunning {
+				return true
+			}
+		}
+		return false
+	})
+	old, _ := turnByID(snapshot, queued.ID)
+	if old.State != domain.TurnStateQueued || !reflect.DeepEqual(conv.sentTexts(), []string{"running", "new interrupt prompt"}) {
+		t.Fatalf("queue lost or wrong prompt next: old=%+v sent=%v", old, conv.sentTexts())
+	}
+	if _, err := h.svc.Send(ctx, testSession, request); err != nil || conv.attemptCount() != 1 {
+		t.Fatalf("duplicate re-interrupted: err=%v attempts=%d", err, conv.attemptCount())
+	}
+	active, _ := turnByID(snapshot, accepted.ID)
+	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: active.ProviderTurnID, TurnState: domain.TurnStateCompleted})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		old, _ := turnByID(s, queued.ID)
+		return old.State == domain.TurnStateRunning
+	})
+	if !reflect.DeepEqual(conv.sentTexts(), []string{"running", "new interrupt prompt", "older queue"}) {
+		t.Fatalf("older queue not preserved in order: %v", conv.sentTexts())
+	}
+}
+
+func TestInterruptAndSendNoActiveDoesNotInventSuccessfulCancellation(t *testing.T) {
+	conv := newInterruptRecorder()
+	h := newHarnessWithConversation(t, conv)
+	ctx := context.Background()
+	first, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "gone", ClientMessageID: "gone", Origin: domain.MessageOriginHuman})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: first.ProviderTurnID})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Turns) == 1 && s.Turns[0].State == domain.TurnStateRunning
+	})
+	old, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "retain", ClientMessageID: "retain", Origin: domain.MessageOriginHuman})
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "next", ClientMessageID: "next", Origin: domain.MessageOriginHuman, InterruptAndSend: true})
+	if accepted.ID == "" {
+		t.Fatalf("accepted prompt missing: %v", err)
+	}
+	before, readErr := h.st.LoadConversationSnapshot(ctx, h.ctrl.ConversationID())
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	target, _ := turnByID(before, first.ID)
+	next, _ := turnByID(before, accepted.ID)
+	if target.State != domain.TurnStateRunning || next.State != domain.TurnStateQueued || len(conv.sentTexts()) != 1 {
+		t.Fatalf("inactivity invented successful cancellation: target=%+v next=%+v sent=%v", target, next, conv.sentTexts())
+	}
+	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: first.ProviderTurnID, TurnState: domain.TurnStateFailed, Err: errors.New("failure projection was delayed")})
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		target, _ := turnByID(s, first.ID)
+		return target.State == domain.TurnStateFailed
+	})
+	retained, _ := turnByID(snapshot, old.ID)
+	next, _ = turnByID(snapshot, accepted.ID)
+	if retained.State != domain.TurnStateQueued || next.State != domain.TurnStateQueued || !reflect.DeepEqual(conv.sentTexts(), []string{"gone"}) {
+		t.Fatalf("delayed failure released work: retained=%+v next=%+v sent=%v", retained, next, conv.sentTexts())
+	}
+}
+
+type gatedInterruptRecoveryStore struct {
+	chatsvc.Store
+	started     chan struct{}
+	release     chan struct{}
+	inspected   chan struct{}
+	once        sync.Once
+	inspectOnce sync.Once
+}
+
+func (s *gatedInterruptRecoveryStore) PendingInterruptTurns(ctx context.Context, conversationID string) ([]domain.ConversationTurn, error) {
+	s.once.Do(func() { close(s.started) })
+	select {
+	case <-s.release:
+		return s.Store.PendingInterruptTurns(ctx, conversationID)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *gatedInterruptRecoveryStore) TurnByProviderID(ctx context.Context, conversationID, providerTurnID string) (domain.ConversationTurn, error) {
+	turn, err := s.Store.TurnByProviderID(ctx, conversationID, providerTurnID)
+	s.inspectOnce.Do(func() { close(s.inspected) })
+	return turn, err
+}
+
+func TestAbortedHandoffRestartsPendingInterruptRecoveryWithoutClientSend(t *testing.T) {
+	st := openStore(t)
+	ctx := context.Background()
+	var ids atomic.Int32
+	newID := func() string { return fmt.Sprintf("handoff-recovery-%d", ids.Add(1)) }
+	firstProvider := &terminatingConversation{fakeConversation: newFakeConversation()}
+	first := chatsvc.New(chatsvc.Options{Store: st, Reader: fullSnapshotReader(st), Sessions: st, Drivers: fakeRegistry{driver: fakeDriver{conv: firstProvider}}, Log: slog.New(slog.DiscardHandler), NewID: newID})
+	cfg := chatsvc.StartConfig{SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex, WorkspacePath: t.TempDir()}
+	ctrl, err := first.Start(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, err := ctrl.Send(ctx, ports.ChatUserMessage{Text: "running", ClientMessageID: "handoff-running", Origin: domain.MessageOriginHuman})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstProvider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: running.ProviderTurnID})
+	created, err := st.AppendUserMessage(ctx, ctrl.ConversationID(), testSession, ctrl.Generation(), domain.ConversationMessage{ID: "handoff-prompt", Text: "priority", Origin: domain.MessageOriginHuman, ClientMessageID: "handoff-priority", InterruptTargetProviderTurnID: running.ProviderTurnID}, "handoff-intent", time.Now())
+	if err != nil || !created {
+		t.Fatalf("intake: created=%v err=%v", created, err)
+	}
+	first.StopAll(ctx)
+	reconnected := &reconnectInterruptRecorder{liveReconnectedConversation: &liveReconnectedConversation{nativeHistoryConversation: &nativeHistoryConversation{fakeConversation: newFakeConversation()}}, attempts: make(chan string, 4)}
+	reconnected.turnSeq = firstProvider.turnSeq
+	gate := &gatedInterruptRecoveryStore{Store: st, started: make(chan struct{}), release: make(chan struct{}), inspected: make(chan struct{})}
+	second := chatsvc.New(chatsvc.Options{Store: gate, Reader: fullSnapshotReader(st), Sessions: st, Drivers: fakeRegistry{driver: fakeDriver{conv: reconnected}}, Log: slog.New(slog.DiscardHandler), NewID: newID})
+	t.Cleanup(func() { second.StopAll(ctx) })
+	cfg.ProviderConversationID = firstProvider.ProviderConversationID()
+	current, err := second.Start(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-gate.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("startup recovery did not start")
+	}
+	if err := current.ArmHandoff(ctx, domain.SessionInterfaceTransitionDrain); err != nil {
+		t.Fatal(err)
+	}
+	close(gate.release)
+	select {
+	case <-gate.inspected:
+	case <-time.After(3 * time.Second):
+		t.Fatal("recovery did not reach handoff fence")
+	}
+	current.AbortHandoff()
+	select {
+	case target := <-reconnected.attempts:
+		if target != running.ProviderTurnID {
+			t.Fatalf("recovery retargeted %q", target)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("aborted handoff lost pending cancellation recovery")
+	}
+	reconnected.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: running.ProviderTurnID, TurnState: domain.TurnStateInterrupted})
+	h := &harness{st: st, ctrl: current}
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		turn, _ := turnByID(s, "handoff-intent")
+		return turn.State == domain.TurnStateRunning
+	})
+}
+
+type reconnectInterruptRecorder struct {
+	*liveReconnectedConversation
+	attempts chan string
+}
+
+func (c *reconnectInterruptRecorder) Interrupt(_ context.Context, target string) error {
+	c.attempts <- target
+	return nil
+}
+
+func TestInterruptAndSendRecoversAcceptedPromptAcrossControllerRestart(t *testing.T) {
+	for _, mode := range []string{"before-cancellation", "cancellation-delivered", "target-settled"} {
+		t.Run(mode, func(t *testing.T) {
+			st := openStore(t)
+			ctx := context.Background()
+			var ids atomic.Int32
+			newID := func() string { return fmt.Sprintf("interrupt-restart-%d", ids.Add(1)) }
+			firstProvider := &terminatingConversation{fakeConversation: newFakeConversation()}
+			first := chatsvc.New(chatsvc.Options{
+				Store: st, Reader: fullSnapshotReader(st), Sessions: st,
+				Drivers: fakeRegistry{driver: fakeDriver{conv: firstProvider}},
+				Log:     slog.New(slog.DiscardHandler), NewID: newID,
+			})
+			cfg := chatsvc.StartConfig{SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex, WorkspacePath: t.TempDir()}
+			ctrl, err := first.Start(ctx, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			running, err := ctrl.Send(ctx, ports.ChatUserMessage{Text: "running", ClientMessageID: "restart-running", Origin: domain.MessageOriginHuman})
+			if err != nil {
+				t.Fatal(err)
+			}
+			firstProvider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: running.ProviderTurnID})
+			if _, err := ctrl.Send(ctx, ports.ChatUserMessage{Text: "older", ClientMessageID: "restart-older", Origin: domain.MessageOriginHuman}); err != nil {
+				t.Fatal(err)
+			}
+			var pending domain.ConversationTurn
+			if mode == "before-cancellation" {
+				created, err := st.AppendUserMessage(ctx, ctrl.ConversationID(), testSession, ctrl.Generation(), domain.ConversationMessage{
+					ID: "crash-window-message", Text: "priority", Origin: domain.MessageOriginHuman, ClientMessageID: "restart-priority", InterruptTargetProviderTurnID: running.ProviderTurnID,
+				}, "crash-window-turn", time.Now())
+				if err != nil || !created {
+					t.Fatalf("seed durable intake: created=%v err=%v", created, err)
+				}
+				pending.ID = "crash-window-turn"
+			} else {
+				pending, err = ctrl.Send(ctx, ports.ChatUserMessage{Text: "priority", ClientMessageID: "restart-priority", Origin: domain.MessageOriginHuman, InterruptAndSend: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			first.StopAll(ctx)
+			if mode == "target-settled" {
+				if err := st.SettleTurnByID(ctx, running.ID, domain.TurnStateInterrupted, "", time.Now()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			secondProvider := &liveReconnectedConversation{nativeHistoryConversation: &nativeHistoryConversation{fakeConversation: newFakeConversation()}}
+			secondProvider.turnSeq = firstProvider.turnSeq
+			reconnected := &reconnectInterruptRecorder{liveReconnectedConversation: secondProvider, attempts: make(chan string, 4)}
+			second := chatsvc.New(chatsvc.Options{
+				Store: st, Reader: fullSnapshotReader(st), Sessions: st,
+				Drivers: fakeRegistry{driver: fakeDriver{conv: reconnected}},
+				Log:     slog.New(slog.DiscardHandler), NewID: newID,
+			})
+			t.Cleanup(func() { second.StopAll(ctx) })
+			cfg.ProviderConversationID = firstProvider.ProviderConversationID()
+			secondController, err := second.Start(ctx, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode == "before-cancellation" {
+				select {
+				case target := <-reconnected.attempts:
+					if target != running.ProviderTurnID {
+						t.Fatalf("recovery retargeted %q", target)
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatal("reconnect did not recover pending cancellation without client resend")
+				}
+			}
+			if mode != "target-settled" {
+				secondProvider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: running.ProviderTurnID, TurnState: domain.TurnStateInterrupted})
+			}
+			h := &harness{st: st, ctrl: secondController}
+			snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				turn, _ := turnByID(s, pending.ID)
+				return turn.State == domain.TurnStateRunning
+			})
+			states := turnStateByText(t, snapshot)
+			if states["older"] != domain.TurnStateQueued || !reflect.DeepEqual(secondProvider.sentTexts(), []string{"priority"}) {
+				t.Fatalf("restart lost priority or older queue: states=%v sent=%v", states, secondProvider.sentTexts())
+			}
+		})
+	}
+}
+
+func TestInterruptAndSendDoesNotDrainAfterTargetFails(t *testing.T) {
+	conv := newInterruptRecorder()
+	h := newHarnessWithConversation(t, conv)
+	ctx := context.Background()
+	first, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "failing", ClientMessageID: "failing", Origin: domain.MessageOriginHuman})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv.markActive(first.ProviderTurnID)
+	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: first.ProviderTurnID})
+	accepted, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "hold", ClientMessageID: "hold", Origin: domain.MessageOriginHuman, InterruptAndSend: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: first.ProviderTurnID, TurnState: domain.TurnStateFailed, Err: errors.New("provider outage")})
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		current, _ := turnByID(s, first.ID)
+		return current.State == domain.TurnStateFailed
+	})
+	held, _ := turnByID(snapshot, accepted.ID)
+	if held.State != domain.TurnStateQueued || len(conv.sentTexts()) != 1 {
+		t.Fatalf("failed target released work: held=%+v sent=%v", held, conv.sentTexts())
+	}
+	changedMode := ports.ChatUserMessage{Text: "hold", ClientMessageID: "hold", Origin: domain.MessageOriginHuman}
+	if _, err := h.svc.Send(ctx, testSession, changedMode); !errors.Is(err, domain.ErrClientMessageConflict) {
+		t.Fatalf("mode change under same key = %v, want conflict", err)
+	}
+	later, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "later ordinary turn", ClientMessageID: "later", Origin: domain.MessageOriginHuman})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: later.ProviderTurnID, TurnState: domain.TurnStateCompleted})
+	snapshot = h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		current, _ := turnByID(s, later.ID)
+		return current.State == domain.TurnStateCompleted
+	})
+	held, _ = turnByID(snapshot, accepted.ID)
+	if held.State != domain.TurnStateQueued || !reflect.DeepEqual(conv.sentTexts(), []string{"failing", "later ordinary turn"}) {
+		t.Fatalf("unrelated completion released failed target: held=%+v sent=%v", held, conv.sentTexts())
+	}
+}
+
 // Stop appears the moment a message is sent, so a user can press it before the
 // provider has acknowledged the turn — and a provider refuses to cancel a turn it
 // does not yet consider active. Interrupt waits out that gap rather than handing
@@ -6256,6 +7519,14 @@ func TestInterruptReconciliationCancelsQueuedTurns(t *testing.T) {
 // claims a turn is running and a queued message is waiting to be sent behind a
 // controller that no longer exists.
 func TestStartSettlesWorkLeftByAKilledController(t *testing.T) {
+	testStartSettlesWorkLeftByAKilledController(t, false)
+}
+
+func TestStartSettlesQueuedWorkLeftByAKilledController(t *testing.T) {
+	testStartSettlesWorkLeftByAKilledController(t, true)
+}
+
+func testStartSettlesWorkLeftByAKilledController(t *testing.T, queuedOnly bool) {
 	h := newHarness(t)
 	ctx := context.Background()
 
@@ -6276,6 +7547,11 @@ func TestStartSettlesWorkLeftByAKilledController(t *testing.T) {
 		ActivityStatus: domain.ActivityStatusPending, Summary: "Run something",
 	})
 	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Activities) == 1 })
+	if queuedOnly {
+		if err := h.st.SettleTurn(ctx, h.ctrl.ConversationID(), "provider-turn-1", domain.TurnStateFailed, "crash", h.now()); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	// A killed daemon leaves the rows mid-flight and takes its service with it, so
 	// the next controller comes up in a NEW service over the SAME store. Building
@@ -6292,8 +7568,10 @@ func TestStartSettlesWorkLeftByAKilledController(t *testing.T) {
 	t.Cleanup(func() { _ = next.Stop(context.Background(), testSession) })
 	// Retry moves an interrupted async start back to provisioning. That state
 	// must not hide the running turn left by its previous controller.
-	if _, err := h.st.SetSessionProvisionState(ctx, testSession, domain.SessionProvisionProvisioning, "", h.now()); err != nil {
-		t.Fatal(err)
+	if !queuedOnly {
+		if _, err := h.st.SetSessionProvisionState(ctx, testSession, domain.SessionProvisionProvisioning, "", h.now()); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	if _, err := next.Start(ctx, chatsvc.StartConfig{
@@ -6670,6 +7948,29 @@ func TestCompactReportsWhatIsAboutToBeReclaimed(t *testing.T) {
 	}
 	if conv.compactCalls() != 1 {
 		t.Errorf("provider called %d times, want 1", conv.compactCalls())
+	}
+}
+
+func TestCompactionSettlementWithoutStartDrainsQueue(t *testing.T) {
+	for _, kind := range []ports.ChatEventKind{ports.ChatEventTurnCompleted, ports.ChatEventCompacted} {
+		t.Run(string(kind), func(t *testing.T) {
+			conv := newCompactingConversation()
+			h := newHarnessWithConversation(t, conv)
+			ctx := context.Background()
+			if _, err := h.svc.Compact(ctx, testSession); err != nil {
+				t.Fatal(err)
+			}
+			if turn, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "after compact"}); err != nil || turn.State != domain.TurnStateQueued {
+				t.Fatalf("Send while compacting = %+v, %v", turn, err)
+			}
+			conv.emit(ports.ChatEvent{Kind: kind, ProviderTurnID: "compact-turn", TurnState: domain.TurnStateCompleted})
+			h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				return len(s.Turns) == 1 && s.Turns[0].State == domain.TurnStateRunning
+			})
+			if got := conv.sentTexts(); len(got) != 1 || got[0] != "after compact" {
+				t.Fatalf("provider messages = %v", got)
+			}
+		})
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -58,6 +59,8 @@ var (
 	// replaced. Two clients looking at the same approval is normal, so one of them
 	// arriving second is an ordinary outcome and not a failure.
 	ErrChatRequestNotPending = errors.New("chat request is not pending")
+	// ErrChatQuestionDeferred proves an automatic yield fenced the unanswered callback.
+	ErrChatQuestionDeferred = fmt.Errorf("%w: question automatically deferred", ErrChatRequestNotPending)
 	// ErrChatDecisionNotOffered means the decision is not one the provider offered
 	// for that request. It must be refused and the request left pending: consent
 	// AO invented is not consent, and consuming the request on a bad decision
@@ -172,12 +175,14 @@ const (
 	ChatCapabilityTools     ChatCapability = "tools"
 	ChatCapabilityApprovals ChatCapability = "approvals"
 	ChatCapabilityInterrupt ChatCapability = "interrupt"
-	ChatCapabilitySteer     ChatCapability = "steer"
-	ChatCapabilityResume    ChatCapability = "resume"
-	ChatCapabilityHistory   ChatCapability = "history"
-	ChatCapabilityUsage     ChatCapability = "usage"
-	ChatCapabilityDiffs     ChatCapability = "diffs"
-	ChatCapabilityPlans     ChatCapability = "plans"
+	// ChatCapabilityInterruptAndSend is added by AO when durable queue-preserving interrupt intake is available.
+	ChatCapabilityInterruptAndSend ChatCapability = "interrupt_send"
+	ChatCapabilitySteer            ChatCapability = "steer"
+	ChatCapabilityResume           ChatCapability = "resume"
+	ChatCapabilityHistory          ChatCapability = "history"
+	ChatCapabilityUsage            ChatCapability = "usage"
+	ChatCapabilityDiffs            ChatCapability = "diffs"
+	ChatCapabilityPlans            ChatCapability = "plans"
 	// ChatCapabilityModels means the provider can enumerate the models it offers
 	// and accept one per turn.
 	ChatCapabilityModels ChatCapability = "models"
@@ -332,9 +337,14 @@ type ChatResumeConfig struct {
 	ProviderIDsScoped      bool
 	SessionID              domain.SessionID
 	ProviderConversationID string
-	DataDir                string
-	WorkspacePath          string
-	Env                    map[string]string
+	// FreshIfMissing lets a driver that had to reload ProviderConversationID
+	// start a fresh provider conversation when the provider reports it does not
+	// exist. Callers set it only with durable proof that the conversation never
+	// started. The returned conversation then reports the new id.
+	FreshIfMissing bool
+	DataDir        string
+	WorkspacePath  string
+	Env            map[string]string
 	// See ChatStartConfig.PrepareEnv.
 	PrepareEnv func(context.Context) (map[string]string, error)
 	// Model is optional; empty keeps the provider conversation's current model.
@@ -370,16 +380,42 @@ type ChatMCPServerConfig struct {
 // ChatInternalReplayResourceURI is reserved for AO's reconstructed edit context.
 const ChatInternalReplayResourceURI = "ao://conversation/edit-replay"
 
+// ChatExcerptResourceURIPrefix identifies AO-verified transcript excerpts. The
+// daemon resolves these from durable messages; clients never supply the resource
+// text directly.
+const ChatExcerptResourceURIPrefix = "ao://conversation-excerpt/"
+
+// ChatExcerptReference points at selected text in one durable transcript
+// message. Revision makes stale selections fail closed when streaming updates
+// replace the source text before the user sends their draft.
+type ChatExcerptReference struct {
+	ConversationID string `json:"conversationId"`
+	MessageID      string `json:"messageId"`
+	Revision       int64  `json:"revision"`
+	Text           string `json:"text"`
+}
+
+// ChatExcerptContext is the server-verified context delivered for one selected
+// transcript range. The paired turn is retained so a short selection can be
+// understood without relying on hidden provider history.
+type ChatExcerptContext struct {
+	Reference        ChatExcerptReference `json:"reference"`
+	SelectedText     string               `json:"selectedText"`
+	UserMessage      string               `json:"userMessage"`
+	AssistantMessage string               `json:"assistantMessage"`
+}
+
 // ChatContent is structured prompt context. Text remains on ChatUserMessage so
 // the durable transcript has an ordinary readable message; these blocks enrich
 // what the provider receives without leaking protocol DTOs above the adapter.
 type ChatContent struct {
-	Type     string `json:"type"`
-	Data     string `json:"data,omitempty"`
-	MIMEType string `json:"mimeType,omitempty"`
-	URI      string `json:"uri,omitempty"`
-	Name     string `json:"name,omitempty"`
-	Text     string `json:"text,omitempty"`
+	Type     string              `json:"type"`
+	Data     string              `json:"data,omitempty"`
+	MIMEType string              `json:"mimeType,omitempty"`
+	URI      string              `json:"uri,omitempty"`
+	Name     string              `json:"name,omitempty"`
+	Text     string              `json:"text,omitempty"`
+	Excerpt  *ChatExcerptContext `json:"excerpt,omitempty"`
 	// Internal distinguishes AO-owned prompt context from a user attachment.
 	// Public request DTOs never expose this bit; it is durable so edit/retry and
 	// snapshot reconstruction can hide only content AO actually synthesized.
@@ -397,6 +433,8 @@ type ChatUserMessage struct {
 	// InteractionAt preserves initial acceptance across transition outbox replay.
 	InteractionAt time.Time
 	Text          string
+	// InterruptAndSend stops the current turn and prioritizes this durable prompt without cancelling queued work.
+	InterruptAndSend bool
 	// SenderSessionID identifies the AO session that authored an automation steer.
 	// It is presentation metadata only and is never sent to the provider.
 	SenderSessionID string
@@ -415,6 +453,8 @@ type ChatUserMessage struct {
 	// ClientPayloadHash identifies the original request before AO adds reports
 	// or other server-owned context. It is internal, never supplied by a client.
 	ClientPayloadHash string
+	// Excerpts are verified transcript selections attached to this user message.
+	Excerpts []ChatExcerptReference
 	// Origin records the timeline attribution and delivery source. Automation
 	// shares the queue with the user and can never resolve an approval.
 	Origin domain.MessageOrigin
@@ -714,6 +754,14 @@ type (
 	ChatSkillLister interface {
 		ListSkills(ctx context.Context) ([]ChatSkill, error)
 	}
+	// ChatSandboxNetwork is implemented by a conversation whose provider runs
+	// the agent in a sandbox that can withhold network access. AO's own tools
+	// that load agent pages must not give the agent more network than that.
+	ChatSandboxNetwork interface {
+		// SandboxAllowsNetwork reports whether the agent can reach the network
+		// under the turn's permission mode; empty means the mode it launched with.
+		SandboxAllowsNetwork(turnMode PermissionMode) bool
+	}
 	// ChatUsageReporter reads the account's quota position on demand, for the
 	// cases where waiting for the next notification is too late to be useful.
 	ChatUsageReporter interface {
@@ -830,11 +878,150 @@ type ChatInputResponse struct {
 // restricted JSON Schema object for form mode. URL is only present for url mode
 // and must never be opened without the user's explicit consent.
 type ChatInputRequest struct {
-	Mode          ChatInputMode
-	Message       string
-	Schema        map[string]any
-	URL           string
-	ElicitationID string
+	Mode                    ChatInputMode
+	Message                 string
+	Schema                  map[string]any
+	URL                     string
+	ElicitationID           string
+	QuestionAgentID         string
+	QuestionParentToolUseID string
+}
+
+// PersistentQuestion identifies Claude's question form, never tool or URL consent.
+func (r ChatInputRequest) PersistentQuestion() bool {
+	if r.Mode != ChatInputModeForm || r.URL != "" || r.QuestionAgentID != "" || r.QuestionParentToolUseID != "" || r.Schema["type"] != "object" {
+		return false
+	}
+	properties, _ := r.Schema["properties"].(map[string]any)
+	if len(properties) == 0 || len(properties)%2 != 0 {
+		return false
+	}
+	for name, raw := range properties {
+		property, ok := raw.(map[string]any)
+		if !ok || !strings.HasPrefix(name, "question_") {
+			return false
+		}
+		if strings.HasSuffix(name, "_custom") {
+			questionID := strings.TrimSuffix(name, "_custom")
+			meta, _ := property["_meta"].(map[string]any)
+			binding, _ := meta["_askUserQuestionCustomAnswer"].(map[string]any)
+			if property["type"] != "string" || binding["isCustomAnswer"] != true || binding["questionId"] != questionID || properties[questionID] == nil {
+				return false
+			}
+			continue
+		}
+		if _, err := strconv.ParseUint(strings.TrimPrefix(name, "question_"), 10, 32); err != nil || properties[name+"_custom"] == nil {
+			return false
+		}
+		enum := property
+		switch property["type"] {
+		case "string":
+		case "array":
+			enum, _ = property["items"].(map[string]any)
+		default:
+			return false
+		}
+		options, _ := enum["oneOf"].([]any)
+		if options == nil {
+			options, _ = enum["anyOf"].([]any)
+		}
+		if len(options) == 0 {
+			return false
+		}
+		for _, rawOption := range options {
+			option, _ := rawOption.(map[string]any)
+			if text, ok := option["const"].(string); !ok || strings.TrimSpace(text) == "" {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// ValidateQuestionResponse checks delayed answers against the stored question options.
+func (r ChatInputRequest) ValidateQuestionResponse(response ChatInputResponse) error {
+	if !r.PersistentQuestion() || !response.Action.Valid() {
+		return ErrChatDecisionNotOffered
+	}
+	if response.Action != ChatInputActionAccept {
+		if len(response.Content) != 0 {
+			return ErrChatDecisionNotOffered
+		}
+		return nil
+	}
+	properties, _ := r.Schema["properties"].(map[string]any)
+	for name, raw := range properties {
+		property, _ := raw.(map[string]any)
+		if !strings.HasPrefix(name, "question_") || strings.HasSuffix(name, "_custom") {
+			continue
+		}
+		custom, _ := response.Content[name+"_custom"].(string)
+		if strings.TrimSpace(custom) != "" {
+			continue
+		}
+		value, present := response.Content[name]
+		if !present {
+			return ErrChatDecisionNotOffered
+		}
+		if property["type"] == "string" && value == "" {
+			return ErrChatDecisionNotOffered
+		}
+		if property["type"] == "array" {
+			values, ok := value.([]any)
+			if !ok || len(values) == 0 {
+				return ErrChatDecisionNotOffered
+			}
+		}
+	}
+	for name, value := range response.Content {
+		property, ok := properties[name].(map[string]any)
+		if !ok {
+			return ErrChatDecisionNotOffered
+		}
+		var values []any
+		switch property["type"] {
+		case "string":
+			text, ok := value.(string)
+			if !ok {
+				return ErrChatDecisionNotOffered
+			}
+			values = []any{text}
+		case "array":
+			var ok bool
+			values, ok = value.([]any)
+			if !ok {
+				return ErrChatDecisionNotOffered
+			}
+			property, _ = property["items"].(map[string]any)
+		default:
+			return ErrChatDecisionNotOffered
+		}
+		options, _ := property["oneOf"].([]any)
+		if options == nil {
+			options, _ = property["anyOf"].([]any)
+		}
+		for _, value := range values {
+			text, ok := value.(string)
+			if !ok {
+				return ErrChatDecisionNotOffered
+			}
+			if strings.HasSuffix(name, "_custom") {
+				continue
+			}
+			offered := false
+			for _, raw := range options {
+				option, _ := raw.(map[string]any)
+				if option["const"] == text {
+					offered = true
+					break
+				}
+			}
+			if !offered {
+				return ErrChatDecisionNotOffered
+			}
+		}
+	}
+	return nil
 }
 
 // ChatInputResponder is optional because not every machine protocol supports
@@ -931,6 +1118,7 @@ const (
 	ChatControllerReady      ChatControllerState = "ready"
 	ChatControllerBusy       ChatControllerState = "busy"
 	ChatControllerRecovering ChatControllerState = "recovering"
+	ChatControllerHibernated ChatControllerState = "hibernated"
 	ChatControllerStopped    ChatControllerState = "stopped"
 )
 
@@ -1031,6 +1219,9 @@ type ChatEvent struct {
 
 	// ControllerState is set on controller.state.
 	ControllerState ChatControllerState
+	// ProviderRetained is set on stopped when only the transport detached.
+	// Durable running and queued work still belongs to the surviving provider.
+	ProviderRetained bool
 
 	// Usage is set on usage events. Nil elsewhere.
 	Usage *ChatUsage
@@ -1112,10 +1303,25 @@ type ChatProviderPreserver interface {
 	PreservesProviderOnClose() bool
 }
 
+// ChatProviderRetentionReporter reports completed transport-only detachment.
+// Stream closure can outlive or omit the final stopped notification.
+type ChatProviderRetentionReporter interface {
+	ProviderRetained() bool
+}
+
 // ChatProviderTerminator is optionally implemented when explicit session
 // destruction must do more than detach the controller.
 type ChatProviderTerminator interface {
 	Terminate() error
+}
+
+// ChatProviderHibernator stops the controller and provider process while
+// retaining the native conversation for a later Resume.
+type ChatProviderHibernator interface {
+	// CanHibernate checks provider-owned work that can outlive a settled turn.
+	// An error must leave the provider running.
+	CanHibernate(ctx context.Context) (bool, error)
+	Hibernate() error
 }
 
 // ChatLiveReconnector identifies attachment to the same initialized provider

@@ -99,8 +99,16 @@ clearly.
 - Focus on the assigned task only; no unrelated work or broad refactors.
 - Work on this session's branch ($AO_SESSION_BRANCH — the checkout you are
   already on). Do not create a different branch.
-- Do not use your runtime's built-in subagent or task-delegation tools;
-  complete the task in this session.
+- When your runtime supports native subagents or task-delegation tools, you
+  may delegate bounded portions of your assigned task to them. Delegate only
+  work that actually splits; do not fan out serial work or create activity for
+  its own sake.
+- You remain responsible for integrating subagent results, testing, reporting,
+  and this session's PR. Subagents get no broader authority than this session:
+  the same task scope, ownership, execution guards, and approval boundaries
+  apply.
+- Prevent overlapping edits: parallel subagents must be read-only or own
+  disjoint files, and no two agents may edit the same file concurrently.
 - If CI fails on your PR, fix and push again. If review comments arrive,
   address each one and push.
 %s
@@ -113,6 +121,10 @@ clearly.
   notification.
 - If a PR was already opened outside the helper, run
   `+"`ao claim-pr <number-or-url>`"+` before finishing the turn so AO can attach it.
+- When asked to review this session's PR or request an AO review, run
+  `+"`ao review trigger`"+`. It starts AO's reviewer on this session's open PRs in
+  its own reviewer terminal, which the human watches; do not review the PR
+  yourself instead. Its findings arrive here as PR review comments.
 - Only when the task asked you to review a PR: submit the verdict with the
   command described in $AO_REVIEW_HELP.
 
