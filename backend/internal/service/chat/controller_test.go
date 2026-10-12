@@ -5571,6 +5571,93 @@ func TestExplicitStopDoesNotCleanRetainedWorkAfterHostShutdownFailure(t *testing
 	}
 }
 
+func TestStopAfterRecoveryAutoDropConfirmsHostBeforeOwnedCleanup(t *testing.T) {
+	for _, scenario := range []string{"success", "no-shutdown", "generation-changed"} {
+		t.Run(scenario, func(t *testing.T) {
+			provider := &recoveryDetachedConversation{terminatingConversation: &terminatingConversation{fakeConversation: newFakeConversation()}}
+			h := newHarnessWithConversation(t, provider)
+			ctx := context.Background()
+			turn, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "auto-drop running", ClientMessageID: "auto-drop-work"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: turn.ProviderTurnID})
+			h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				return len(s.Turns) == 1 && s.Turns[0].State == domain.TurnStateRunning
+			})
+			if _, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "auto-drop queued", ClientMessageID: "auto-drop-queue"}); err != nil {
+				t.Fatal(err)
+			}
+			provider.emit(ports.ChatEvent{Kind: ports.ChatEventApprovalRequested, ProviderTurnID: turn.ProviderTurnID, RequestID: "auto-drop-approval", Summary: "Approval stays pending", Decisions: []ports.ChatDecisionOption{{ID: "allow", Label: "Allow", Kind: ports.ChatDecisionAllowOnce}}})
+			h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				return len(s.Activities) == 1 && s.Activities[0].Status == domain.ActivityStatusPending
+			})
+			provider.retained.Store(true)
+			if err := provider.Close(); err != nil {
+				t.Fatal(err)
+			}
+			h.ctrl.Wait()
+			deadline := time.Now().Add(time.Second)
+			for {
+				if _, err := h.svc.Controller(testSession); errors.Is(err, chatsvc.ErrNoController) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("recovery controller was not auto-dropped")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			var calls atomic.Int32
+			shutdown := func(context.Context, domain.SessionID) error {
+				calls.Add(1)
+				if scenario == "generation-changed" {
+					record, found, err := h.st.GetSession(ctx, testSession)
+					if err != nil || !found {
+						return fmt.Errorf("read generation: found=%v: %w", found, err)
+					}
+					record.Metadata.ControllerGeneration = "replacement-generation"
+					return h.st.UpdateSession(ctx, record)
+				}
+				return nil
+			}
+			if scenario == "no-shutdown" {
+				shutdown = nil
+			}
+			// This new service has no volatile controller; it must use captured durable ownership.
+			svc := chatsvc.New(chatsvc.Options{Store: h.st, Sessions: h.st, StopProviderHost: shutdown})
+			err = svc.Stop(ctx, testSession)
+			if scenario == "no-shutdown" && err == nil {
+				t.Fatal("missing host shutdown fallback reported success")
+			}
+			if scenario == "generation-changed" && err == nil {
+				t.Fatal("changed controller ownership reported successful Stop")
+			}
+			if scenario == "success" && err != nil {
+				t.Fatalf("Stop: %v", err)
+			}
+			wantCalls := int32(1)
+			if scenario == "no-shutdown" {
+				wantCalls = 0
+			}
+			if calls.Load() != wantCalls {
+				t.Fatalf("host shutdown calls=%d want=%d", calls.Load(), wantCalls)
+			}
+			snapshot, err := h.st.LoadConversationSnapshot(ctx, h.ctrl.ConversationID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			states := turnStateByText(t, snapshot)
+			if scenario == "success" {
+				if !states["auto-drop running"].Terminal() || !states["auto-drop queued"].Terminal() || snapshot.Activities[0].Status == domain.ActivityStatusPending {
+					t.Fatalf("confirmed Stop left retained work: turns=%+v activity=%+v", states, snapshot.Activities[0])
+				}
+			} else if states["auto-drop running"] != domain.TurnStateRunning || states["auto-drop queued"] != domain.TurnStateQueued || snapshot.Activities[0].Status != domain.ActivityStatusPending {
+				t.Fatalf("Stop cleaned unconfirmed or replacement-owned work: turns=%+v activity=%+v", states, snapshot.Activities[0])
+			}
+		})
+	}
+}
+
 func TestServiceStopAllRetainsControllerUntilItsEventStreamActuallyEnds(t *testing.T) {
 	base := newFakeConversation()
 	h := newHarnessWithConversation(t, &stuckConversation{

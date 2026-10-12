@@ -1469,7 +1469,8 @@ func (s *Service) AbortChatHandoff(id domain.SessionID) {
 	}
 }
 
-// Stop closes a session's controller. Safe to call for a session that has none.
+// Stop destroys a session's provider and settles its generation-owned work.
+// A missing controller still requires confirmed host shutdown before cleanup.
 func (s *Service) Stop(ctx context.Context, id domain.SessionID) error {
 	owner := domain.SessionConversationOwner(id)
 	gate := s.controllerGate(owner)
@@ -1486,24 +1487,36 @@ func (s *Service) Stop(ctx context.Context, id domain.SessionID) error {
 	controller, ok := s.controllers[id]
 	s.mu.RUnlock()
 	if !ok {
-		s.mu.Lock()
-		delete(s.startConfigs, owner)
-		s.mu.Unlock()
-		var stopErr error
-		if s.stopProviderHost != nil {
-			stopErr = s.stopProviderHost(ctx, id)
-			if stopErr == nil && s.sessions != nil {
-				record, found, readErr := s.sessions.GetSession(ctx, id)
-				stopErr = readErr
-				if found && readErr == nil {
-					conversation, conversationErr := s.store.ConversationForSession(ctx, id)
-					if conversationErr == nil {
-						_, stopErr = s.store.CleanupOwnedControllerWork(ctx, id, conversation.ID, record.Metadata.ControllerGeneration, s.now())
-					} else if !errors.Is(conversationErr, domain.ErrNoConversation) {
-						stopErr = conversationErr
-					}
-				}
+		if s.stopProviderHost == nil || s.sessions == nil {
+			return errors.New("retained provider shutdown or ownership is unavailable")
+		}
+		// Capture ownership before shutdown; a changed generation must not be cleaned.
+		record, found, err := s.sessions.GetSession(ctx, id)
+		if err != nil {
+			return err
+		}
+		var conversation domain.ConversationRecord
+		if found && s.store != nil {
+			conversation, err = s.store.ConversationForSession(ctx, id)
+			if err != nil && !errors.Is(err, domain.ErrNoConversation) {
+				return err
 			}
+		}
+		stopErr := s.stopProviderHost(ctx, id)
+		if found && s.store == nil {
+			stopErr = errors.Join(stopErr, errors.New("retained provider cleanup is unavailable"))
+		}
+		if stopErr == nil && conversation.ID != "" {
+			var owned bool
+			owned, stopErr = s.store.CleanupOwnedControllerWork(ctx, id, conversation.ID, record.Metadata.ControllerGeneration, s.now())
+			if stopErr == nil && !owned {
+				stopErr = errors.New("controller ownership changed during provider shutdown")
+			}
+		}
+		if stopErr == nil {
+			s.mu.Lock()
+			delete(s.startConfigs, owner)
+			s.mu.Unlock()
 		}
 		return errors.Join(stopErr, s.clearHibernation(ctx, id))
 	}
