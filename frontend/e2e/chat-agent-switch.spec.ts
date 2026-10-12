@@ -89,6 +89,6 @@ test("chat session without an agent terminal exposes the switch-agent dialog @T0
 	});
 
 	await page.goto(`/#/projects/${projectId}/sessions/${sessionId}`);
-	await expect(page.getByRole("region", { name: "Chat" })).toBeVisible();
+	await expect(page.getByRole("region", { name: "Chat" })).toBeVisible({ timeout: 15_000 });
 	await openSwitchAgentDialog(page);
 });

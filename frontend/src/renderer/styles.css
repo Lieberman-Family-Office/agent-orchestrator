@@ -2986,6 +2986,11 @@ button.automation-visibility-control:focus-visible {
 /* The draft grows to seven lines before it becomes its own scroll surface. A
    narrow inset thumb keeps long prompts legible without the platform scrollbar
    competing with the composer controls. */
+/* ponytail: Native-font fallback for draft pointer hit-testing; remove when the font regression is fixed. */
+.chat-composer-scrollbar[contenteditable="true"] {
+	font-family: Arial, sans-serif;
+}
+
 .chat-composer-scrollbar {
 	scrollbar-width: thin;
 	scrollbar-color: var(--color-scrollbar-board) transparent;

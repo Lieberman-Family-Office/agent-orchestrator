@@ -985,9 +985,9 @@ export function useConversationCommands(sessionId: string | undefined, hostId?: 
 				? { text: input }
 				: {
 					...input,
-					text: input.text.trim() || (input.excerpts?.length
-						? `Use the attached ${input.excerpts.length} chat excerpt(s) as context`
-						: input.text),
+					text: input.text.trim() || !input.excerpts?.length
+						? input.text
+						: `Use the attached ${input.excerpts.length} chat excerpt(s) as context`,
 				};
 			// React cannot disable the composer until its next render. Claim the
 			// session in the shared registry synchronously so two Enter events in the

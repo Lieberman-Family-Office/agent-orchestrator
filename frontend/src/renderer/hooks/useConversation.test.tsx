@@ -827,6 +827,17 @@ describe("useConversation snapshot mapping", () => {
 });
 
 describe("conversation branching commands", () => {
+	it("preserves authored leading and trailing whitespace in object-shaped sends", async () => {
+		postMock.mockResolvedValue({ data: {}, error: undefined });
+		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });
+		const text = "  Only my typed words\n\n  Preserve this spacing.\n\n";
+		await act(async () => { await result.current.send({ text }); });
+		expect(postMock).toHaveBeenCalledWith(
+			"/api/v1/sessions/{sessionId}/conversation/messages",
+			expect.objectContaining({ body: expect.objectContaining({ text }) }),
+		);
+	});
+
 	it("marks only attachment-bearing conversation writes as uploads", async () => {
 		postMock.mockResolvedValue({ data: {}, error: undefined });
 		const { result } = renderHook(() => useConversationCommands("ao-1"), { wrapper });

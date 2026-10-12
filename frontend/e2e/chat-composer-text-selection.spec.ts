@@ -138,7 +138,7 @@ test("clicking chat whitespace and composer padding keeps the draft caret positi
 
 test("typed chat composer text is visibly selected with a pointer drag @T0", async ({ page }) => {
 	const composer = await openChatWithDraft(page);
-
+	await page.evaluate(() => document.fonts.ready);
 	const textBounds = await composer.evaluate((element) => {
 		const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT);
 		const textNodes: Text[] = [];

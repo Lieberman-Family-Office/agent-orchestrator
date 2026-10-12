@@ -138,6 +138,7 @@ test("automation visibility is reversible and persistent without suppressing war
 	const typed = "  Only my typed words\n\n  Preserve this spacing.\n\n";
 	const composer = page.getByRole("combobox", { name: "Message the agent" });
 	await composer.fill(typed);
+	expect(await composer.textContent()).toBe(typed);
 	await page.getByRole("button", { name: "Queue message", exact: true }).click();
 	await expect.poll(() => sentTexts).toEqual([typed]);
 });
