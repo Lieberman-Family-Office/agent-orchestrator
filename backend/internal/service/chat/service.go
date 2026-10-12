@@ -2205,10 +2205,13 @@ func (s *Service) SetConfigOption(
 	settings, _ := settingsFromConfigOptions(previous, options)
 	if record.Harness == domain.HarnessClaudeCode {
 		// Only an explicit model reset may clear the durable model pin.
-		if settings.Model == "default" && configID != "model" {
-			settings.Model = previous.Model
-		} else if settings.Model == "default" {
+		if settings.Model == "default" {
 			settings.Model = ""
+			if !slices.ContainsFunc(options, func(option ports.ChatConfigOption) bool {
+				return option.ID == configID && (option.ID == "model" || option.Category == "model")
+			}) {
+				settings.Model = previous.Model
+			}
 		}
 		if settings.ReasoningEffort == "default" {
 			settings.ReasoningEffort = ""
