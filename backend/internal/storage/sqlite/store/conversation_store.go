@@ -2793,6 +2793,18 @@ func (s *Store) ResolveInputAnswer(ctx context.Context, conversationID string, s
 	return rows == 1, err
 }
 
+// ReleaseInputAnswer permits corrected or retried bytes only after definite non-delivery.
+func (s *Store) ReleaseInputAnswer(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, branchID, activityID, answerJSON string, now time.Time) (bool, error) {
+	q, unlock := s.conversationWriter(ctx)
+	defer unlock()
+	rows, err := q.ReleaseConversationInputAnswer(ctx, gen.ReleaseConversationInputAnswerParams{
+		ConversationID: conversationID, SessionID: session, ReviewID: reviewID,
+		Generation: generation, BranchID: branchID, ActivityID: activityID,
+		AnswerJson: answerJSON, UpdatedAt: now,
+	})
+	return rows == 1, err
+}
+
 // DetachQuestion keeps an unanswered clarification after its provider RPC disappears.
 func (s *Store) DetachQuestion(ctx context.Context, conversationID, requestID string, now time.Time) (bool, error) {
 	q, unlock := s.conversationWriter(ctx)

@@ -222,11 +222,13 @@ func (c *conversation) applyPersistentInteraction(command persistentInteractionC
 			c.mu.Unlock()
 			<-request.ready
 			request.mu.Lock()
-			defer request.mu.Unlock()
 			if request.resolved {
+				request.mu.Unlock()
 				return
 			}
 			request.resolved = true
+			request.accepted = command.Input
+			request.mu.Unlock()
 			c.discardInput(command.RequestID)
 			c.emit(persistentInteractionEvent(command))
 			request.result <- *command.Input

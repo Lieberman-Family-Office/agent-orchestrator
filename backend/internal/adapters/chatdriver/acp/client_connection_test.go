@@ -19,6 +19,54 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
 
+func TestInputAcceptanceReplayDoesNotWaitForHostRPC(t *testing.T) {
+	clientR, clientW := io.Pipe()
+	agentR, agentW := io.Pipe()
+	conv := &conversation{pendingInputs: make(map[string]*parkedInput), events: make(chan ports.ChatEvent, 8), proc: &process{terminate: func() error { return nil }}}
+	conv.conn = acpsdk.NewClientSideConnection(conv, clientW, agentR)
+	t.Cleanup(func() { _ = clientR.Close(); _ = clientW.Close(); _ = agentR.Close(); _ = agentW.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	answer := ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"choice": "retained"}}
+	result := make(chan ports.ChatInputResponse, 1)
+	go func() {
+		response, _ := conv.requestInput(ctx, "question", ports.ChatInputRequest{Mode: ports.ChatInputModeForm, Schema: map[string]any{"type": "object", "properties": map[string]any{"choice": map[string]any{"type": "string"}}}})
+		result <- response
+	}()
+	<-conv.events
+	resolved := make(chan error, 1)
+	go func() { resolved <- conv.ResolveInput(ctx, "question", answer) }()
+	var command struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.NewDecoder(clientR).Decode(&command); err != nil {
+		t.Fatal(err)
+	}
+	params, _ := json.Marshal(persistentInteractionCommand{RequestID: "question", EventID: "accepted-replay", Kind: persistentInteractionInput, ProviderPending: true, Input: &answer})
+	replay, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "method": persistenthost.ACPInteractionCommandMethod, "params": json.RawMessage(params)})
+	if _, err := agentW.Write(append(replay, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-conv.events:
+		if event.Kind != ports.ChatEventInputResolved {
+			t.Fatalf("event=%+v", event)
+		}
+	case <-ctx.Done():
+		t.Fatal("accepted notification blocked behind host RPC")
+	}
+	response, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": command.ID, "result": map[string]string{"eventId": "accepted-replay"}})
+	if _, err := agentW.Write(append(response, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-resolved; err != nil {
+		t.Fatal(err)
+	}
+	if got := <-result; got.Action != ports.ChatInputActionAccept {
+		t.Fatalf("answer lost: %+v", got)
+	}
+}
+
 func TestInputCancellationAndAnswerHaveOneOutcome(t *testing.T) {
 	request := ports.ChatInputRequest{Mode: ports.ChatInputModeForm, Schema: map[string]any{"type": "object", "properties": map[string]any{"choice": map[string]any{"type": "string"}}}}
 	answer := ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"choice": "retained"}}

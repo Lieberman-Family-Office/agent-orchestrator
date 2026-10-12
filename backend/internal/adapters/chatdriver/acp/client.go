@@ -1,6 +1,7 @@
 package acp
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -329,22 +330,47 @@ func (c *conversation) ResolveInput(
 		return ports.ErrChatRequestNotPending
 	}
 	request.mu.Lock()
-	defer request.mu.Unlock()
-	if request.resolved {
+	if request.resolved || request.resolving {
+		request.mu.Unlock()
 		return ports.ErrChatRequestNotPending
 	}
 	if err := validateInputResponse(request.request, response); err != nil {
+		request.mu.Unlock()
 		return err
 	}
+	request.resolving = true
+	persistent := c.proc != nil && c.proc.terminate != nil
+	if !persistent {
+		request.resolved = true
+		request.accepted = &response
+	}
+	request.mu.Unlock()
 	command := persistentInteractionCommand{
 		RequestID: requestID, Kind: persistentInteractionInput, Input: &response,
 	}
 	eventID, err := c.recordPersistentInteraction(ctx, command)
+	request.mu.Lock()
+	request.resolving = false
+	if request.resolved && persistent {
+		accepted := request.accepted
+		request.mu.Unlock()
+		if accepted != nil {
+			old, _ := json.Marshal(accepted)
+			current, _ := json.Marshal(response)
+			if bytes.Equal(old, current) {
+				return nil
+			}
+		}
+		return ports.ErrChatRequestNotPending
+	}
 	if err != nil {
+		request.mu.Unlock()
 		return err
 	}
-	command.EventID = eventID
 	request.resolved = true
+	request.accepted = &response
+	request.mu.Unlock()
+	command.EventID = eventID
 	c.discardInput(requestID)
 	c.emit(persistentInteractionEvent(command))
 	request.result <- response

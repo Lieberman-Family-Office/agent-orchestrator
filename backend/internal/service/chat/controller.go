@@ -156,6 +156,7 @@ type Store interface {
 	ConversationInput(ctx context.Context, conversationID, requestID string) (domain.ConversationActivity, error)
 	ClaimInputAnswer(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, branchID string, activity domain.ConversationActivity, answerJSON string, now time.Time) (bool, error)
 	ResolveInputAnswer(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, branchID, activityID, answerJSON string, now time.Time) (bool, error)
+	ReleaseInputAnswer(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, branchID, activityID, answerJSON string, now time.Time) (bool, error)
 	DetachQuestion(ctx context.Context, conversationID, requestID string, now time.Time) (bool, error)
 	HasPendingConversationInteractions(ctx context.Context, conversationID string) (bool, error)
 	FailPendingApprovals(ctx context.Context, conversationID string, now time.Time) error
@@ -2159,6 +2160,8 @@ func (c *Controller) ArmHandoff(
 	ctx context.Context,
 	policy domain.SessionInterfaceTransitionPolicy,
 ) error {
+	c.inputMu.Lock()
+	defer c.inputMu.Unlock()
 	c.interruptSendMu.Lock()
 	defer c.interruptSendMu.Unlock()
 	if !policy.Valid() {
@@ -2283,6 +2286,8 @@ func (c *Controller) BeginHandoff(
 // or interrupts accepted work: branch changes are refused until the user stops
 // the active turn and the durable queue is empty.
 func (c *Controller) BeginIdleBranchHandoff(ctx context.Context) error {
+	c.inputMu.Lock()
+	defer c.inputMu.Unlock()
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
 
@@ -2376,10 +2381,10 @@ func (c *Controller) ResolveInput(
 	c.inputMu.Lock()
 	defer c.inputMu.Unlock()
 	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
 	c.mu.Lock()
 	unavailable := c.handoff != controllerHandoffNone || c.preserveProviderOnStop || c.state == ports.ChatControllerStopped
 	c.mu.Unlock()
+	c.sendMu.Unlock()
 	if unavailable {
 		return ErrControllerHandoff
 	}
@@ -2396,6 +2401,7 @@ func (c *Controller) ResolveInput(
 		Action             ports.ChatInputAction `json:"action"`
 		Content            map[string]any        `json:"content"`
 		AnswerIntent       string                `json:"answerIntent"`
+		AnswerAttempt      int64                 `json:"answerAttempt"`
 	}
 	if err := json.Unmarshal(activity.Detail, &stored); err != nil {
 		return fmt.Errorf("read input detail: %w", err)
@@ -2437,7 +2443,14 @@ func (c *Controller) ResolveInput(
 	if !claimed {
 		return ports.ErrChatRequestNotPending
 	}
+	releaseRefused := func(cause error) error {
+		_, releaseErr := c.store.ReleaseInputAnswer(context.WithoutCancel(ctx), c.conversation.ID, c.sessionID, c.reviewID, c.generation, branchID, activity.ID, string(detail), c.now())
+		return errors.Join(cause, releaseErr)
+	}
 	resolveErr := responder.ResolveInput(ctx, requestID, response)
+	if errors.Is(resolveErr, ports.ErrChatDecisionNotOffered) {
+		return releaseRefused(resolveErr)
+	}
 	if resolveErr != nil {
 		if !persistent || stored.ProviderPending || !errors.Is(resolveErr, ports.ErrChatRequestNotPending) {
 			return fmt.Errorf("resolve input %s: %w", requestID, resolveErr)
@@ -2447,12 +2460,20 @@ func (c *Controller) ResolveInput(
 			if err != nil {
 				return err
 			}
-			msg := ports.ChatUserMessage{Text: "Response to an earlier unanswered question (the original tool call was interrupted):\n" + string(contextJSON), Origin: domain.MessageOriginHuman, ClientMessageID: "question-answer/" + requestID}
-			delivery, err := c.steerOrSendLocked(ctx, msg, false)
+			clientID := "question-answer/" + requestID
+			if stored.AnswerAttempt > 0 {
+				clientID += fmt.Sprintf("/%d", stored.AnswerAttempt)
+			}
+			msg := ports.ChatUserMessage{Text: "Response to an earlier unanswered question (the original tool call was interrupted):\n" + string(contextJSON), Origin: domain.MessageOriginHuman, ClientMessageID: clientID}
+			delivery, err := c.SteerOrSend(ctx, msg, false)
 			if err != nil {
+				if !errors.Is(err, ErrSteerDeliveryUncertain) && (errors.Is(err, ErrTurnNotSteerable) || errors.Is(err, ErrSteerUnsupported) || errors.Is(err, ErrSteerContentUnsupported) || errors.Is(err, ErrProviderRefused)) {
+					return releaseRefused(err)
+				}
 				return err
 			}
-			if !delivery.Steered && (delivery.Turn.ProviderTurnID == "" || (delivery.Turn.State != domain.TurnStateRunning && delivery.Turn.State != domain.TurnStateCompleted)) {
+			_, deferred := c.conv.(ports.ChatDeferredTurnStarter)
+			if !delivery.Steered && (delivery.Turn.ProviderTurnID == "" || (delivery.Turn.State != domain.TurnStateCompleted && (deferred || delivery.Turn.State != domain.TurnStateRunning))) {
 				return fmt.Errorf("%w: earlier question answer has no proven provider acceptance", ErrSteerDeliveryUncertain)
 			}
 		}

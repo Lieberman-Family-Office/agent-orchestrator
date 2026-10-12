@@ -58,11 +58,13 @@ type parkedPermission struct {
 }
 
 type parkedInput struct {
-	mu       sync.Mutex
-	resolved bool
-	request  ports.ChatInputRequest
-	result   chan ports.ChatInputResponse
-	ready    chan struct{}
+	mu        sync.Mutex
+	resolved  bool
+	resolving bool
+	accepted  *ports.ChatInputResponse
+	request   ports.ChatInputRequest
+	result    chan ports.ChatInputResponse
+	ready     chan struct{}
 }
 
 type toolState struct {

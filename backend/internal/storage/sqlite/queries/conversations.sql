@@ -1287,6 +1287,23 @@ WHERE conversation_activities.id = sqlc.arg(activity_id) AND conversation_activi
       AND NOT EXISTS (SELECT 1 FROM session_interface_transitions tr WHERE tr.session_id = s.id AND tr.phase NOT IN ('completed','failed','cancelled','recovery_required'))
   );
 
+-- A definitive refusal releases only these claimed bytes and advances a retry identity.
+-- name: ReleaseConversationInputAnswer :execrows
+UPDATE conversation_activities
+SET detail_json = json_set(json_remove(detail_json, '$.answerIntent'), '$.answerAttempt', COALESCE(json_extract(detail_json, '$.answerAttempt'), 0) + 1),
+    revision = revision + 1, updated_at = sqlc.arg(updated_at)
+WHERE conversation_activities.id = sqlc.arg(activity_id) AND conversation_activities.conversation_id = sqlc.arg(conversation_id)
+  AND kind = 'user_input' AND status = 'pending'
+  AND json_extract(detail_json, '$.answerIntent') = sqlc.arg(answer_json)
+  AND EXISTS (
+    SELECT 1 FROM conversations c JOIN sessions s ON s.id = sqlc.arg(session_id)
+    LEFT JOIN review r ON r.id = c.current_review_id
+    WHERE c.id = conversation_activities.conversation_id AND c.active_branch_id = sqlc.arg(branch_id)
+      AND s.is_terminated = 0
+      AND ((sqlc.arg(review_id) = '' AND c.current_session_id = s.id AND s.session_mode = 'chat' AND s.controller_generation = sqlc.arg(generation))
+        OR (sqlc.arg(review_id) <> '' AND c.current_review_id = sqlc.arg(review_id) AND r.session_id = s.id AND r.interface_mode = 'chat' AND r.controller_generation = sqlc.arg(generation)))
+  );
+
 -- name: SelectConversationActivityByRequest :one
 SELECT * FROM conversation_activities WHERE conversation_id = ? AND request_id = ?;
 

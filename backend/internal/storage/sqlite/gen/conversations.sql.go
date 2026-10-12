@@ -1812,6 +1812,52 @@ func (q *Queries) RejectConversationSteerDelivery(ctx context.Context, arg Rejec
 	return result.RowsAffected()
 }
 
+const releaseConversationInputAnswer = `-- name: ReleaseConversationInputAnswer :execrows
+UPDATE conversation_activities
+SET detail_json = json_set(json_remove(detail_json, '$.answerIntent'), '$.answerAttempt', COALESCE(json_extract(detail_json, '$.answerAttempt'), 0) + 1),
+    revision = revision + 1, updated_at = ?1
+WHERE conversation_activities.id = ?2 AND conversation_activities.conversation_id = ?3
+  AND kind = 'user_input' AND status = 'pending'
+  AND json_extract(detail_json, '$.answerIntent') = ?4
+  AND EXISTS (
+    SELECT 1 FROM conversations c JOIN sessions s ON s.id = ?5
+    LEFT JOIN review r ON r.id = c.current_review_id
+    WHERE c.id = conversation_activities.conversation_id AND c.active_branch_id = ?6
+      AND s.is_terminated = 0
+      AND ((?7 = '' AND c.current_session_id = s.id AND s.session_mode = 'chat' AND s.controller_generation = ?8)
+        OR (?7 <> '' AND c.current_review_id = ?7 AND r.session_id = s.id AND r.interface_mode = 'chat' AND r.controller_generation = ?8))
+  )
+`
+
+type ReleaseConversationInputAnswerParams struct {
+	UpdatedAt      time.Time
+	ActivityID     string
+	ConversationID string
+	AnswerJson     string
+	SessionID      domain.SessionID
+	BranchID       string
+	ReviewID       interface{}
+	Generation     string
+}
+
+// A definitive refusal releases only these claimed bytes and advances a retry identity.
+func (q *Queries) ReleaseConversationInputAnswer(ctx context.Context, arg ReleaseConversationInputAnswerParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, releaseConversationInputAnswer,
+		arg.UpdatedAt,
+		arg.ActivityID,
+		arg.ConversationID,
+		arg.AnswerJson,
+		arg.SessionID,
+		arg.BranchID,
+		arg.ReviewID,
+		arg.Generation,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const releaseQueuedConversationTurnPromotion = `-- name: ReleaseQueuedConversationTurnPromotion :execrows
 UPDATE conversation_turns
 SET promotion_started_at = NULL
