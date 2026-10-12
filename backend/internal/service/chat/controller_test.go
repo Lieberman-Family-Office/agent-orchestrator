@@ -241,6 +241,13 @@ func (c *terminatingConversation) Terminate() error {
 
 func (c *terminatingConversation) PreservesProviderOnClose() bool { return true }
 
+type recoveryDetachedConversation struct {
+	*terminatingConversation
+	retained atomic.Bool
+}
+
+func (c *recoveryDetachedConversation) ProviderRetained() bool { return c.retained.Load() }
+
 type liveReconnectedConversation struct{ *nativeHistoryConversation }
 
 func (c *liveReconnectedConversation) ReconnectedLive() bool { return true }
@@ -5889,6 +5896,69 @@ func TestServiceLiveReconnectKeepsDurableRunningTurnBusy(t *testing.T) {
 	}
 	if got := secondProvider.sentTexts(); len(got) != 0 {
 		t.Fatalf("reconnected provider received concurrent turns: %v", got)
+	}
+}
+
+func TestAdapterRecoveryDetachPreservesRunningTurnForAdoption(t *testing.T) {
+	for _, stoppedEvent := range []string{"explicit", "unmarked", "omitted"} {
+		t.Run(stoppedEvent, func(t *testing.T) { testAdapterRecoveryDetachPreservesRunningTurnForAdoption(t, stoppedEvent) })
+	}
+}
+
+func testAdapterRecoveryDetachPreservesRunningTurnForAdoption(t *testing.T, stoppedEvent string) {
+	provider := &recoveryDetachedConversation{terminatingConversation: &terminatingConversation{fakeConversation: newFakeConversation()}}
+	h := newHarnessWithConversation(t, provider)
+	ctx := context.Background()
+	running, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "keep running", ClientMessageID: "retain-running"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: running.ProviderTurnID})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Turns) == 1 && s.Turns[0].State == domain.TurnStateRunning
+	})
+	queued, err := h.ctrl.Send(ctx, ports.ChatUserMessage{Text: "after recovery", ClientMessageID: "retain-queued"})
+	if err != nil || queued.State != domain.TurnStateQueued {
+		t.Fatalf("queue: %+v %v", queued, err)
+	}
+	// A receipt failure makes the adapter detach itself, not Controller.Close.
+	provider.retained.Store(true)
+	if stoppedEvent != "omitted" {
+		provider.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: ports.ChatControllerStopped, ProviderRetained: stoppedEvent == "explicit"})
+	}
+	if err := provider.Close(); err != nil {
+		t.Fatal(err)
+	}
+	h.ctrl.Wait()
+	before, err := h.st.LoadConversationSnapshot(ctx, h.ctrl.ConversationID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	states := turnStateByText(t, before)
+	if states["keep running"] != domain.TurnStateRunning || states["after recovery"] != domain.TurnStateQueued {
+		t.Fatalf("recovery detach destroyed durable ownership: %+v", states)
+	}
+	if provider.terminated.Load() || h.hostStops.Load() != 0 {
+		t.Fatal("recovery terminated the retained provider")
+	}
+	adopted := &liveReconnectedConversation{nativeHistoryConversation: &nativeHistoryConversation{fakeConversation: newFakeConversation()}}
+	var ids atomic.Int32
+	replacement := chatsvc.New(chatsvc.Options{Store: h.st, Reader: fullSnapshotReader(h.st), Sessions: h.st, Drivers: fakeRegistry{driver: fakeDriver{conv: adopted}}, Log: slog.New(slog.DiscardHandler), NewID: func() string { return fmt.Sprintf("recovery-adoption-%d", ids.Add(1)) }})
+	t.Cleanup(func() { replacement.StopAll(context.Background()) })
+	ctrl, err := replacement.Start(ctx, chatsvc.StartConfig{SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex, WorkspacePath: t.TempDir(), ProviderConversationID: provider.ProviderConversationID()})
+	if err != nil {
+		t.Fatalf("retained host adoption: %v", err)
+	}
+	if ctrl.State() != ports.ChatControllerBusy || ctrl.ConversationID() != h.ctrl.ConversationID() {
+		t.Fatalf("adoption lost active conversation: state=%s conversation=%s", ctrl.State(), ctrl.ConversationID())
+	}
+	adopted.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: running.ProviderTurnID, TurnState: domain.TurnStateCompleted})
+	awaitStoreSnapshot(t, h.st, ctrl.ConversationID(), func(s store.ConversationSnapshot) bool {
+		states := turnStateByText(t, s)
+		return states["keep running"] == domain.TurnStateCompleted && states["after recovery"] == domain.TurnStateRunning
+	})
+	if sent := adopted.sentTexts(); !reflect.DeepEqual(sent, []string{"after recovery"}) {
+		t.Fatalf("retained queue delivery: %v", sent)
 	}
 }
 

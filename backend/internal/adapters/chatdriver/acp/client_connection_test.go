@@ -259,6 +259,25 @@ func testWorkerYieldDetachesWhenReceiptRecoveryFails(t *testing.T, withAnswer bo
 	case <-ctx.Done():
 		t.Fatal("receipt failure stranded the callback until cancellation")
 	}
+	for {
+		select {
+		case event, ok := <-conv.Events():
+			if !ok {
+				if !conv.ProviderRetained() {
+					t.Fatal("recovery stream lost independent retained-provider state")
+				}
+				return
+			}
+			if event.Kind == ports.ChatEventControllerState && event.ControllerState == ports.ChatControllerStopped {
+				if !event.ProviderRetained {
+					t.Fatal("recovery detach would clean up retained running work")
+				}
+				return
+			}
+		case <-ctx.Done():
+			t.Fatal("recovery did not report its retained provider")
+		}
+	}
 }
 
 func TestWorkerYieldRecoversAnswerWhoseAcceptanceAckWasLost(t *testing.T) {

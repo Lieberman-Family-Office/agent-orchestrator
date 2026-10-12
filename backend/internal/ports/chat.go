@@ -1219,6 +1219,9 @@ type ChatEvent struct {
 
 	// ControllerState is set on controller.state.
 	ControllerState ChatControllerState
+	// ProviderRetained is set on stopped when only the transport detached.
+	// Durable running and queued work still belongs to the surviving provider.
+	ProviderRetained bool
 
 	// Usage is set on usage events. Nil elsewhere.
 	Usage *ChatUsage
@@ -1298,6 +1301,12 @@ type ChatConversation interface {
 // daemon-side controller and deliberately leaves provider work alive.
 type ChatProviderPreserver interface {
 	PreservesProviderOnClose() bool
+}
+
+// ChatProviderRetentionReporter reports completed transport-only detachment.
+// Stream closure can outlive or omit the final stopped notification.
+type ChatProviderRetentionReporter interface {
+	ProviderRetained() bool
 }
 
 // ChatProviderTerminator is optionally implemented when explicit session

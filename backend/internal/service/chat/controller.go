@@ -2961,9 +2961,20 @@ func (c *Controller) project() {
 	// controller, and must keep persisting until the provider stream ends.
 	ctx := context.WithoutCancel(context.Background())
 	acknowledger, persistent := c.conv.(ports.ChatProviderEventAcknowledger)
+	retainedProvider := func() bool {
+		preserver, persistent := c.conv.(ports.ChatProviderPreserver)
+		reporter, observed := c.conv.(ports.ChatProviderRetentionReporter)
+		return persistent && preserver.PreservesProviderOnClose() && observed && reporter.ProviderRetained()
+	}
 
 	for event := range c.conv.Events() {
 		c.mu.Lock()
+		if event.Kind == ports.ChatEventControllerState && event.ControllerState == ports.ChatControllerStopped && (event.ProviderRetained || retainedProvider()) {
+			if preserver, ok := c.conv.(ports.ChatProviderPreserver); ok && preserver.PreservesProviderOnClose() {
+				c.preserveProviderOnStop = true
+				c.state = ports.ChatControllerStopped
+			}
+		}
 		preserveWork := c.preserveProviderOnStop || c.handoff == controllerHandoffHibernate
 		c.mu.Unlock()
 		if preserveWork && event.Kind == ports.ChatEventControllerState && event.ControllerState == ports.ChatControllerStopped {
@@ -3017,7 +3028,7 @@ func (c *Controller) project() {
 	c.mu.Lock()
 	c.state = ports.ChatControllerStopped
 	suppressStoppedActivity := c.suppressStoppedActivity
-	preserveProvider := c.preserveProviderOnStop
+	preserveProvider := c.preserveProviderOnStop || retainedProvider()
 	hibernating := c.handoff == controllerHandoffHibernate
 	c.mu.Unlock()
 	// Hibernate admitted no running work, but Send can append an optimistic

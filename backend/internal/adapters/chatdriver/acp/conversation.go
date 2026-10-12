@@ -350,6 +350,12 @@ func (c *conversation) Events() <-chan ports.ChatEvent { return c.events }
 // conversation is backed by the daemon-independent host.
 func (c *conversation) PreservesProviderOnClose() bool { return c.proc.terminate != nil }
 
+func (c *conversation) ProviderRetained() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.detaching
+}
+
 // ReconnectedLive distinguishes the same initialized ACP connection from a
 // replacement process recovered with session/load or session/resume.
 func (c *conversation) ReconnectedLive() bool { return c.proc.reconnected }
@@ -1050,7 +1056,7 @@ func (c *conversation) watchConnection() {
 		c.failPendingPermissions()
 		c.failPendingInputs()
 	}
-	c.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: ports.ChatControllerStopped})
+	c.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: ports.ChatControllerStopped, ProviderRetained: detaching})
 	c.eventMu.Lock()
 	if !c.eventsClosed {
 		c.eventsClosed = true
