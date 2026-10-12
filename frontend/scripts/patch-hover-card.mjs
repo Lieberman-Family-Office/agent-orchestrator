@@ -16,9 +16,10 @@ const files = ["index.mjs", "index.js"].map(name => {
 	const path = join(directory, name);
 	let source = readFileSync(path, "utf8");
 	for (const [original, patched] of replacements) {
-		if (source.split(patched).length === 2) continue;
-		assert.equal(source.split(original).length, 2, `HoverCard timer shape changed in ${name}.`);
-		source = source.replace(original, patched);
+		const originalCount = source.split(original).length - 1;
+		const patchedCount = source.split(patched).length - 1;
+		assert.ok((originalCount === 1 && patchedCount === 0) || (originalCount === 0 && patchedCount === 1), `HoverCard timer shape changed in ${name}.`);
+		if (originalCount === 1) source = source.replace(original, patched);
 	}
 	return { path, source };
 });
