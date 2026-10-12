@@ -420,6 +420,7 @@ func repairCustom0134MigrationHistory(db *sql.DB) error {
 			if err != nil {
 				return err
 			}
+			body = bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
 			for _, name := range []string{"projects_revision_guard", "projects_revision_update"} {
 				start := bytes.Index(body, []byte("CREATE TRIGGER "+name+"\n"))
 				if start < 0 {

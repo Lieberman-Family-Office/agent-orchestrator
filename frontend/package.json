@@ -13,6 +13,7 @@
 		"url": "https://github.com/aoagents/agent-orchestrator"
 	},
 	"scripts": {
+		"postinstall": "node ./scripts/patch-hover-card.mjs",
 		"build:acp-runtime": "node ./scripts/build-acp-runtime.mjs",
 		"build:tmux": "node ./scripts/build-tmux.mjs",
 		"browser-runtime:prepare": "node ./scripts/prepare-agent-browser.mjs",

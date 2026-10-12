@@ -24,8 +24,8 @@ func TestCustom0134HistoryRepairRollsBackIncompleteSchema(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := repairCustom0134MigrationHistory(db); err == nil {
-		t.Fatal("partial interrupt schema accepted")
+	if err := repairCustom0134MigrationHistory(db); err == nil || !strings.Contains(err.Error(), "custom migration 191 has incomplete or incompatible columns") {
+		t.Fatalf("partial interrupt schema was not refused for incomplete columns: %v", err)
 	}
 	var original, remapped int
 	if err := db.QueryRow(`SELECT (SELECT COUNT(*) FROM goose_db_version WHERE version_id=190),(SELECT COUNT(*) FROM goose_db_version WHERE version_id=195)`).Scan(&original, &remapped); err != nil || original != 1 || remapped != 0 {

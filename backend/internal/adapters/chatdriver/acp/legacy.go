@@ -63,6 +63,15 @@ type legacyACPResponse struct {
 	err error
 }
 
+type legacyACPEnvelope struct {
+	JSONRPC string               `json:"jsonrpc"`
+	ID      *json.RawMessage     `json:"id,omitempty"`
+	Method  string               `json:"method,omitempty"`
+	Params  json.RawMessage      `json:"params,omitempty"`
+	Result  json.RawMessage      `json:"result,omitempty"`
+	Error   *acpsdk.RequestError `json:"error,omitempty"`
+}
+
 const localNotificationBarrierMethod = "_ao/local_notification_barrier"
 
 func newLegacyACPTransport(stdin io.WriteCloser, stdout io.Reader, updateProcessed <-chan string, streamDone <-chan struct{}) (*legacyACPTransport, io.WriteCloser, io.Reader) {
@@ -83,18 +92,19 @@ func (t *legacyACPTransport) forward(source io.Reader, destination *io.PipeWrite
 	reader := bufio.NewReader(source)
 	for {
 		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 && !t.intercept(line) {
-			// Match the SDK's complete envelope decode before expecting its callback.
-			var notification struct {
-				JSONRPC string               `json:"jsonrpc"`
-				ID      *json.RawMessage     `json:"id,omitempty"`
-				Method  string               `json:"method,omitempty"`
-				Params  json.RawMessage      `json:"params,omitempty"`
-				Result  json.RawMessage      `json:"result,omitempty"`
-				Error   *acpsdk.RequestError `json:"error,omitempty"`
-			}
+		// Decode once for interception and SDK-compatible notification admission.
+		var notification legacyACPEnvelope
+		decoded := json.Unmarshal(line, &notification) == nil
+		var intercepted bool
+		if decoded {
+			intercepted = t.interceptEnvelope(notification)
+		} else {
+			// Legacy responses historically ignore unrelated malformed envelope fields.
+			intercepted = t.intercept(line)
+		}
+		if len(line) > 0 && !intercepted {
 			ackID := ""
-			if json.Unmarshal(line, &notification) == nil {
+			if decoded {
 				// This method belongs only to this local transport, never the provider.
 				if notification.Method == localNotificationBarrierMethod {
 					_ = destination.CloseWithError(errors.New("provider used reserved ACP barrier method"))
@@ -150,9 +160,12 @@ func (t *legacyACPTransport) intercept(line []byte) bool {
 	if err := json.Unmarshal(line, &envelope); err != nil {
 		return false
 	}
+	return t.interceptEnvelope(legacyACPEnvelope{ID: &envelope.ID, Result: envelope.Result, Error: envelope.Error})
+}
 
+func (t *legacyACPTransport) interceptEnvelope(envelope legacyACPEnvelope) bool {
 	var requestID string
-	if len(envelope.ID) > 0 && json.Unmarshal(envelope.ID, &requestID) == nil &&
+	if envelope.ID != nil && len(*envelope.ID) > 0 && json.Unmarshal(*envelope.ID, &requestID) == nil &&
 		strings.HasPrefix(requestID, "ao-legacy-") {
 		t.mu.Lock()
 		pending := t.pending[requestID]
