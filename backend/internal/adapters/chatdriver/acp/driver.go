@@ -562,8 +562,8 @@ func (d *Driver) initialize(
 			}
 		}
 		steering, _ := init.Meta["steering"].(map[string]any)
-		conv.workerSafeBoundary = steering["aoWorkerSafeBoundary"] == true && steering["aoWorkerQuestionYield"] == true && steering["aoWorkerQuestionOwnership"] == true && steering["aoGuidanceStopFence"] == true
-		conv.humanSafeBoundary = steering["aoHumanSafeBoundary"] == true && steering["aoGuidanceStopFence"] == true
+		conv.workerSafeBoundary = steering["aoWorkerSafeBoundary"] == true && steering["aoWorkerQuestionYield"] == true && steering["aoWorkerQuestionOwnership"] == true && steering["aoGuidanceStopFence"] == float64(2)
+		conv.humanSafeBoundary = steering["aoHumanSafeBoundary"] == true && steering["aoGuidanceStopFence"] == float64(2)
 		return conv, init, state, nil
 	}
 
@@ -616,8 +616,8 @@ func (d *Driver) initialize(
 		}
 	}
 	steering, _ := init.Meta["steering"].(map[string]any)
-	conv.workerSafeBoundary = steering["aoWorkerSafeBoundary"] == true && steering["aoWorkerQuestionYield"] == true && steering["aoWorkerQuestionOwnership"] == true && steering["aoGuidanceStopFence"] == true
-	conv.humanSafeBoundary = steering["aoHumanSafeBoundary"] == true && steering["aoGuidanceStopFence"] == true
+	conv.workerSafeBoundary = steering["aoWorkerSafeBoundary"] == true && steering["aoWorkerQuestionYield"] == true && steering["aoWorkerQuestionOwnership"] == true && steering["aoGuidanceStopFence"] == float64(2)
+	conv.humanSafeBoundary = steering["aoHumanSafeBoundary"] == true && steering["aoGuidanceStopFence"] == float64(2)
 	return conv, init, nil, nil
 }
 

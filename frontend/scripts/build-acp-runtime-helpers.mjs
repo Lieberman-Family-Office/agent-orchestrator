@@ -170,8 +170,8 @@ export function patchClaudeQueuedStop(sdkPath) {
 // ponytail: This pinned bridge patch must be replaced with upstream support when available.
 export function patchClaudeWorkerSteering(adapterPath) {
 	const source = readFileSync(adapterPath, "utf8");
-	if (source.includes("// AO: worker safe-boundary steering v5.")) return false;
-	if (source.includes("// AO: worker safe-boundary steering.") || source.includes("// AO: worker safe-boundary steering v2.") || source.includes("// AO: worker safe-boundary steering v3.") || source.includes("// AO: worker safe-boundary steering v4.")) {
+	if (source.includes("// AO: worker safe-boundary steering v6.")) return false;
+	if (source.includes("// AO: worker safe-boundary steering.") || source.includes("// AO: worker safe-boundary steering v2.") || source.includes("// AO: worker safe-boundary steering v3.") || source.includes("// AO: worker safe-boundary steering v4.") || source.includes("// AO: worker safe-boundary steering v5.")) {
 		throw new Error("claude-agent-acp has obsolete worker steering; rebuild from the pinned package");
 	}
 	const validation = "    return {\n        sessionId,\n        prompt: prompt,";
@@ -191,7 +191,7 @@ export function patchClaudeWorkerSteering(adapterPath) {
 			throw new Error("claude-agent-acp no longer matches AO's worker steering patch");
 		}
 	}
-	const validateWorker = `    // AO: worker safe-boundary steering v5.
+	const validateWorker = `    // AO: worker safe-boundary steering v6.
     if (steering?.priority !== undefined && steering.priority !== "next") {
         throw RequestError.invalidParams(undefined, "invalid worker steering priority");
     }
@@ -221,10 +221,28 @@ export function patchClaudeWorkerSteering(adapterPath) {
 		.replace(validation, validateWorker + validation)
 		.replace(priority, delivery)
 		.replace(injected, 'return { outcome: "injected", workerEpoch: session.aoWorkerSteeringEpoch ?? 0, workerPending: workerSteering?.senderSessionId !== undefined && session.aoWorkerSteering?.has(steeredUuid) === true };')
-		.replace(capability, capability + "\n                    aoHumanSafeBoundary: true,\n                    aoGuidanceStopFence: true,\n                    aoWorkerSafeBoundary: true,\n                    aoWorkerQuestionYield: true,\n                    aoWorkerQuestionOwnership: true,")
+		.replace(capability, capability + "\n                    aoHumanSafeBoundary: true,\n                    aoGuidanceStopFence: 2,\n                    aoWorkerSafeBoundary: true,\n                    aoWorkerQuestionYield: true,\n                    aoWorkerQuestionOwnership: true,")
 		.replace(initLifecycle, initLifecycle + '\n                                if (message.capabilities?.includes("interrupt_cancel_queued_v1")) session.aoInterruptCancelQueued = true;')
-		.replace(stop, stop + '\n        for (const message of session.aoPendingGuidance?.values() ?? []) message.aoCancelled = true;\n        session.aoPendingGuidance?.clear();\n        session.aoWorkerSteering?.clear();')
-		.replace(interrupt, 'const receipt = await session.query.interrupt(session.aoInterruptCancelQueued ? { cancelQueued: true } : undefined);\n        if (session.aoInterruptCancelQueued && (!Array.isArray(receipt?.still_queued) || receipt.still_queued.length !== 0)) {\n            throw new Error("native Stop did not confirm queued guidance cancellation");\n        }')
+		.replace(stop, stop + '\n        const aoCancelledGuidance = new Set(session.aoPendingGuidance?.keys() ?? []);\n        const aoGuidanceOrphanCount = [...session.activeTurn?.steeredEchoes ?? []].filter(uuid => aoCancelledGuidance.has(uuid)).length;\n        for (const message of session.aoPendingGuidance?.values() ?? []) message.aoCancelled = true;\n        session.aoPendingGuidance?.clear();\n        session.aoWorkerSteering?.clear();')
+		.replace(interrupt, `let receipt;
+        try {
+            receipt = await session.query.interrupt(session.aoInterruptCancelQueued ? { cancelQueued: true } : undefined);
+            if (session.aoInterruptCancelQueued && (!Array.isArray(receipt?.still_queued) || receipt.still_queued.length !== 0)) {
+                throw new Error("native Stop did not confirm queued guidance cancellation");
+            }
+        } catch (error) {
+            this.closeQueryStream(session);
+            throw error;
+        }
+        if (session.aoInterruptCancelQueued) {
+            if (lifecycleLane) {
+                for (const uuid of aoCancelledGuidance) {
+                    if (session.orphanCommands?.get(uuid) === "pending") session.orphanCommands.delete(uuid);
+                }
+            } else {
+                session.pendingOrphanResults = Math.max(0, (session.pendingOrphanResults ?? 0) - aoGuidanceOrphanCount);
+            }
+        }`)
 		.replace(questionMethod, 'async handleAskUserQuestion(sessionId, toolInput, toolUseID, signal, agentID, parentToolUseId) {')
 		.replace(questionCall, 'return this.handleAskUserQuestion(sessionId, toolInput, toolUseID, signal, agentID, parentToolUseId);')
 		.replace(questionRequest, questionRequest + '\n        // ponytail: Subagent questions retain their callback until owner-targeted continuation exists.\n        createRequest._meta = { ...createRequest._meta, aoQuestionAgentId: agentID, aoQuestionParentToolUseId: parentToolUseId, aoWorkerQuestionEpoch: this.sessions[sessionId]?.aoWorkerSteeringEpoch ?? 0, aoWorkerQuestionYield: agentID || parentToolUseId ? false : this.sessions[sessionId]?.aoWorkerSteering?.size > 0 ? "automatic-worker-deferral" : true };')

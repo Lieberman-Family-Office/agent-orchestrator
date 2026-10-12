@@ -72,7 +72,7 @@ func TestClaudeWorkerUpdateKeepsQuestionAndDeliversAnswerOnce(t *testing.T) {
 	if os.Getenv("AO_LIVE_CLAUDE_QUESTION") != "1" {
 		t.Skip("set AO_LIVE_CLAUDE_QUESTION=1 with the candidate ACP runtime")
 	}
-	d, project, _ := isolatedClaudeRouter(t, nil, false)
+	d, project, config := isolatedClaudeRouter(t, nil, false)
 	// Use the native provider's configured model; AO receives no explicit model override.
 	session := spawn(t, d, map[string]any{"projectId": project, "kind": "worker", "harness": "claude-code", "mode": "chat", "prompt": "This is an isolated acceptance test. Use only AskUserQuestion. Ask 'Which color?' with Blue and Red options. Do not invent an answer. Independent worker results can be acknowledged before this question is answered. After receiving the color answer, acknowledge it in plain text and end the turn. Do not run tools or submit reports after acknowledging it."}).Session.ID
 	question := func(s snapshot) (activity, bool) {
@@ -112,14 +112,15 @@ func TestClaudeWorkerUpdateKeepsQuestionAndDeliversAnswerOnce(t *testing.T) {
 	}
 	// ACP starts a new turn asynchronously. A 409 keeps the form pending until
 	// the accepted continuation completes; retry the identical answer to recover it.
-	d.awaitConversation(session, 2*time.Minute, "the accepted answer continuation", func(s snapshot) bool {
-		return len(s.Turns) > len(after.Turns) && terminal(s.Turns[len(s.Turns)-1].State)
+	continuation := d.awaitConversation(session, 2*time.Minute, "the completed answer continuation", func(s snapshot) bool {
+		return len(s.Turns) > len(after.Turns) && s.Turns[len(s.Turns)-1].State == "completed"
 	})
+	answerTurnID := continuation.Turns[len(continuation.Turns)-1].ID
 	d.mustCall("POST", resolvePath, http.StatusNoContent, answer, nil)
 	answered := d.awaitConversation(session, 2*time.Minute, "the delayed human answer", func(s snapshot) bool {
 		for _, a := range s.Activities {
 			if a.RequestID == form.RequestID && a.Status == "resolved" {
-				return len(s.Turns) > len(after.Turns) && terminal(s.Turns[len(s.Turns)-1].State)
+				return len(s.Turns) > len(after.Turns) && s.Turns[len(s.Turns)-1].State == "completed"
 			}
 		}
 		return false
@@ -133,12 +134,80 @@ func TestClaudeWorkerUpdateKeepsQuestionAndDeliversAnswerOnce(t *testing.T) {
 		}
 		return n
 	}
-	if countAnswers(answered) != 1 || !strings.Contains(answered.assistantText(), "Blue") {
-		t.Fatalf("delayed answer missing or repeated: %s", describe(answered))
+	answerText, answerPrompt := "", ""
+	for _, m := range answered.Messages {
+		if m.TurnID != answerTurnID {
+			continue
+		}
+		if m.Role == "assistant" {
+			answerText += m.Text
+		} else if m.Role == "user" && m.Origin == "human" {
+			answerPrompt = m.Text
+		}
+	}
+	if countAnswers(answered) != 1 || !strings.Contains(answerText, "Blue") || !strings.Contains(answerPrompt, "Response to an earlier unanswered question") {
+		t.Fatalf("completed answer turn lacks its own acknowledgement or duplicated input: %s", describe(answered))
+	}
+	countNativeAnswers := func() int {
+		t.Helper()
+		files, err := filepath.Glob(filepath.Join(config, "projects", "*", "*.jsonl"))
+		if err != nil || len(files) == 0 {
+			t.Fatalf("answer native transcript unavailable: files=%d error=%v", len(files), err)
+		}
+		inputs := make(map[string]bool)
+		for _, file := range files {
+			data, err := os.ReadFile(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, line := range strings.Split(string(data), "\n") {
+				if strings.TrimSpace(line) == "" {
+					continue
+				}
+				var event struct {
+					Type    string `json:"type"`
+					UUID    string `json:"uuid"`
+					Message struct {
+						Content json.RawMessage `json:"content"`
+					} `json:"message"`
+				}
+				if err := json.Unmarshal([]byte(line), &event); err != nil {
+					t.Fatal(err)
+				}
+				if event.Type != "user" {
+					continue
+				}
+				var text string
+				if json.Unmarshal(event.Message.Content, &text) != nil {
+					var blocks []struct {
+						Type string `json:"type"`
+						Text string `json:"text"`
+					}
+					if json.Unmarshal(event.Message.Content, &blocks) != nil {
+						continue
+					}
+					for _, block := range blocks {
+						if block.Type == "text" {
+							text += block.Text
+						}
+					}
+				}
+				if text == answerPrompt {
+					if event.UUID == "" {
+						t.Fatal("native answer input lacked an identity")
+					}
+					inputs[event.UUID] = true
+				}
+			}
+		}
+		return len(inputs)
+	}
+	if got := countNativeAnswers(); got != 1 {
+		t.Fatalf("native answer inputs=%d, want one", got)
 	}
 	d.mustCall("POST", resolvePath, http.StatusNoContent, answer, nil)
-	if repeated := d.conversation(session); countAnswers(repeated) != 1 || len(repeated.Turns) != len(answered.Turns) {
-		t.Fatalf("repeated answer opened another turn: %s", describe(repeated))
+	if repeated := d.conversation(session); countAnswers(repeated) != 1 || len(repeated.Turns) != len(answered.Turns) || countNativeAnswers() != 1 {
+		t.Fatalf("repeated answer opened another AO or native delivery: %s", describe(repeated))
 	}
 	t.Logf("PASS full daemon/SQLite/ACP/model: worker processed; question %s retained; delayed human answer delivered once", form.RequestID)
 }
@@ -228,6 +297,15 @@ func TestClaudeHumanGuidanceDoesNotCancelToolAndStopsPendingGuidance(t *testing.
 	if strings.Contains(stopped.assistantText(), pendingToken) {
 		t.Fatalf("pending guidance executed after Stop: %s", describe(stopped))
 	}
+	contextTurn, _ := send(t, d, session, "/context", "echo-less-after-stop")
+	d.awaitConversation(session, 2*time.Minute, "an echo-less native command after Stop without orphan debt", func(s snapshot) bool {
+		for _, turn := range s.Turns {
+			if turn.ID == contextTurn {
+				return turn.State == "completed"
+			}
+		}
+		return false
+	})
 	const laterToken = "NEW_PROMPT_AFTER_STOP_b1f4"
 	laterTurn, _ := send(t, d, session, "Reply with exactly "+laterToken+". Do not call tools or process earlier cancelled guidance.", "fresh-after-stop")
 	final := d.awaitConversation(session, 2*time.Minute, "a fresh prompt after Stop without surviving guidance", func(s snapshot) bool {
