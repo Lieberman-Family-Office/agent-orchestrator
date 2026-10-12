@@ -55,6 +55,16 @@ function commandLifecycle(message) {
                         case "started": break;
                     }
 }
+function initializeMessage(message) {
+ switch (message.subtype) {
+                            case "init": break;
+ }
+}
+async function cancelFixture() {
+        session.cancelled = true;
+ const receipt = await session.query.interrupt();
+ return receipt;
+}
 const initialized = { steering: {
                     supported: true,
                 } };
@@ -70,9 +80,9 @@ return { parseSteerRequest, agent, initialized, handleAskUserQuestion: questionB
 	assert.equal(helpers.patchClaudeWorkerSteering(adapter), true);
 	assert.equal(helpers.patchClaudeWorkerSteering(adapter), false);
 	const pushed = [];
-	const session = { input: { push: message => pushed.push(message) } };
+	const session = { aoInterruptCancelQueued: true, input: { push: message => pushed.push(message) } };
 	const { parseSteerRequest, agent, initialized, handleAskUserQuestion, commandLifecycle } = new Function("session", "STEER_PRIORITY", "RequestError", "extractAskUserQuestions", "askUserQuestionsToCreateRequest", "applyAskElicitationResponse", readFileSync(adapter, "utf8"))(
-		session, "now", { invalidParams: (_, message) => new Error(message) }, () => [{}], () => ({}), response => ({ action: response.action, updatedInput: response.content }),
+		session, "now", { invalidParams: (_, message) => new Error(message), internalError: (_, message) => new Error(message) }, () => [{}], () => ({}), response => ({ action: response.action, updatedInput: response.content }),
 	);
 	const sdkSignal = new AbortController();
 	const elicitation = { sessions: { test: session }, client: { unstable_createElicitation: async request => {
@@ -103,6 +113,7 @@ return { parseSteerRequest, agent, initialized, handleAskUserQuestion: questionB
 	assert.equal(pushed[1].priority, "next", "ordinary human guidance must not cancel a running tool");
 	assert.equal(pushed[1].origin, undefined, "human guidance must not become worker input");
 	assert.equal(initialized.steering.aoHumanSafeBoundary, true);
+	assert.equal(initialized.steering.aoGuidanceStopFence, true);
 	await agent.steer(parseSteerRequest({ sessionId: "test", prompt: "ledger receipt", _meta: { steering: { priority: "next" } } }));
 	assert.equal(pushed[2].priority, "next");
 	assert.equal(pushed[2].origin, undefined);
@@ -143,6 +154,12 @@ return { parseSteerRequest, agent, initialized, handleAskUserQuestion: questionB
 		const copy = join(runtime, "dist", "acp-agent.js");
 		try {
 			helpers.patchClaudeWorkerSteering(copy);
+			const sdkPackage = join(runtime, "node_modules", "@anthropic-ai", "claude-agent-sdk");
+			cpSync(join(dirname(dirname(dirname(dirname(nativeAdapter)))), "@anthropic-ai", "claude-agent-sdk"), sdkPackage, { recursive: true });
+			const sdkCopy = join(sdkPackage, "sdk.mjs");
+			assert.equal(helpers.patchClaudeQueuedStop(sdkCopy), true);
+			assert.equal(helpers.patchClaudeQueuedStop(sdkCopy), false);
+			execFileSync(process.execPath, ["--check", sdkCopy]);
 			execFileSync(process.execPath, ["--check", copy]);
 			const { ClaudeAcpAgent } = await import(pathToFileURL(copy).href);
 			const prototype = ClaudeAcpAgent.prototype;
@@ -179,7 +196,7 @@ return { parseSteerRequest, agent, initialized, handleAskUserQuestion: questionB
 			const signal = new AbortController();
 			const realPushed = [];
 			const turn = { settled: false };
-			const nativeSession = { turnQueue: [turn], activeTurn: turn, input: { push: message => realPushed.push(message) } };
+			const nativeSession = { aoInterruptCancelQueued: true, turnQueue: [turn], activeTurn: turn, input: { push: message => realPushed.push(message) } };
 			const bridge = { sessions: { test: nativeSession }, publishGoalFromPrompt: async () => {}, client: { unstable_createElicitation: () => new Promise(resolve => { complete = resolve; }) } };
 			const pending = prototype.handleAskUserQuestion.call(bridge, "test", input, "question", signal.signal);
 			const outcome = await prototype.steer.call(bridge, { sessionId: "test", prompt: [{ type: "text", text: "worker update" }], _meta: { steering: { priority: "next", senderSessionId: "worker-54", idleBehavior: "promptRequired" } } });
@@ -193,7 +210,7 @@ return { parseSteerRequest, agent, initialized, handleAskUserQuestion: questionB
 			const humanSignal = new AbortController();
 			const humanPushed = [];
 			const humanTurn = { settled: false };
-			const humanSession = { turnQueue: [humanTurn], activeTurn: humanTurn, input: { push: message => humanPushed.push(message) } };
+			const humanSession = { aoInterruptCancelQueued: true, turnQueue: [humanTurn], activeTurn: humanTurn, input: { push: message => humanPushed.push(message) } };
 			const humanBridge = { sessions: { test: humanSession }, publishGoalFromPrompt: async () => {}, client: { unstable_createElicitation: () => new Promise(resolve => { answerHumanQuestion = resolve; }) } };
 			const humanQuestion = prototype.handleAskUserQuestion.call(humanBridge, "test", input, "human-question", humanSignal.signal);
 			const humanSteer = await prototype.steer.call(humanBridge, { sessionId: "test", prompt: [{ type: "text", text: "ordinary human guidance" }], _meta: { steering: { priority: "next", idleBehavior: "promptRequired" } } });
@@ -205,11 +222,54 @@ return { parseSteerRequest, agent, initialized, handleAskUserQuestion: questionB
 			assert.equal(humanSignal.signal.aborted, false);
 			answerHumanQuestion({ action: "accept", content: { question_0: "Narrow" } });
 			assert.equal((await humanQuestion).behavior, "allow");
-			let stopCalls = 0;
-			const stopSession = { query: { interrupt: async () => { stopCalls++; } }, turnQueue: [] };
-			await prototype.cancel.call({ sessions: { test: stopSession } }, { sessionId: "test" });
-			assert.equal(stopCalls, 1, "explicit Stop must interrupt immediately");
+			const incompatibleSDK = join(directory, "incompatible-sdk.mjs");
+			writeFileSync(incompatibleSDK, "export const unsupported = true;");
+			assert.throws(() => helpers.patchClaudeQueuedStop(incompatibleSDK), /queued Stop patch/);
+			execFileSync(process.execPath, ["--check", sdkCopy]);
+			const sdkSource = readFileSync(sdkCopy, "utf8");
+			const interruptMethod = sdkSource.match(/async interrupt\([^)]*\)\{[\s\S]*?\}async setPermissionMode/)?.[0].replace(/async setPermissionMode$/, "");
+			assert.ok(interruptMethod, "pinned SDK interrupt method changed");
+			const interrupt = new Function("lr", `return (${interruptMethod.replace("async interrupt", "async function")});`)((_name, callback) => callback());
+			const plainRequests = [];
+			await interrupt.call({ request: async request => { plainRequests.push(request); return { response: { still_queued: [] } }; } });
+			assert.deepEqual(plainRequests, [{ subtype: "interrupt" }], "unrelated SDK callers must retain plain interrupt semantics");
+			const stopRequests = [];
+			const waitingGuidance = new Set();
+			const locallyQueuedGuidance = [];
+			const stopTurn = { settled: false };
+			const stopSession = { aoInterruptCancelQueued: true, msgLifecycleV1: true, turnQueue: [stopTurn], activeTurn: stopTurn, input: { push: message => { locallyQueuedGuidance.push(message); waitingGuidance.add(message.uuid); } }, query: { interrupt, request: async request => {
+				stopRequests.push(request);
+				const cancelled = request.cancel_queued === true ? [...waitingGuidance] : [];
+				for (const uuid of cancelled) waitingGuidance.delete(uuid);
+				return { response: { still_queued: [...waitingGuidance], cancelled } };
+			} } };
+			const stopBridge = Object.assign(Object.create(prototype), { sessions: { test: stopSession }, publishGoalFromPrompt: async () => {} });
+			await prototype.steer.call(stopBridge, { sessionId: "test", prompt: [{ type: "text", text: "pending human guidance" }], _meta: { steering: { priority: "next", idleBehavior: "promptRequired" } } });
+			await prototype.steer.call(stopBridge, { sessionId: "test", prompt: [{ type: "text", text: "pending worker guidance" }], _meta: { steering: { priority: "next", senderSessionId: "worker-54", idleBehavior: "promptRequired" } } });
+			assert.equal(waitingGuidance.size, 2);
+			await prototype.cancel.call(stopBridge, { sessionId: "test" });
+			assert.equal(stopRequests.length, 1, "explicit Stop must interrupt immediately");
 			assert.equal(stopSession.cancelled, true);
+			assert.equal(waitingGuidance.size, 0, "pending human guidance survived Stop and could execute afterward");
+			assert.equal(stopRequests[0].cancel_queued, true);
+			assert.equal(stopSession.aoPendingGuidance.size, 0);
+			assert.ok(locallyQueuedGuidance.every(message => message.aoCancelled === true));
+			assert.equal(stopSession.aoWorkerSteering.size, 0);
+			const streamSource = sdkSource.match(/async streamInput\(e\)\{[\s\S]*?\}waitForFirstResult\(/)?.[0].replace(/waitForFirstResult\($/, "");
+			assert.ok(streamSource, "pinned SDK streaming input changed");
+			const streamInput = new Function("ce", "Se", "Yn", `return (${streamSource.replace("async streamInput", "async function")});`)(() => {}, JSON.stringify, Error);
+			const writtenInput = [];
+			await streamInput.call({ transport: { write: value => writtenInput.push(JSON.parse(value)), endInput() {} }, hasBidirectionalNeeds: () => false }, locallyQueuedGuidance);
+			assert.equal(writtenInput.length, 0, "guidance buffered locally crossed the Stop fence");
+			await streamInput.call({ transport: { write: value => writtenInput.push(JSON.parse(value)), endInput() {} }, hasBidirectionalNeeds: () => false }, [{ type: "user", uuid: "after-stop", message: { role: "user", content: "new authorized prompt" } }]);
+			assert.equal(writtenInput[0].uuid, "after-stop", "Stop must not suppress a new later prompt");
+			await assert.rejects(prototype.steer.call(stopBridge, { sessionId: "test", prompt: [{ type: "text", text: "racing guidance" }], _meta: { steering: { priority: "next" } } }), /atomic Stop support/);
+			stopSession.cancelled = false;
+			stopSession.aoInterruptCancelQueued = false;
+			await assert.rejects(prototype.steer.call(stopBridge, { sessionId: "test", prompt: [{ type: "text", text: "unsupported native CLI" }], _meta: { steering: { priority: "next" } } }), /atomic Stop support/);
+			stopSession.aoInterruptCancelQueued = true;
+			stopSession.query.request = async () => ({ response: {} });
+			await assert.rejects(prototype.cancel.call(stopBridge, { sessionId: "test" }), /did not confirm/);
 			console.log("PASS: pinned bridge keeps human guidance noninterrupting and preserves pending human questions; worker-only deferral and explicit Stop retain semantics");
 		} finally {
 			rmSync(copy, { force: true });

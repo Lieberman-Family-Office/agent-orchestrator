@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
-import { patchClaudeWorkerSteering } from "./build-acp-runtime-helpers.mjs";
+import { patchClaudeQueuedStop, patchClaudeWorkerSteering } from "./build-acp-runtime-helpers.mjs";
 
 assert.ok(process.argv[2] && process.argv[3], "Pass the pinned acp-agent.js and native Claude executable paths.");
 const directory = mkdtempSync(join(tmpdir(), "ao-native-worker-check-"));
@@ -25,6 +25,9 @@ cpSync(dirname(dirname(nativeAdapter)), runtime, { recursive: true });
 symlinkSync(dirname(dirname(dirname(dirname(nativeAdapter)))), join(directory, "node_modules"));
 const adapter = join(runtime, "dist", "acp-agent.js");
 patchClaudeWorkerSteering(adapter);
+const sdkPackage = join(runtime, "node_modules", "@anthropic-ai", "claude-agent-sdk");
+cpSync(join(dirname(dirname(dirname(dirname(nativeAdapter)))), "@anthropic-ai", "claude-agent-sdk"), sdkPackage, { recursive: true });
+patchClaudeQueuedStop(join(sdkPackage, "sdk.mjs"));
 const raw = [];
 const forms = new Map();
 const workerToken = "WORKER_54_NATIVE_PROOF_7c1e";
