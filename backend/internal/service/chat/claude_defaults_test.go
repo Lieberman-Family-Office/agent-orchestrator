@@ -162,6 +162,66 @@ func TestClaudeImplicitDefaultsRemainProviderOwnedAcrossStartSwitchAndResume(t *
 	}
 }
 
+func TestClaudeUnrelatedConfigChangePreservesExplicitModelPin(t *testing.T) {
+	ctx := context.Background()
+	st := openStore(t)
+	const pinnedModel = "cc/claude-opus-5-5(max)"
+	created, err := st.CreateSession(ctx, domain.SessionRecord{
+		ProjectID: testProject, Kind: domain.KindWorker, Harness: domain.HarnessClaudeCode,
+		Mode: domain.SessionModeChat, CreatedAt: time.Now(), UpdatedAt: time.Now(),
+		Metadata: domain.SessionMetadata{Model: pinnedModel},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv := &claudeDefaultsConversation{fakeConversation: newFakeConversation(), model: "default", effort: "default"}
+	var modelWrites []string
+	svc := chatsvc.New(chatsvc.Options{
+		Store: st, Reader: fullSnapshotReader(st), Sessions: st,
+		Drivers: fakeRegistry{driver: fakeDriver{conv: conv}},
+		Log:     slog.New(slog.DiscardHandler), NewID: uuid.NewString,
+		OnModelChanged: func(id domain.SessionID, model string) {
+			modelWrites = append(modelWrites, model)
+			if _, err := st.UpdateSessionModel(ctx, id, model); err != nil {
+				t.Fatal(err)
+			}
+		},
+	})
+	if _, err := svc.Start(ctx, chatsvc.StartConfig{
+		SessionID: created.ID, ProjectID: testProject, Harness: domain.HarnessClaudeCode,
+		WorkspacePath: t.TempDir(), Model: pinnedModel,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = svc.Stop(ctx, created.ID) })
+	for _, configID := range []string{"effort", "mode", "model"} {
+		value, wantModel := "high", pinnedModel
+		if configID == "model" {
+			value, wantModel = "default", ""
+		}
+		if _, err := svc.SetConfigOption(ctx, created.ID, configID, ports.ChatConfigOptionValue{Select: value}); err != nil {
+			t.Fatal(err)
+		}
+		stored, err := st.ConversationForSession(ctx, created.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		record, found, err := st.GetSession(ctx, created.ID)
+		if err != nil || !found {
+			t.Fatalf("read session: found=%v error=%v", found, err)
+		}
+		if stored.Settings.Model != wantModel || record.Metadata.Model != wantModel {
+			t.Fatalf("%s changed model pin: conversation=%q session=%q want=%q", configID, stored.Settings.Model, record.Metadata.Model, wantModel)
+		}
+		if configID != "model" && (stored.Settings.ReasoningEffort != "high" || len(modelWrites) != 0) {
+			t.Fatalf("%s settings=%+v model writes=%v", configID, stored.Settings, modelWrites)
+		}
+	}
+	if !reflect.DeepEqual(modelWrites, []string{""}) {
+		t.Fatalf("explicit model reset writes=%v, want one clearing write", modelWrites)
+	}
+}
+
 func TestClaudeStartIgnoresConfigCatalogFailureOnResumeAndLiveReconnect(t *testing.T) {
 	for _, live := range []bool{false, true} {
 		t.Run(map[bool]string{false: "resume", true: "live reconnect"}[live], func(t *testing.T) {

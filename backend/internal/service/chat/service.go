@@ -2204,8 +2204,10 @@ func (s *Service) SetConfigOption(
 	options = permissionConfigOptions(record.Harness, options)
 	settings, _ := settingsFromConfigOptions(previous, options)
 	if record.Harness == domain.HarnessClaudeCode {
-		// Provider-owned defaults stay implicit so future Claude defaults still apply.
-		if settings.Model == "default" {
+		// Only an explicit model reset may clear the durable model pin.
+		if settings.Model == "default" && configID != "model" {
+			settings.Model = previous.Model
+		} else if settings.Model == "default" {
 			settings.Model = ""
 		}
 		if settings.ReasoningEffort == "default" {
