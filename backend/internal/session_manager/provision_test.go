@@ -954,7 +954,7 @@ func TestChatGenerationReservationPreservesUnpublishedWorkspace(t *testing.T) {
 					t.Fatalf("not paused before publication with done/no setup: row=%+v found=%v error=%v", rec, found, err)
 				}
 				registration := runManagerGit(t, repo, "worktree", "list", "--porcelain")
-				if !strings.Contains(registration, "worktree "+rec.Metadata.WorkspacePath+"\n") {
+				if !strings.Contains(registration, "worktree "+filepath.ToSlash(rec.Metadata.WorkspacePath)+"\n") {
 					t.Fatalf("actual workspace is not registered: %s", registration)
 				}
 				payload := filepath.Join(rec.Metadata.WorkspacePath, "retained-payload")

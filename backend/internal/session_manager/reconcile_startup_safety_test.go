@@ -146,7 +146,7 @@ func TestKillPreservesPublishedWorkspaceAfterStartupSettlementFailure(t *testing
 				if got := runManagerGit(t, info.Path, "status", "--porcelain"); (got != "") != dirty {
 					t.Fatalf("workspace dirty=%v, want %v: %s", got != "", dirty, got)
 				}
-				if got := runManagerGit(t, repo, "worktree", "list", "--porcelain"); !strings.Contains(got, "worktree "+info.Path+"\n") {
+				if got := runManagerGit(t, repo, "worktree", "list", "--porcelain"); !strings.Contains(got, "worktree "+filepath.ToSlash(info.Path)+"\n") {
 					t.Fatalf("fixture workspace is not independently registered: %s", got)
 				}
 				if updated, err := st.SetSessionProvisionedWorkspace(ctx, rec.ID, info.Branch, info.Path, repo, time.Now().UTC()); err != nil || !updated {
@@ -185,7 +185,7 @@ func TestKillPreservesPublishedWorkspaceAfterStartupSettlementFailure(t *testing
 				if err != nil || !found || !reflect.DeepEqual(after, before) || store.attempts[rec.ID] != 1 {
 					t.Errorf("Kill rewrote interrupted publication: row=%+v attempts=%d error=%v", after, store.attempts[rec.ID], err)
 				}
-				if got := runManagerGit(t, repo, "worktree", "list", "--porcelain"); !strings.Contains(got, "worktree "+info.Path+"\n") {
+				if got := runManagerGit(t, repo, "worktree", "list", "--porcelain"); !strings.Contains(got, "worktree "+filepath.ToSlash(info.Path)+"\n") {
 					t.Errorf("Kill removed independently registered workspace: %s", got)
 				}
 				if body, err := os.ReadFile(payload); err != nil || string(body) != contents {
