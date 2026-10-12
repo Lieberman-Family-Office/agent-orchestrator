@@ -105,6 +105,7 @@ type conversation struct {
 	reportedSessionID  string
 	capabilities       ports.ChatCapabilities
 	workerSafeBoundary bool
+	humanSafeBoundary  bool
 	workerYieldEpoch   uint64
 	prepared           *preparedTurn
 	activeTurn         string

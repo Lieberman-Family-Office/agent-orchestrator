@@ -1124,6 +1124,7 @@ type fakeAgent struct {
 	setCalls            int
 	steering            bool
 	workerSafeBoundary  bool
+	humanSafeBoundary   bool
 	steerText           string
 	steerPrompt         []acpsdk.ContentBlock
 	steerMeta           map[string]any
@@ -1274,7 +1275,7 @@ func (a *fakeAgent) Initialize(_ context.Context, params acpsdk.InitializeReques
 	}
 	meta := map[string]any(nil)
 	if a.steering {
-		meta = map[string]any{"steering": map[string]any{"supported": true, "aoWorkerSafeBoundary": a.workerSafeBoundary, "aoWorkerQuestionYield": a.workerSafeBoundary, "aoWorkerQuestionOwnership": a.workerSafeBoundary}}
+		meta = map[string]any{"steering": map[string]any{"supported": true, "aoHumanSafeBoundary": a.humanSafeBoundary, "aoWorkerSafeBoundary": a.workerSafeBoundary, "aoWorkerQuestionYield": a.workerSafeBoundary, "aoWorkerQuestionOwnership": a.workerSafeBoundary}}
 	}
 	defaultCaps := acpsdk.AgentCapabilities{
 		SessionCapabilities: acpsdk.SessionCapabilities{Resume: &acpsdk.SessionResumeCapabilities{}},
@@ -3775,6 +3776,7 @@ func TestACPDriverMapsAdvertisedSteeringOntoAO(t *testing.T) {
 	agent := &fakeAgent{
 		steering:           true,
 		workerSafeBoundary: true,
+		humanSafeBoundary:  true,
 		capabilities: &acpsdk.AgentCapabilities{
 			PromptCapabilities: acpsdk.PromptCapabilities{Image: true},
 			SessionCapabilities: acpsdk.SessionCapabilities{
@@ -3858,9 +3860,16 @@ func TestACPDriverMapsAdvertisedSteeringOntoAO(t *testing.T) {
 	if workerSteering["priority"] != "next" || workerSteering["senderSessionId"] != "worker-54" {
 		t.Fatalf("worker update lacks safe-boundary provenance: %#v", workerMeta)
 	}
-	if _, present := steering["priority"]; present {
-		t.Fatal("explicit human steering must retain the provider's immediate behavior")
+	if steering["priority"] != "next" || steering["senderSessionId"] != nil {
+		t.Fatalf("human guidance must retain provenance without tool preemption: %#v", steering)
 	}
+	conv.humanSafeBoundary = false
+	for _, origin := range []domain.MessageOrigin{"", domain.MessageOriginHuman, domain.MessageOriginAutomation} {
+		if _, err := conv.Steer(context.Background(), "turn-1", ports.ChatUserMessage{Text: "ledger receipt", Origin: origin}); !errors.Is(err, ports.ErrChatTurnNotSteerable) {
+			t.Fatalf("unpatched Claude bridge must not preempt ordinary guidance: %v", err)
+		}
+	}
+	conv.humanSafeBoundary = true
 	conv.workerSafeBoundary = false
 	if _, err := conv.Steer(context.Background(), "turn-1", ports.ChatUserMessage{Text: "unsupported worker update", Origin: domain.MessageOriginAutomation, SenderSessionID: "worker-54"}); !errors.Is(err, ports.ErrChatTurnNotSteerable) {
 		t.Fatalf("unpatched Claude bridge must not silently cancel tools: %v", err)

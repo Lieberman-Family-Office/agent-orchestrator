@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { cpSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { execFileSync } from "node:child_process";
 import * as helpers from "./build-acp-runtime-helpers.mjs";
@@ -100,10 +100,16 @@ return { parseSteerRequest, agent, initialized, handleAskUserQuestion: questionB
 	commandLifecycle({ command_uuid: "human-message", state: "started" });
 	assert.deepEqual([...session.turnQueue[0].steeredEchoes], ["human-message"]);
 	await agent.steer(parseSteerRequest({ sessionId: "test", prompt: "explicit human correction" }));
-	assert.equal(pushed[1].priority, "now");
-	assert.equal(pushed[1].origin, undefined);
+	assert.equal(pushed[1].priority, "next", "ordinary human guidance must not cancel a running tool");
+	assert.equal(pushed[1].origin, undefined, "human guidance must not become worker input");
+	assert.equal(initialized.steering.aoHumanSafeBoundary, true);
+	await agent.steer(parseSteerRequest({ sessionId: "test", prompt: "ledger receipt", _meta: { steering: { priority: "next" } } }));
+	assert.equal(pushed[2].priority, "next");
+	assert.equal(pushed[2].origin, undefined);
+	assert.equal(pushed[2].message.content[0].text, "ledger receipt");
+	assert.equal(session.aoWorkerSteering.size, 0, "human guidance must not yield an unanswered form as worker input");
 	for (const steering of [
-		{ priority: "next" },
+		{ priority: "now" },
 		{ priority: "later", senderSessionId: "worker" },
 		{ senderSessionId: "worker" },
 		{ priority: "next", senderSessionId: "" },
@@ -128,7 +134,7 @@ return { parseSteerRequest, agent, initialized, handleAskUserQuestion: questionB
 		assert.ok(native.includes('getCommandsByMaxPriority("next")') && native.includes('reason:"absorbed_mid_turn"'), "native safe-boundary scheduler changed");
 		console.log("PASS: extracted native CLI ingress recognizes the actual worker envelope and retains next priority");
 	}
-	const nativeAdapter = process.argv[2];
+	const nativeAdapter = process.argv[2] ? resolve(process.argv[2]) : undefined;
 	if (nativeAdapter) {
 		// Copy the adapter; dependencies are read-only. Never patch the installed app.
 		const runtime = join(directory, "runtime");
@@ -183,7 +189,28 @@ return { parseSteerRequest, agent, initialized, handleAskUserQuestion: questionB
 			assert.equal(signal.signal.aborted, false);
 			complete({ action: "cancel", _meta: { aoWorkerQuestionYield: "automatic-worker-deferral" } });
 			assert.equal((await pending).interrupt, false);
-			console.log("PASS: real pinned bridge releases only the question callback; explicit cancellation and human answers retain semantics");
+			let answerHumanQuestion;
+			const humanSignal = new AbortController();
+			const humanPushed = [];
+			const humanTurn = { settled: false };
+			const humanSession = { turnQueue: [humanTurn], activeTurn: humanTurn, input: { push: message => humanPushed.push(message) } };
+			const humanBridge = { sessions: { test: humanSession }, publishGoalFromPrompt: async () => {}, client: { unstable_createElicitation: () => new Promise(resolve => { answerHumanQuestion = resolve; }) } };
+			const humanQuestion = prototype.handleAskUserQuestion.call(humanBridge, "test", input, "human-question", humanSignal.signal);
+			const humanSteer = await prototype.steer.call(humanBridge, { sessionId: "test", prompt: [{ type: "text", text: "ordinary human guidance" }], _meta: { steering: { priority: "next", idleBehavior: "promptRequired" } } });
+			assert.equal(humanSteer.outcome, "injected");
+			assert.equal(humanSteer.workerPending, false);
+			assert.equal(humanSteer.workerEpoch, 0);
+			assert.equal(humanPushed[0].priority, "next");
+			assert.deepEqual(humanPushed[0].origin, { kind: "human" });
+			assert.equal(humanSignal.signal.aborted, false);
+			answerHumanQuestion({ action: "accept", content: { question_0: "Narrow" } });
+			assert.equal((await humanQuestion).behavior, "allow");
+			let stopCalls = 0;
+			const stopSession = { query: { interrupt: async () => { stopCalls++; } }, turnQueue: [] };
+			await prototype.cancel.call({ sessions: { test: stopSession } }, { sessionId: "test" });
+			assert.equal(stopCalls, 1, "explicit Stop must interrupt immediately");
+			assert.equal(stopSession.cancelled, true);
+			console.log("PASS: pinned bridge keeps human guidance noninterrupting and preserves pending human questions; worker-only deferral and explicit Stop retain semantics");
 		} finally {
 			rmSync(copy, { force: true });
 		}

@@ -53,12 +53,16 @@ func (c *conversation) Steer(
 	}
 
 	steering := map[string]any{"idleBehavior": "promptRequired"}
-	if c.harness == domain.HarnessClaudeCode && msg.Origin == domain.MessageOriginAutomation && msg.SenderSessionID != "" {
-		if !c.workerSafeBoundary {
-			return ports.ChatTurnRef{}, fmt.Errorf("%w: safe worker steering is unavailable", ports.ErrChatTurnNotSteerable)
+	if c.harness == domain.HarnessClaudeCode {
+		if msg.Origin == domain.MessageOriginAutomation && msg.SenderSessionID != "" {
+			if !c.workerSafeBoundary {
+				return ports.ChatTurnRef{}, fmt.Errorf("%w: safe worker steering is unavailable", ports.ErrChatTurnNotSteerable)
+			}
+			steering["senderSessionId"] = msg.SenderSessionID
+		} else if !c.humanSafeBoundary {
+			return ports.ChatTurnRef{}, fmt.Errorf("%w: safe human steering is unavailable", ports.ErrChatTurnNotSteerable)
 		}
 		steering["priority"] = "next"
-		steering["senderSessionId"] = msg.SenderSessionID
 	}
 	raw, err := c.conn.CallExtension(ctx, steeringMethod, map[string]any{
 		"sessionId": sessionID,

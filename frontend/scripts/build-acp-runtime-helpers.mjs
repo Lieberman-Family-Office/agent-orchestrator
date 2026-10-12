@@ -151,12 +151,12 @@ export function patchClaudeHibernationCheck(adapterPath) {
 	return true;
 }
 
-// Worker updates are peer input at the next safe boundary, not human interrupts.
+// Guidance waits for a safe boundary; worker updates additionally retain peer provenance.
 // ponytail: This pinned bridge patch must be replaced with upstream support when available.
 export function patchClaudeWorkerSteering(adapterPath) {
 	const source = readFileSync(adapterPath, "utf8");
-	if (source.includes("// AO: worker safe-boundary steering v3.")) return false;
-	if (source.includes("// AO: worker safe-boundary steering.") || source.includes("// AO: worker safe-boundary steering v2.")) {
+	if (source.includes("// AO: worker safe-boundary steering v4.")) return false;
+	if (source.includes("// AO: worker safe-boundary steering.") || source.includes("// AO: worker safe-boundary steering v2.") || source.includes("// AO: worker safe-boundary steering v3.")) {
 		throw new Error("claude-agent-acp has obsolete worker steering; rebuild from the pinned package");
 	}
 	const validation = "    return {\n        sessionId,\n        prompt: prompt,";
@@ -173,16 +173,19 @@ export function patchClaudeWorkerSteering(adapterPath) {
 			throw new Error("claude-agent-acp no longer matches AO's worker steering patch");
 		}
 	}
-	const validateWorker = `    // AO: worker safe-boundary steering v3.
-    if (steering?.priority !== undefined || steering?.senderSessionId !== undefined) {
-        if (steering?.priority !== "next" || typeof steering.senderSessionId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(steering.senderSessionId)) {
+	const validateWorker = `    // AO: worker safe-boundary steering v4.
+    if (steering?.priority !== undefined && steering.priority !== "next") {
+        throw RequestError.invalidParams(undefined, "invalid worker steering priority");
+    }
+    if (steering?.senderSessionId !== undefined) {
+        if (steering.priority !== "next" || typeof steering.senderSessionId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(steering.senderSessionId)) {
             throw RequestError.invalidParams(undefined, "invalid worker steering metadata");
         }
     }
 `;
 	const delivery = `const workerSteering = params._meta?.steering;
-        userMessage.priority = workerSteering?.priority === "next" ? "next" : STEER_PRIORITY;
-        if (workerSteering?.priority === "next") {
+        userMessage.priority = "next";
+        if (workerSteering?.senderSessionId !== undefined) {
             userMessage.origin = { kind: "peer", from: workerSteering.senderSessionId };
             const firstText = userMessage.message.content.find(block => block.type === "text");
             if (!firstText) {
@@ -195,8 +198,8 @@ export function patchClaudeWorkerSteering(adapterPath) {
 	writeFileSync(adapterPath, source
 		.replace(validation, validateWorker + validation)
 		.replace(priority, delivery)
-		.replace(injected, 'return { outcome: "injected", workerEpoch: session.aoWorkerSteeringEpoch ?? 0, workerPending: workerSteering?.priority === "next" && session.aoWorkerSteering?.has(steeredUuid) === true };')
-		.replace(capability, capability + "\n                    aoWorkerSafeBoundary: true,\n                    aoWorkerQuestionYield: true,\n                    aoWorkerQuestionOwnership: true,")
+		.replace(injected, 'return { outcome: "injected", workerEpoch: session.aoWorkerSteeringEpoch ?? 0, workerPending: workerSteering?.senderSessionId !== undefined && session.aoWorkerSteering?.has(steeredUuid) === true };')
+		.replace(capability, capability + "\n                    aoHumanSafeBoundary: true,\n                    aoWorkerSafeBoundary: true,\n                    aoWorkerQuestionYield: true,\n                    aoWorkerQuestionOwnership: true,")
 		.replace(questionMethod, 'async handleAskUserQuestion(sessionId, toolInput, toolUseID, signal, agentID, parentToolUseId) {')
 		.replace(questionCall, 'return this.handleAskUserQuestion(sessionId, toolInput, toolUseID, signal, agentID, parentToolUseId);')
 		.replace(questionRequest, questionRequest + '\n        // ponytail: Subagent questions retain their callback until owner-targeted continuation exists.\n        createRequest._meta = { ...createRequest._meta, aoQuestionAgentId: agentID, aoQuestionParentToolUseId: parentToolUseId, aoWorkerQuestionEpoch: this.sessions[sessionId]?.aoWorkerSteeringEpoch ?? 0, aoWorkerQuestionYield: agentID || parentToolUseId ? false : this.sessions[sessionId]?.aoWorkerSteering?.size > 0 ? "automatic-worker-deferral" : true };')
