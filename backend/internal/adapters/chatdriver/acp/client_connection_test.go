@@ -2,13 +2,16 @@ package acp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -187,6 +190,135 @@ func TestPersistentQuestionDeferralRestoresTypedProof(t *testing.T) {
 	deferred := <-conv.events
 	if deferred.RequestID != "question" || deferred.ProviderEventID != "durable-deferral" {
 		t.Fatalf("missing stable durable receipt: %+v", deferred)
+	}
+}
+
+func TestWorkerYieldDetachesWhenReceiptRecoveryFails(t *testing.T) {
+	for _, withAnswer := range []bool{false, true} {
+		t.Run(fmt.Sprint(withAnswer), func(t *testing.T) { testWorkerYieldDetachesWhenReceiptRecoveryFails(t, withAnswer) })
+	}
+}
+
+func testWorkerYieldDetachesWhenReceiptRecoveryFails(t *testing.T, withAnswer bool) {
+	clientR, clientW := io.Pipe()
+	agentR, agentW := io.Pipe()
+	var stopped atomic.Bool
+	proc := &process{stdin: clientW, stdout: agentR, terminate: func() error { t.Error("replay recovery terminated the provider"); return nil }, stop: func() error {
+		stopped.Store(true)
+		_ = clientW.Close()
+		_ = agentR.Close()
+		return nil
+	}}
+	conv := newConversation(proc, slog.New(slog.NewTextHandler(io.Discard, nil)), "test", nil, nil)
+	t.Cleanup(func() { _ = clientR.Close(); _ = agentW.Close(); _ = conv.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := conv.requestInput(ctx, "question", ports.ChatInputRequest{Mode: ports.ChatInputModeForm}, &parkedInput{workerYield: make(chan struct{})})
+		result <- err
+	}()
+	<-conv.events
+	decoder := json.NewDecoder(clientR)
+	var command struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+	}
+	if withAnswer {
+		answerCtx, cancelAnswer := context.WithCancel(ctx)
+		resolved := make(chan error, 1)
+		go func() {
+			resolved <- conv.ResolveInput(answerCtx, "question", ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{}})
+		}()
+		if err := decoder.Decode(&command); err != nil {
+			t.Fatal(err)
+		}
+		conv.yieldWorkerQuestions(1)
+		cancelAnswer()
+		<-resolved
+	} else {
+		conv.yieldWorkerQuestions(1)
+	}
+	for {
+		if err := decoder.Decode(&command); err != nil {
+			t.Fatal(err)
+		}
+		if command.Method == persistenthost.ACPInteractionCommandMethod {
+			break
+		}
+	}
+	refused, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": command.ID, "error": map[string]any{"code": -32602, "message": "persistent interaction command changed"}})
+	if _, err := agentW.Write(append(refused, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err == nil || !stopped.Load() || !conv.providerDetaching() {
+			t.Fatalf("receipt failure did not detach for replay: err=%v stopped=%v", err, stopped.Load())
+		}
+	case <-ctx.Done():
+		t.Fatal("receipt failure stranded the callback until cancellation")
+	}
+}
+
+func TestWorkerYieldRecoversAnswerWhoseAcceptanceAckWasLost(t *testing.T) {
+	clientR, clientW := io.Pipe()
+	agentR, agentW := io.Pipe()
+	conv := &conversation{pendingInputs: make(map[string]*parkedInput), events: make(chan ports.ChatEvent, 8), proc: &process{terminate: func() error { return nil }}}
+	conv.conn = acpsdk.NewClientSideConnection(conv, clientW, agentR)
+	t.Cleanup(func() { _ = clientR.Close(); _ = clientW.Close(); _ = agentR.Close(); _ = agentW.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	answer := ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"choice": "Blue"}}
+	result := make(chan ports.ChatInputResponse, 1)
+	go func() {
+		response, _ := conv.requestInput(ctx, "question", ports.ChatInputRequest{Mode: ports.ChatInputModeForm, Schema: map[string]any{"type": "object", "properties": map[string]any{"choice": map[string]any{"type": "string"}}}}, &parkedInput{workerYield: make(chan struct{})})
+		result <- response
+	}()
+	<-conv.events
+	answerCtx, cancelAnswer := context.WithCancel(ctx)
+	resolved := make(chan error, 1)
+	go func() { resolved <- conv.ResolveInput(answerCtx, "question", answer) }()
+	decoder := json.NewDecoder(clientR)
+	var first struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+	}
+	if err := decoder.Decode(&first); err != nil {
+		t.Fatal(err)
+	}
+	// The fake host retained first.Params. Its acceptance ACK loses the race.
+	conv.yieldWorkerQuestions(1)
+	cancelAnswer()
+	if err := <-resolved; err == nil {
+		t.Fatal("answer cancellation should precede host ACK")
+	}
+	var retry struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+		Params json.RawMessage `json:"params"`
+	}
+	for {
+		if err := decoder.Decode(&retry); err != nil {
+			t.Fatal(err)
+		}
+		if retry.Method == persistenthost.ACPInteractionCommandMethod {
+			break
+		}
+	}
+	if !bytes.Equal(first.Params, retry.Params) {
+		t.Fatalf("worker deferral overwrote uncertain accepted answer: first=%s retry=%s", first.Params, retry.Params)
+	}
+	ack, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": retry.ID, "result": map[string]string{"eventId": "same-answer-acceptance"}})
+	if _, err := agentW.Write(append(ack, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-result; got.Action != ports.ChatInputActionAccept || got.Content["choice"] != "Blue" {
+		t.Fatalf("retained answer was stranded or replaced: %+v", got)
+	}
+	if event := <-conv.events; event.Kind != ports.ChatEventInputResolved || !bytes.Contains(event.Detail, []byte("Blue")) {
+		t.Fatalf("recovered answer was not projected once: %+v", event)
 	}
 }
 

@@ -353,6 +353,33 @@ func (c *conversation) requestInput(
 		parked.mu.Unlock()
 		return <-parked.result, nil
 	}
+	if yielded && ctx.Err() == nil && parked.answerIntent != nil {
+		answer := *parked.answerIntent
+		parked.mu.Unlock()
+		// Host acceptance may have won while the human request lost its ACK.
+		// Recover that exact command, never replace it with automatic deferral.
+		recoveryCtx, cancelRecovery := context.WithTimeout(ctx, 5*time.Second)
+		err := c.ResolveInput(recoveryCtx, requestID, answer)
+		cancelRecovery()
+		if err == nil {
+			return <-parked.result, nil
+		}
+		parked.mu.Lock()
+		answered := parked.resolved && parked.accepted != nil
+		parked.mu.Unlock()
+		if answered {
+			return <-parked.result, nil
+		}
+		if ctx.Err() == nil {
+			_ = c.Close() // Detach only; the persistent host replays its winning command.
+			return ports.ChatInputResponse{}, err
+		}
+		parked.mu.Lock()
+		if parked.resolved {
+			parked.mu.Unlock()
+			return <-parked.result, nil
+		}
+	}
 	parked.resolved = true
 	automatic := yielded && ctx.Err() == nil
 	parked.mu.Unlock()
@@ -361,11 +388,14 @@ func (c *conversation) requestInput(
 		// The host must retain this receipt before the native callback retires.
 		// A lost daemon must replay both the form and its typed deferral proof.
 		var err error
-		eventID, err = c.recordPersistentInteraction(ctx, persistentInteractionCommand{RequestID: requestID, Kind: persistentInteractionQuestionDeferred, Request: &request})
+		receiptCtx, cancelReceipt := context.WithTimeout(ctx, 5*time.Second)
+		eventID, err = c.recordPersistentInteraction(receiptCtx, persistentInteractionCommand{RequestID: requestID, Kind: persistentInteractionQuestionDeferred, Request: &request})
+		cancelReceipt()
+		if err != nil && ctx.Err() == nil {
+			_ = c.Close() // Failed/uncertain acceptance must reconnect for retained replay.
+			return ports.ChatInputResponse{}, err
+		}
 		if err != nil {
-			// Do not retire the callback on uncertain receipt acceptance. The host
-			// will replay an accepted receipt; otherwise a real cancellation ends it.
-			<-ctx.Done()
 			automatic = false
 		}
 	}
@@ -462,6 +492,15 @@ func (c *conversation) ResolveInput(
 		request.mu.Unlock()
 		return err
 	}
+	if request.answerIntent != nil {
+		previous, _ := json.Marshal(request.answerIntent)
+		current, _ := json.Marshal(response)
+		if !bytes.Equal(previous, current) {
+			request.mu.Unlock()
+			return domain.ErrClientMessageConflict
+		}
+	}
+	request.answerIntent = &response
 	request.resolving = true
 	request.resolveDone = make(chan struct{})
 	persistent := c.proc != nil && c.proc.terminate != nil

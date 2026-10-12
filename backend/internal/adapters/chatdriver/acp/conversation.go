@@ -62,6 +62,7 @@ type parkedInput struct {
 	resolved      bool
 	resolving     bool
 	accepted      *ports.ChatInputResponse
+	answerIntent  *ports.ChatInputResponse
 	resolveDone   chan struct{}
 	workerYield   chan struct{}
 	workerYielded bool
