@@ -22,7 +22,7 @@ func TestClaudeWorkerUpdateKeepsQuestionAndDeliversAnswerOnce(t *testing.T) {
 	if err := os.Mkdir(config, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(config, "settings.json"), []byte(`{"model":"haiku","disableAllHooks":true,"env":{"CLAUDE_CODE_USE_BEDROCK":"1","AWS_REGION":"us-east-1","CLAUDE_CODE_DISABLE_AUTO_MEMORY":"1","ANTHROPIC_DEFAULT_HAIKU_MODEL":"us.anthropic.claude-haiku-4-5-20251001-v1:0"}}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(config, "settings.json"), []byte(`{"model":"haiku","disableAllHooks":true,"permissions":{"deny":["Bash"]},"env":{"CLAUDE_CODE_USE_BEDROCK":"1","AWS_REGION":"us-east-1","CLAUDE_CODE_DISABLE_AUTO_MEMORY":"1","ANTHROPIC_DEFAULT_HAIKU_MODEL":"us.anthropic.claude-haiku-4-5-20251001-v1:0"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("CLAUDE_CONFIG_DIR", config)
@@ -39,7 +39,7 @@ func TestClaudeWorkerUpdateKeepsQuestionAndDeliversAnswerOnce(t *testing.T) {
 		"env":         map[string]string{"CLAUDE_CONFIG_DIR": config, "CLAUDE_CODE_USE_BEDROCK": "1", "AWS_REGION": "us-east-1"},
 	}}, nil)
 	// Use the native provider's configured model; AO receives no explicit model override.
-	session := spawn(t, d, map[string]any{"projectId": project, "kind": "worker", "harness": "claude-code", "mode": "chat", "prompt": "This is an isolated acceptance test. Use only AskUserQuestion. Ask 'Which color?' with Blue and Red options. Do not invent an answer. Independent worker results can be acknowledged before this question is answered."}).Session.ID
+	session := spawn(t, d, map[string]any{"projectId": project, "kind": "worker", "harness": "claude-code", "mode": "chat", "prompt": "This is an isolated acceptance test. Use only AskUserQuestion. Ask 'Which color?' with Blue and Red options. Do not invent an answer. Independent worker results can be acknowledged before this question is answered. After receiving the color answer, acknowledge it in plain text and end the turn. Do not run tools or submit reports after acknowledging it."}).Session.ID
 	question := func(s snapshot) (activity, bool) {
 		for _, a := range s.Activities {
 			if a.Kind == "user_input" && a.Status == "pending" {

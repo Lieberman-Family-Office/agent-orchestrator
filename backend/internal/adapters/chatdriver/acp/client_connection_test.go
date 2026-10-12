@@ -99,6 +99,97 @@ func TestInputCancellationAndAnswerHaveOneOutcome(t *testing.T) {
 	}
 }
 
+func TestSubagentQuestionCannotUseParentContinuation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conv := &conversation{harness: domain.HarnessClaudeCode, workerSafeBoundary: true, pendingInputs: make(map[string]*parkedInput), events: make(chan ports.ChatEvent, 8)}
+	params := acpsdk.NewUnstableCreateElicitationRequestForm(acpsdk.UnstableElicitationSchema{Type: "object", Properties: map[string]any{
+		"question_0":        map[string]any{"type": "string", "oneOf": []any{map[string]any{"const": "Blue"}}},
+		"question_0_custom": map[string]any{"type": "string", "_meta": map[string]any{"_askUserQuestionCustomAnswer": map[string]any{"isCustomAnswer": true, "questionId": "question_0"}}},
+	}})
+	params.Form.Meta = map[string]any{"aoQuestionAgentId": "subagent-7", "aoQuestionParentToolUseId": "task-7", workerQuestionYieldMeta: "automatic-worker-deferral"}
+	result := make(chan acpsdk.UnstableCreateElicitationResponse, 1)
+	go func() { response, _ := conv.UnstableCreateElicitation(ctx, params); result <- response }()
+	event := <-conv.events
+	if event.Input.QuestionAgentID != "subagent-7" || event.Input.PersistentQuestion() {
+		t.Fatalf("subagent owner was lost or parent fallback enabled: %+v", event.Input)
+	}
+	conv.yieldWorkerQuestions(1)
+	if err := conv.ResolveInput(ctx, event.RequestID, ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"question_0": "Blue"}}); err != nil {
+		t.Fatalf("original subagent callback stopped accepting its answer: %v", err)
+	}
+	if response := <-result; response.Accept == nil || response.Accept.Content["question_0"] != "Blue" {
+		t.Fatalf("answer was not returned to originating callback: %+v", response)
+	}
+}
+
+func TestWorkerYieldRecordsReceiptBeforeRetiringCallback(t *testing.T) {
+	clientR, clientW := io.Pipe()
+	agentR, agentW := io.Pipe()
+	conv := &conversation{pendingInputs: make(map[string]*parkedInput), events: make(chan ports.ChatEvent, 8), proc: &process{terminate: func() error { return nil }}}
+	conv.conn = acpsdk.NewClientSideConnection(conv, clientW, agentR)
+	t.Cleanup(func() { _ = clientR.Close(); _ = clientW.Close(); _ = agentR.Close(); _ = agentW.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := conv.requestInput(ctx, "question", ports.ChatInputRequest{Mode: ports.ChatInputModeForm, Message: "Which color?"}, &parkedInput{workerYield: make(chan struct{})})
+		result <- err
+	}()
+	<-conv.events
+	conv.yieldWorkerQuestions(1)
+	var command struct {
+		ID     json.RawMessage              `json:"id"`
+		Params persistentInteractionCommand `json:"params"`
+	}
+	if err := json.NewDecoder(clientR).Decode(&command); err != nil {
+		t.Fatal(err)
+	}
+	if command.Params.Kind != persistentInteractionQuestionDeferred || command.Params.Request == nil || command.Params.Request.Message != "Which color?" {
+		t.Fatalf("host did not receive complete typed deferral: %+v", command.Params)
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("native callback retired before host acceptance: %v", err)
+	default:
+	}
+	if err := conv.ResolveInput(ctx, "question", ports.ChatInputResponse{Action: ports.ChatInputActionAccept}); errors.Is(err, ports.ErrChatQuestionDeferred) {
+		t.Fatal("unaccepted receipt claimed proven deferral")
+	}
+	ack, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": command.ID, "result": map[string]string{"eventId": "host-deferral"}})
+	if _, err := agentW.Write(append(ack, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; !errors.Is(err, errWorkerQuestionYield) {
+		t.Fatalf("accepted deferral lost: %v", err)
+	}
+	if event := <-conv.events; event.Kind != ports.ChatEventInputRequested || event.ProviderEventID != "question:question" {
+		t.Fatalf("retained form not bound to host receipt: %+v", event)
+	}
+	if event := <-conv.events; event.ProviderEventID != "host-deferral" || len(event.Detail) != 0 {
+		t.Fatalf("projection not bound to host receipt: %+v", event)
+	}
+}
+
+func TestPersistentQuestionDeferralRestoresTypedProof(t *testing.T) {
+	conv := &conversation{pendingInputs: make(map[string]*parkedInput), events: make(chan ports.ChatEvent, 8)}
+	payload := json.RawMessage(`{"eventId":"durable-deferral","requestId":"question","kind":"question_deferred","providerPending":false,"request":{"Mode":"form","Message":"Which color?","Schema":{"type":"object","properties":{"question_0":{"type":"string","oneOf":[{"const":"Blue"}]},"question_0_custom":{"type":"string","_meta":{"_askUserQuestionCustomAnswer":{"isCustomAnswer":true,"questionId":"question_0"}}}}}}}`)
+	if _, err := conv.HandleExtensionMethod(context.Background(), persistenthost.ACPInteractionCommandMethod, payload); err != nil {
+		t.Fatalf("durable automatic deferral was not replayed: %v", err)
+	}
+	if err := conv.ResolveInput(context.Background(), "question", ports.ChatInputResponse{Action: ports.ChatInputActionAccept}); !errors.Is(err, ports.ErrChatQuestionDeferred) {
+		t.Fatalf("adopted host lost typed deferral evidence: %v", err)
+	}
+	requested := <-conv.events
+	if requested.Kind != ports.ChatEventInputRequested || requested.Input == nil || requested.Input.Message != "Which color?" {
+		t.Fatalf("missing retained form: %+v", requested)
+	}
+	deferred := <-conv.events
+	if deferred.RequestID != "question" || deferred.ProviderEventID != "durable-deferral" {
+		t.Fatalf("missing stable durable receipt: %+v", deferred)
+	}
+}
+
 func TestWorkerQuestionYieldWaitsForAcceptedAnswer(t *testing.T) {
 	clientR, clientW := io.Pipe()
 	agentR, agentW := io.Pipe()
@@ -203,7 +294,7 @@ func TestWorkerYieldIgnoresConsentAndHandlesMultipleQuestions(t *testing.T) {
 	defer cancel()
 	conv := &conversation{pendingInputs: make(map[string]*parkedInput), events: make(chan ports.ChatEvent, 16)}
 	results := make(chan error, 2)
-	for _, id := range []string{"main-question", "subagent-question"} {
+	for _, id := range []string{"main-question-1", "main-question-2"} {
 		go func() {
 			_, err := conv.requestInput(ctx, id, ports.ChatInputRequest{Mode: ports.ChatInputModeForm}, &parkedInput{workerYield: make(chan struct{})})
 			results <- err

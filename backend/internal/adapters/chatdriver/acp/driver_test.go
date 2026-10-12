@@ -1274,7 +1274,7 @@ func (a *fakeAgent) Initialize(_ context.Context, params acpsdk.InitializeReques
 	}
 	meta := map[string]any(nil)
 	if a.steering {
-		meta = map[string]any{"steering": map[string]any{"supported": true, "aoWorkerSafeBoundary": a.workerSafeBoundary, "aoWorkerQuestionYield": a.workerSafeBoundary}}
+		meta = map[string]any{"steering": map[string]any{"supported": true, "aoWorkerSafeBoundary": a.workerSafeBoundary, "aoWorkerQuestionYield": a.workerSafeBoundary, "aoWorkerQuestionOwnership": a.workerSafeBoundary}}
 	}
 	defaultCaps := acpsdk.AgentCapabilities{
 		SessionCapabilities: acpsdk.SessionCapabilities{Resume: &acpsdk.SessionResumeCapabilities{}},

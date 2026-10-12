@@ -878,16 +878,18 @@ type ChatInputResponse struct {
 // restricted JSON Schema object for form mode. URL is only present for url mode
 // and must never be opened without the user's explicit consent.
 type ChatInputRequest struct {
-	Mode          ChatInputMode
-	Message       string
-	Schema        map[string]any
-	URL           string
-	ElicitationID string
+	Mode                    ChatInputMode
+	Message                 string
+	Schema                  map[string]any
+	URL                     string
+	ElicitationID           string
+	QuestionAgentID         string
+	QuestionParentToolUseID string
 }
 
 // PersistentQuestion identifies Claude's question form, never tool or URL consent.
 func (r ChatInputRequest) PersistentQuestion() bool {
-	if r.Mode != ChatInputModeForm || r.URL != "" || r.Schema["type"] != "object" {
+	if r.Mode != ChatInputModeForm || r.URL != "" || r.QuestionAgentID != "" || r.QuestionParentToolUseID != "" || r.Schema["type"] != "object" {
 		return false
 	}
 	properties, _ := r.Schema["properties"].(map[string]any)

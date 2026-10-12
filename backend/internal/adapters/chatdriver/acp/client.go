@@ -213,6 +213,8 @@ func (c *conversation) UnstableCreateElicitation(
 			return acpsdk.NewUnstableCreateElicitationResponseCancel(), err
 		}
 		request.Schema = schema
+		request.QuestionAgentID, _ = params.Form.Meta["aoQuestionAgentId"].(string)
+		request.QuestionParentToolUseID, _ = params.Form.Meta["aoQuestionParentToolUseId"].(string)
 	case params.Url != nil:
 		request.Mode = ports.ChatInputModeURL
 		request.Message = params.Url.Message
@@ -297,16 +299,25 @@ func (c *conversation) requestInput(
 		return ports.ChatInputResponse{Action: ports.ChatInputActionCancel}, nil
 	}
 	accepted, hasAccepted := c.accepted[requestID]
-	if hasAccepted && accepted.Kind == persistentInteractionInput {
+	if hasAccepted && (accepted.Kind == persistentInteractionInput || accepted.Kind == persistentInteractionQuestionDeferred) {
 		delete(c.accepted, requestID)
-	} else {
+	}
+	if hasAccepted && accepted.Kind == persistentInteractionQuestionDeferred && parked.workerYield != nil && !parked.workerYielded {
+		parked.workerYielded = true
+		close(parked.workerYield)
+	}
+	if !hasAccepted || accepted.Kind != persistentInteractionInput {
 		c.pendingInputs[requestID] = parked
 	}
 	turnID := c.activeTurn
 	c.mu.Unlock()
 
+	requestedEventID := ""
+	if parked.workerYield != nil {
+		requestedEventID = requestID + ":question"
+	}
 	c.emit(ports.ChatEvent{
-		Kind: ports.ChatEventInputRequested, ProviderTurnID: turnID,
+		Kind: ports.ChatEventInputRequested, ProviderEventID: requestedEventID, ProviderTurnID: turnID,
 		RequestID: requestID, Input: &request, Summary: request.Message,
 	})
 	close(parked.ready)
@@ -344,6 +355,20 @@ func (c *conversation) requestInput(
 	}
 	parked.resolved = true
 	automatic := yielded && ctx.Err() == nil
+	parked.mu.Unlock()
+	eventID := ""
+	if automatic {
+		// The host must retain this receipt before the native callback retires.
+		// A lost daemon must replay both the form and its typed deferral proof.
+		var err error
+		eventID, err = c.recordPersistentInteraction(ctx, persistentInteractionCommand{RequestID: requestID, Kind: persistentInteractionQuestionDeferred, Request: &request})
+		if err != nil {
+			// Do not retire the callback on uncertain receipt acceptance. The host
+			// will replay an accepted receipt; otherwise a real cancellation ends it.
+			<-ctx.Done()
+			automatic = false
+		}
+	}
 	if automatic {
 		c.mu.Lock()
 		if c.deferredQuestions == nil {
@@ -353,9 +378,11 @@ func (c *conversation) requestInput(
 		c.mu.Unlock()
 	}
 	c.discardInput(requestID)
-	parked.mu.Unlock()
 	if !c.providerDetaching() {
-		c.emit(ports.ChatEvent{Kind: ports.ChatEventInputResolved, RequestID: requestID})
+		if automatic && eventID != "" {
+			c.emit(ports.ChatEvent{Kind: ports.ChatEventInputRequested, ProviderEventID: requestedEventID, ProviderTurnID: turnID, RequestID: requestID, Input: &request, Summary: request.Message})
+		}
+		c.emit(ports.ChatEvent{Kind: ports.ChatEventInputResolved, ProviderEventID: eventID, RequestID: requestID})
 	}
 	if automatic {
 		return ports.ChatInputResponse{}, errWorkerQuestionYield
@@ -423,7 +450,7 @@ func (c *conversation) ResolveInput(
 		return ports.ErrChatRequestNotPending
 	}
 	request.mu.Lock()
-	if request.workerYielded && !request.resolving && request.accepted == nil {
+	if deferred && !request.resolving && request.accepted == nil {
 		request.mu.Unlock()
 		return ports.ErrChatQuestionDeferred
 	}

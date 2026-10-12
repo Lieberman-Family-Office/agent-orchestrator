@@ -562,7 +562,7 @@ func (d *Driver) initialize(
 			}
 		}
 		steering, _ := init.Meta["steering"].(map[string]any)
-		conv.workerSafeBoundary = steering["aoWorkerSafeBoundary"] == true && steering["aoWorkerQuestionYield"] == true
+		conv.workerSafeBoundary = steering["aoWorkerSafeBoundary"] == true && steering["aoWorkerQuestionYield"] == true && steering["aoWorkerQuestionOwnership"] == true
 		return conv, init, state, nil
 	}
 
@@ -615,7 +615,7 @@ func (d *Driver) initialize(
 		}
 	}
 	steering, _ := init.Meta["steering"].(map[string]any)
-	conv.workerSafeBoundary = steering["aoWorkerSafeBoundary"] == true && steering["aoWorkerQuestionYield"] == true
+	conv.workerSafeBoundary = steering["aoWorkerSafeBoundary"] == true && steering["aoWorkerQuestionYield"] == true && steering["aoWorkerQuestionOwnership"] == true
 	return conv, init, nil, nil
 }
 

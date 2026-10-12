@@ -24,7 +24,7 @@ try {
     };
 }`;
 	const fixture = `${parse}
-async function handleAskUserQuestion(sessionId, toolInput, toolUseID, signal) {
+const questionBridge = { async handleAskUserQuestion(sessionId, toolInput, toolUseID, signal) {
         const questions = extractAskUserQuestions(toolInput);
         if (!questions) {
             return { behavior: "deny", message: "AskUserQuestion called with no valid questions." };
@@ -46,7 +46,9 @@ async function handleAskUserQuestion(sessionId, toolInput, toolUseID, signal) {
             throw new Error("Tool use aborted");
         }
         return { behavior: "allow", updatedInput: outcome.updatedInput };
-}
+}, async dispatch(sessionId, toolInput, toolUseID, signal, agentID, parentToolUseId) {
+    return this.handleAskUserQuestion(sessionId, toolInput, toolUseID, signal);
+} };
 function commandLifecycle(message) {
                     const frame = message;
                     switch (frame.state) {
@@ -63,7 +65,7 @@ const agent = { async steer(params) {
  session.input.push(userMessage);
  return { outcome: "injected" };
 } };
-return { parseSteerRequest, agent, initialized, handleAskUserQuestion, commandLifecycle };`;
+return { parseSteerRequest, agent, initialized, handleAskUserQuestion: questionBridge.handleAskUserQuestion, commandLifecycle };`;
 	writeFileSync(adapter, fixture);
 	assert.equal(helpers.patchClaudeWorkerSteering(adapter), true);
 	assert.equal(helpers.patchClaudeWorkerSteering(adapter), false);
@@ -139,6 +141,12 @@ return { parseSteerRequest, agent, initialized, handleAskUserQuestion, commandLi
 			const { ClaudeAcpAgent } = await import(pathToFileURL(copy).href);
 			const prototype = ClaudeAcpAgent.prototype;
 			const input = { questions: [{ question: "Select scope?", header: "Scope", options: [{ label: "Narrow", description: "One item" }, { label: "Broad", description: "All items" }], multiSelect: false }] };
+			let subagentRequest;
+			const subagentBridge = { sessions: { test: {} }, client: { unstable_createElicitation: async request => { subagentRequest = request; return { action: "accept", content: { question_0: "Narrow" } }; } } };
+			await prototype.handleAskUserQuestion.call(subagentBridge, "test", input, "sub-question", new AbortController().signal, "subagent-7", "parent-task");
+			assert.equal(subagentRequest._meta.aoWorkerQuestionYield, false, "subagent question must not yield into a parent-owned continuation");
+			assert.equal(subagentRequest._meta.aoQuestionAgentId, "subagent-7");
+			assert.equal(subagentRequest._meta.aoQuestionParentToolUseId, "parent-task");
 			const responseCases = [
 				[{ action: "cancel", _meta: { aoWorkerQuestionYield: "automatic-worker-deferral" } }, false, "deny"],
 				[{ action: "accept", content: { question_0: "Narrow" } }, false, "allow"],

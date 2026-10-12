@@ -72,6 +72,31 @@ func TestACPRelayReclaimsPromptAcrossAttachment(t *testing.T) {
 	}
 }
 
+func TestACPRelayReplaysQuestionDeferralAfterDaemonLoss(t *testing.T) {
+	relay := newTestACPRelay(t)
+	prompt := relayClientFrame(t, relay, []byte(`{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{}}`+"\n"), 1)
+	request, _ := relayProviderFrame(t, relay, []byte(`{"jsonrpc":"2.0","id":"question-1","method":"elicitation/create","params":{"mode":"form","message":"Which color?","requestedSchema":{"type":"object"}}}`+"\n"), 1, true)
+	requestID := frameMetaString(t, request, ACPRequestIDMetaKey)
+	command, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": 2, "method": ACPInteractionCommandMethod,
+		"params": map[string]any{"requestId": requestID, "kind": "question_deferred", "request": map[string]any{"Mode": "form", "Message": "Which color?", "Schema": map[string]any{"type": "object"}}},
+	})
+	accepted, err := relay.clientFrame(context.Background(), append(command, '\n'), 1)
+	if err != nil || frameResultString(t, accepted.client, "eventId") == "" {
+		t.Fatalf("deferral receipt not accepted: %+v %v", accepted, err)
+	}
+	relayClientFrame(t, relay, []byte(`{"jsonrpc":"2.0","id":"question-1","result":{"action":"cancel","_meta":{"aoWorkerQuestionYield":"automatic-worker-deferral"}}}`+"\n"), 1)
+	// The replacement daemon must receive proof after the native callback is gone.
+	replay := relayReplayFrames(t, relay)
+	if len(replay) != 1 || !bytes.Contains(replay[0], []byte(`"kind":"question_deferred"`)) || !bytes.Contains(replay[0], []byte(`"providerPending":false`)) || !bytes.Contains(replay[0], []byte("Which color?")) {
+		t.Fatalf("deferral proof lost across daemon adoption: %q", replay)
+	}
+	relayProviderFrame(t, relay, []byte(`{"jsonrpc":"2.0","id":`+frameID(t, prompt)+`,"result":{"stopReason":"end_turn"}}`+"\n"), 2, false)
+	if replay := relayReplayFrames(t, relay); len(replay) != 2 {
+		t.Fatalf("prompt completion discarded unprojected deferral: %q", replay)
+	}
+}
+
 func TestACPRelayTracksActiveCompactionPrompt(t *testing.T) {
 	relay := newTestACPRelay(t)
 

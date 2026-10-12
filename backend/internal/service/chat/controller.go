@@ -2393,15 +2393,17 @@ func (c *Controller) ResolveInput(
 		return fmt.Errorf("read input %s: %w", requestID, loadErr)
 	}
 	var stored struct {
-		PersistentQuestion bool                  `json:"persistentQuestion"`
-		ProviderPending    bool                  `json:"providerPending"`
-		InputMode          ports.ChatInputMode   `json:"inputMode"`
-		Message            string                `json:"message"`
-		Schema             map[string]any        `json:"schema"`
-		Action             ports.ChatInputAction `json:"action"`
-		Content            map[string]any        `json:"content"`
-		AnswerIntent       string                `json:"answerIntent"`
-		AnswerAttempt      int64                 `json:"answerAttempt"`
+		PersistentQuestion      bool                  `json:"persistentQuestion"`
+		ProviderPending         bool                  `json:"providerPending"`
+		InputMode               ports.ChatInputMode   `json:"inputMode"`
+		Message                 string                `json:"message"`
+		QuestionAgentID         string                `json:"questionAgentId"`
+		QuestionParentToolUseID string                `json:"questionParentToolUseId"`
+		Schema                  map[string]any        `json:"schema"`
+		Action                  ports.ChatInputAction `json:"action"`
+		Content                 map[string]any        `json:"content"`
+		AnswerIntent            string                `json:"answerIntent"`
+		AnswerAttempt           int64                 `json:"answerAttempt"`
 	}
 	if err := json.Unmarshal(activity.Detail, &stored); err != nil {
 		return fmt.Errorf("read input detail: %w", err)
@@ -2417,7 +2419,7 @@ func (c *Controller) ResolveInput(
 	if activity.Status != domain.ActivityStatusPending {
 		return ports.ErrChatRequestNotPending
 	}
-	question := ports.ChatInputRequest{Mode: stored.InputMode, Message: stored.Message, Schema: stored.Schema}
+	question := ports.ChatInputRequest{Mode: stored.InputMode, Message: stored.Message, Schema: stored.Schema, QuestionAgentID: stored.QuestionAgentID, QuestionParentToolUseID: stored.QuestionParentToolUseID}
 	persistent := stored.PersistentQuestion && c.harness == domain.HarnessClaudeCode && question.PersistentQuestion()
 	if persistent {
 		if err := question.ValidateQuestionResponse(response); err != nil {
@@ -3492,13 +3494,15 @@ func (c *Controller) apply(ctx context.Context, event ports.ChatEvent) error {
 			return nil
 		}
 		detail, _ := json.Marshal(map[string]any{
-			"inputMode":          event.Input.Mode,
-			"message":            event.Input.Message,
-			"schema":             event.Input.Schema,
-			"url":                event.Input.URL,
-			"elicitationId":      event.Input.ElicitationID,
-			"persistentQuestion": c.harness == domain.HarnessClaudeCode && event.Input.PersistentQuestion(),
-			"providerPending":    true,
+			"inputMode":               event.Input.Mode,
+			"message":                 event.Input.Message,
+			"schema":                  event.Input.Schema,
+			"url":                     event.Input.URL,
+			"elicitationId":           event.Input.ElicitationID,
+			"persistentQuestion":      c.harness == domain.HarnessClaudeCode && event.Input.PersistentQuestion(),
+			"questionAgentId":         event.Input.QuestionAgentID,
+			"questionParentToolUseId": event.Input.QuestionParentToolUseID,
+			"providerPending":         true,
 		})
 		return c.store.UpsertActivity(ctx, c.conversation.ID, event.ProviderTurnID,
 			domain.ConversationActivity{

@@ -3913,6 +3913,61 @@ func TestFailedDelayedAnswerRetryDoesNotResolveQuestion(t *testing.T) {
 	}
 }
 
+func TestQuestionDeferralReplayDoesNotReattachCommittedQuestion(t *testing.T) {
+	provider := &cancelledQuestionProvider{steerRecorder: newSteerRecorder(), deferred: true}
+	h := newHarnessWithConversationAndStoreForHarness(t, provider, func(st *sqlite.Store) chatsvc.Store { return st }, domain.HarnessClaudeCode)
+	turn, err := h.ctrl.Send(context.Background(), ports.ChatUserMessage{Text: "work", ClientMessageID: "replay-work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: turn.ProviderTurnID})
+	schema := map[string]any{"type": "object", "properties": map[string]any{
+		"question_0":        map[string]any{"type": "string", "oneOf": []any{map[string]any{"const": "Blue"}}},
+		"question_0_custom": map[string]any{"type": "string", "_meta": map[string]any{"_askUserQuestionCustomAnswer": map[string]any{"isCustomAnswer": true, "questionId": "question_0"}}},
+	}}
+	requested := ports.ChatEvent{Kind: ports.ChatEventInputRequested, ProviderEventID: "question:question", RequestID: "question", Input: &ports.ChatInputRequest{Mode: ports.ChatInputModeForm, Schema: schema}}
+	deferred := ports.ChatEvent{Kind: ports.ChatEventInputResolved, ProviderEventID: "host-deferral", RequestID: "question"}
+	provider.emit(requested, deferred)
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Activities) == 1 && strings.Contains(string(s.Activities[0].Detail), `"providerPending":false`)
+	})
+	provider.emit(requested, deferred, ports.ChatEvent{Kind: ports.ChatEventActivityStarted, ProviderItemID: "replay-fence", ActivityKind: domain.ActivityKindSystem, ActivityStatus: domain.ActivityStatusCompleted, Summary: "replay finished"})
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Activities) == 2 })
+	for _, a := range snapshot.Activities {
+		if a.RequestID == "question" && (!strings.Contains(string(a.Detail), `"providerPending":false`) || a.Status != domain.ActivityStatusPending) {
+			t.Fatalf("replay reattached or resolved retained form: %+v", a)
+		}
+	}
+	if err := h.ctrl.ResolveInput(context.Background(), "question", ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"question_0": "Blue"}}); err != nil {
+		t.Fatalf("replayed question cannot accept its delayed answer: %v", err)
+	}
+	if len(provider.steers()) != 1 {
+		t.Fatalf("delayed answer delivered %d times", len(provider.steers()))
+	}
+}
+
+func TestSubagentQuestionCannotResolveThroughParentFallback(t *testing.T) {
+	provider := &cancelledQuestionProvider{steerRecorder: newSteerRecorder(), deferred: true}
+	h := newHarnessWithConversationAndStoreForHarness(t, provider, func(st *sqlite.Store) chatsvc.Store { return st }, domain.HarnessClaudeCode)
+	ctx := context.Background()
+	schema := map[string]any{"type": "object", "properties": map[string]any{
+		"question_0":        map[string]any{"type": "string", "oneOf": []any{map[string]any{"const": "Blue"}}},
+		"question_0_custom": map[string]any{"type": "string", "_meta": map[string]any{"_askUserQuestionCustomAnswer": map[string]any{"isCustomAnswer": true, "questionId": "question_0"}}},
+	}}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventInputRequested, RequestID: "sub-question", Input: &ports.ChatInputRequest{Mode: ports.ChatInputModeForm, Schema: schema, QuestionAgentID: "subagent-7", QuestionParentToolUseID: "task-7"}})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Activities) == 1 })
+	if err := h.ctrl.ResolveInput(ctx, "sub-question", ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"question_0": "Blue"}}); !errors.Is(err, ports.ErrChatRequestNotPending) {
+		t.Fatalf("lost subagent callback must not claim parent delivery: %v", err)
+	}
+	if len(provider.steers()) != 0 {
+		t.Fatal("subagent answer was steered into the parent")
+	}
+	activity, err := h.st.ConversationInput(ctx, h.ctrl.ConversationID(), "sub-question")
+	if err != nil || activity.Status == domain.ActivityStatusResolved {
+		t.Fatalf("undelivered subagent answer marked resolved: %+v %v", activity, err)
+	}
+}
+
 func TestQuestionSurvivesBackgroundCancellationAndAnswerIsDeliveredOnce(t *testing.T) {
 	for _, scenario := range []struct{ rejected, detachFirst bool }{{false, true}, {true, true}, {false, false}} {
 		rejected := scenario.rejected
