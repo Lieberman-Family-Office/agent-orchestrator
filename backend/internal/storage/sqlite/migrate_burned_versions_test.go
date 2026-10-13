@@ -201,6 +201,7 @@ var shippedMigrations = map[int64]string{
 	// repairCustom0134MigrationHistory validates and remaps those installed identities.
 	195: "0195_project_revision.sql",
 	196: "0196_interrupt_and_send.sql",
+	197: "0197_provider_events_turn_completed_index.sql",
 }
 
 // burnedVersion reports version numbers that must never be (re)used: they
