@@ -63,6 +63,22 @@ func TestSideCompactionUsesOnlySideProviderAndRejectsBusyTurn(t *testing.T) {
 	if conv.compactions != 1 {
 		t.Fatalf("busy turn compacted provider %d times", conv.compactions)
 	}
+	runtime.activeTurnID = ""
+	runtime.compacting = false
+	runtime.dispatchBlocked = true
+	if _, err := svc.CompactSideChat(ctx, side.SessionID, side.ID); !errors.Is(err, ErrSideNotReady) {
+		t.Fatalf("blocked compact error = %v", err)
+	}
+	runtime.dispatchBlocked = false
+	if err := store.SetSideFailed(ctx, side.ID, side.Generation, "Receipt acknowledgement failed.", now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.CompactSideChat(ctx, side.SessionID, side.ID); !errors.Is(err, ErrSideNotReady) {
+		t.Fatalf("failed side compact error = %v", err)
+	}
+	if conv.compactions != 1 {
+		t.Fatalf("blocked or failed side compacted provider %d times", conv.compactions)
+	}
 }
 
 func (*deferredSideTestConversation) ProviderConversationID() string       { return "provider-side-1" }
