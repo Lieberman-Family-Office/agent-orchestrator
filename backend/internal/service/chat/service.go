@@ -74,6 +74,7 @@ type Service struct {
 	renderMeasure    RenderMeasure
 	// renderMeasures tracks background measures, so tests can wait for them.
 	renderMeasures     sync.WaitGroup
+	sides              *sideManager
 	wakeChat           func(context.Context, domain.SessionID) error
 	hibernationEnabled func() bool
 	viewMu             sync.Mutex
@@ -83,6 +84,9 @@ type Service struct {
 	waking             map[domain.SessionID]int
 	wakeRuns           map[domain.SessionID]*wakeRun
 	backgroundWakes    map[domain.SessionID]bool
+
+	runPromptSuggestion   func(context.Context, domain.SessionID, string, string, string) (string, error)
+	promptSuggestionSlots chan struct{}
 
 	mu               sync.RWMutex
 	controllers      map[domain.SessionID]*Controller
@@ -121,6 +125,7 @@ func (g controllerGate) unlock() { <-g }
 // Options configures a Service. The id factory and clock are injected so tests
 // are deterministic.
 type Options struct {
+	AppRunID   string
 	Store      Store
 	Reader     SnapshotReader
 	PageReader SnapshotPageReader
@@ -167,7 +172,7 @@ func New(opts Options) *Service {
 	if now == nil {
 		now = func() time.Time { return time.Now().UTC() }
 	}
-	return &Service{
+	svc := &Service{
 		store:                  opts.Store,
 		reader:                 opts.Reader,
 		pageReader:             opts.PageReader,
@@ -193,7 +198,10 @@ func New(opts Options) *Service {
 		waking:                 make(map[domain.SessionID]int),
 		wakeRuns:               make(map[domain.SessionID]*wakeRun),
 		backgroundWakes:        make(map[domain.SessionID]bool),
+		promptSuggestionSlots:  make(chan struct{}, 2),
 	}
+	svc.sides = newSideManager(svc, newMemorySideStore(), opts.AppRunID)
+	return svc
 }
 
 func (s *Service) controllerGate(owner domain.ConversationOwner) controllerGate {
@@ -488,6 +496,21 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 		}
 	}
 
+	// One read of the session serves every first-controller decision below. A
+	// provisioning retry is not necessarily the first controller: only durable
+	// controller ownership or provider history proves work was dispatched.
+	var sessionRecord domain.SessionRecord
+	sessionFound := false
+	if s.sessions != nil {
+		var readErr error
+		sessionRecord, sessionFound, readErr = s.sessions.GetSession(ctx, cfg.SessionID)
+		if readErr != nil {
+			return nil, fmt.Errorf("read chat session before start: %w", readErr)
+		}
+	}
+	firstController := sessionFound && sessionRecord.ProvisionState.IsProvisioning() &&
+		sessionRecord.Metadata.ControllerGeneration == "" && sessionRecord.Metadata.ProviderConversationID == ""
+
 	scope := domain.ConversationScopeSession
 	if cfg.Kind == domain.KindOrchestrator {
 		scope = domain.ConversationScopeProject
@@ -495,16 +518,6 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 	now := s.now()
 	var resetBoundary domain.ConversationActivity
 	freshProjectContext := scope == domain.ConversationScopeProject && cfg.ProviderConversationID == ""
-	if freshProjectContext && s.sessions != nil {
-		record, found, readErr := s.sessions.GetSession(ctx, cfg.SessionID)
-		if readErr != nil {
-			return nil, fmt.Errorf("read initial project controller: %w", readErr)
-		}
-		if found && record.ProvisionState.IsProvisioning() && record.Metadata.ControllerGeneration == "" && record.Metadata.ProviderConversationID == "" {
-			// This owner's queued opening brief is intake, not a previous context to reset.
-			freshProjectContext = false
-		}
-	}
 	if freshProjectContext {
 		detail, marshalErr := json.Marshal(map[string]string{
 			"event":  "context.reset",
@@ -538,6 +551,12 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 			conversation.ActiveBranchID != handoff.PreviousBranchID || conversation.LatestSequence != handoff.PreviousSequence) {
 			err = errors.New("native Chat handoff conversation changed")
 		}
+	} else if freshProjectContext && firstController {
+		// What the user typed while this orchestrator provisioned waits in a
+		// session-scoped row. It moves to the project conversation with the rebind
+		// (#6523); a later controller must not replay it.
+		conversation, err = s.store.CreateProjectConversationAdoptingQueue(
+			ctx, conversationID, cfg.ProjectID, cfg.SessionID, resetBoundary, now)
 	} else if freshProjectContext {
 		conversation, err = s.store.CreateProjectConversationWithContextReset(
 			ctx, conversationID, cfg.ProjectID, cfg.SessionID, resetBoundary, now)
@@ -586,28 +605,20 @@ func (s *Service) Start(ctx context.Context, cfg StartConfig) (*Controller, erro
 		providerScopeID = cfg.ProviderScopeID
 		providerHandleOwnedByActiveBranch = providerScopeID == activeBranch.ProviderScopeID
 	}
-	// A provisioning retry is not necessarily the first controller. Only durable
-	// controller ownership (or a running provider turn) proves work was dispatched;
-	// queued-only intake must survive a failed first drain.
+	// A running provider turn also proves dispatch; queued-only intake must
+	// survive a failed first drain.
 	queuedBeforeFirstController := false
 	preserveUndispatchedQueue := false
 	waking := s.isWaking(cfg.SessionID)
 	hadProviderHistory := false
-	if s.sessions != nil {
-		record, found, readErr := s.sessions.GetSession(ctx, cfg.SessionID)
-		if readErr != nil {
-			return nil, fmt.Errorf("read chat session before start: %w", readErr)
+	if sessionFound && (sessionRecord.ProvisionState.IsProvisioning() || waking) {
+		hadProviderHistory = sessionRecord.Metadata.ProviderConversationID != ""
+		running, listErr := s.store.ListVisibleRunningTurnProviderIDs(ctx, conversation.ID)
+		if listErr != nil {
+			return nil, fmt.Errorf("read running chat turns before start: %w", listErr)
 		}
-		if found && (record.ProvisionState.IsProvisioning() || waking) {
-			hadProviderHistory = record.Metadata.ProviderConversationID != ""
-			running, listErr := s.store.ListVisibleRunningTurnProviderIDs(ctx, conversation.ID)
-			if listErr != nil {
-				return nil, fmt.Errorf("read running chat turns before start: %w", listErr)
-			}
-			queuedBeforeFirstController = record.ProvisionState.IsProvisioning() && record.Metadata.ControllerGeneration == "" &&
-				record.Metadata.ProviderConversationID == "" && len(running) == 0
-			preserveUndispatchedQueue = len(running) == 0 && (record.ProvisionState.IsProvisioning() || waking)
-		}
+		queuedBeforeFirstController = firstController && len(running) == 0
+		preserveUndispatchedQueue = len(running) == 0 && (sessionRecord.ProvisionState.IsProvisioning() || waking)
 	}
 	providerBoundaryID := ""
 	if !providerHandleOwnedByActiveBranch {
@@ -1478,6 +1489,12 @@ func (s *Service) Stop(ctx context.Context, id domain.SessionID) error {
 		return err
 	}
 	defer gate.unlock()
+	// Each side is marked closed before its host stops, and a host that fails to
+	// stop stays queued for the periodic cleanup retry. Stopping the main chat
+	// (Exit agent, agent switch, spawn rollback) must not depend on it.
+	if err := s.closeSessionSides(ctx, id); err != nil {
+		s.log.Warn("side chat cleanup deferred while stopping session", "session", id, "error", err)
+	}
 	s.viewMu.Lock()
 	delete(s.viewClosedAt, id)
 	delete(s.viewLeases, id)
@@ -1574,6 +1591,9 @@ func (s *Service) Stop(ctx context.Context, id domain.SessionID) error {
 // StopForOwner closes a typed-owner controller without touching its parent
 // worker's Chat controller.
 func (s *Service) StopForOwner(ctx context.Context, owner domain.ConversationOwner) error {
+	if owner.Kind == domain.ConversationOwnerSession {
+		return s.Stop(ctx, domain.SessionID(owner.ID))
+	}
 	gate := s.controllerGate(owner)
 	if err := gate.lock(ctx); err != nil {
 		return err
@@ -1609,6 +1629,9 @@ func (s *Service) StopForOwner(ctx context.Context, owner domain.ConversationOwn
 
 // StopAll closes every controller, for daemon shutdown.
 func (s *Service) StopAll(ctx context.Context) {
+	if s.sides != nil {
+		s.sides.stopAll()
+	}
 	s.mu.Lock()
 	type shutdownTarget struct {
 		owner      domain.ConversationOwner
@@ -2481,6 +2504,19 @@ func permissionConfigOptions(harness domain.AgentHarness, options []ports.ChatCo
 	out := append([]ports.ChatConfigOption(nil), options...)
 	for i := range out {
 		out[i].Choices = append([]ports.ChatConfigOptionChoice(nil), out[i].Choices...)
+		if harness == domain.HarnessCommandCode && out[i].ID == "mode" {
+			choices := out[i].Choices[:0]
+			for _, choice := range out[i].Choices {
+				mode, ok := commandCodeApprovalMode(choice.Value)
+				if !ok {
+					continue
+				}
+				choice.PermissionMode = mode
+				choices = append(choices, choice)
+			}
+			out[i].Choices = choices
+			continue
+		}
 		for j := range out[i].Choices {
 			choice := &out[i].Choices[j]
 			choice.PermissionMode = ""
@@ -2512,6 +2548,19 @@ func permissionConfigOptions(harness domain.AgentHarness, options []ports.ChatCo
 		}
 	}
 	return out
+}
+
+func commandCodeApprovalMode(value string) (domain.PermissionMode, bool) {
+	switch value {
+	case "default":
+		return domain.PermissionModeDefault, true
+	case "auto-accept":
+		return domain.PermissionModeAuto, true
+	case "bypass":
+		return domain.PermissionModeBypassPermissions, true
+	default:
+		return "", false
+	}
 }
 
 func openCodeApprovalTier(value string) (domain.PermissionMode, string, bool) {

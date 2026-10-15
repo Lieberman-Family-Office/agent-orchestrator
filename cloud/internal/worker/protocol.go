@@ -21,8 +21,11 @@ type BootstrapRequest struct {
 
 // LaunchContext is the durable session context handed to a bootstrapped worker.
 type LaunchContext struct {
-	SessionID      string `json:"sessionId"`
-	ProjectID      string `json:"projectId"`
+	SessionID string `json:"sessionId"`
+	ProjectID string `json:"projectId"`
+	// ProjectName is the project's display name, for the Setup and Cleanup
+	// commands' environment.
+	ProjectName    string `json:"projectName,omitempty"`
 	Kind           string `json:"kind"`
 	Harness        string `json:"harness"`
 	DisplayName    string `json:"displayName"`
@@ -49,6 +52,12 @@ type LaunchContext struct {
 	// SystemPrompt carries control-plane-authored project context and rules. It
 	// remains separate from Prompt, which is the user's visible task input.
 	SystemPrompt string `json:"systemPrompt"`
+	// PostCreate and PreRemove are the project's Setup and Cleanup commands
+	// (Project settings > Scripts), read from the project when the worker
+	// boots. Setup runs after the checkout and before the coding agent starts;
+	// Cleanup runs before the workspace is deleted.
+	PostCreate []string `json:"postCreate,omitempty"`
+	PreRemove  []string `json:"preRemove,omitempty"`
 }
 
 // RepoRef is one additional repository the worker clones beside the primary
@@ -72,13 +81,27 @@ type BootstrapResponse struct {
 type HeartbeatRequest struct {
 	Version      string   `json:"version"`
 	Capabilities []string `json:"capabilities"`
+	// Busy reports activity since the previous heartbeat (terminal output, a
+	// process under a workspace shell, CPU use), so idle pause only stops a
+	// session that is truly idle. A worker sends it only to a control plane
+	// that advertised HeartbeatFeatureBusy: an older control plane rejects
+	// unknown heartbeat fields, which would fail every heartbeat after a
+	// control-plane rollback.
+	Busy bool `json:"busy,omitempty"`
 }
+
+// HeartbeatFeatureBusy, in HeartbeatResponse.Features, means the control plane
+// accepts HeartbeatRequest.Busy.
+const HeartbeatFeatureBusy = "busy"
 
 // HeartbeatResponse renews the worker's short-lived token.
 type HeartbeatResponse struct {
 	OK          bool   `json:"ok"`
 	WorkerToken string `json:"workerToken"`
 	ExpiresIn   int    `json:"expiresIn"`
+	// Features lists the optional heartbeat request fields this control plane
+	// accepts (HeartbeatFeatureBusy). Older control planes omit it.
+	Features []string `json:"features,omitempty"`
 }
 
 // CheckoutGrantResponse carries a repository-scoped, short-lived GitHub App

@@ -368,9 +368,10 @@ func migrate(db *sql.DB) error {
 	return reconcileSchema(db)
 }
 
-// repairCustom0134MigrationHistory supersedes the installed custom 190/191
-// identities with 195/196 before applying upstream's distinct 190/191 schema.
-// The custom SQL bodies are unchanged. Ambiguous or partial schema is refused.
+// repairCustom0134MigrationHistory moves custom 190/191 and fork 195–197 to
+// 198–200, preserving their SQL bodies and upstream's distinct identities.
+// Schema and history must agree. All identity changes commit together; partial
+// or ambiguous databases are refused before goose can skip or replay their DDL.
 func repairCustom0134MigrationHistory(db *sql.DB) error {
 	var exists int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name='goose_db_version' AND type='table'`).Scan(&exists); err != nil || exists == 0 {
@@ -381,34 +382,103 @@ func repairCustom0134MigrationHistory(db *sql.DB) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	applied := make(map[int]int)
+	for _, version := range []int{190, 191, 195, 196, 197, 198, 199, 200} {
+		var state int
+		if err := tx.QueryRow(`SELECT COALESCE((SELECT is_applied FROM goose_db_version WHERE version_id=? ORDER BY id DESC LIMIT 1),0)`, version).Scan(&state); err != nil {
+			return err
+		}
+		applied[version] = state
+	}
+	var requestedOutput, artifactVersions int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='requested_output'`).Scan(&requestedOutput); err != nil {
+		return err
+	}
+	if requestedOutput != 0 {
+		var valid int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='requested_output' AND upper(type)='TEXT' AND "notnull"=1 AND dflt_value="''" AND pk=0`).Scan(&valid); err != nil {
+			return err
+		}
+		if valid != 1 || applied[195] != 1 {
+			return errors.New("upstream migration 195 schema or identity is incompatible")
+		}
+	}
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name IN ('session_artifact_versions','idx_session_artifact_versions_sha')`).Scan(&artifactVersions); err != nil {
+		return err
+	}
+	if artifactVersions != 0 {
+		if artifactVersions != 2 || applied[196] != 1 || requestedOutput != 1 {
+			return errors.New("upstream migration 196 schema or identity is incomplete")
+		}
+		for kind, name := range map[string]string{"table": "session_artifact_versions", "index": "idx_session_artifact_versions_sha"} {
+			if err := validateMigrationObject(tx, "0196_session_artifact_versions.sql", kind, name); err != nil {
+				return err
+			}
+		}
+	}
 	for _, migration := range []struct {
-		old, next                       int
-		file, presence, valid, upstream string
+		legacy, old, next, want, upstream     int
+		file, presence, valid, legacyUpstream string
 	}{
-		{190, 195, "0195_project_revision.sql",
+		{190, 195, 198, 1, requestedOutput, "0198_project_revision.sql",
 			`SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name='revision'`,
 			`SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name='revision' AND upper(type)='INTEGER' AND "notnull"=1 AND dflt_value='0' AND pk=0`,
 			`SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='hibernated_at'`},
-		{191, 196, "0196_interrupt_and_send.sql",
+		{191, 196, 199, 2, artifactVersions, "0199_interrupt_and_send.sql",
 			`SELECT COUNT(*) FROM pragma_table_info('conversation_turns') WHERE name IN ('interrupt_target_provider_turn_id','interrupt_delivered')`,
 			`SELECT COUNT(*) FROM pragma_table_info('conversation_turns') WHERE "notnull"=1 AND pk=0 AND ((name='interrupt_target_provider_turn_id' AND upper(type)='TEXT' AND dflt_value="''") OR (name='interrupt_delivered' AND upper(type)='BOOLEAN' AND upper(dflt_value)='FALSE'))`,
 			`SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='branch_state'`},
+		{0, 197, 200, 1, requestedOutput + artifactVersions, "0200_provider_events_turn_completed_index.sql",
+			`SELECT COUNT(*) FROM sqlite_master WHERE name='idx_conversation_provider_events_turn_completed'`,
+			`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_conversation_provider_events_turn_completed' AND tbl_name='conversation_provider_events'`,
+			`SELECT 1`},
 	} {
-		var present, valid, upstream, old, next int
+		var present, valid, legacyUpstream int
 		if err := tx.QueryRow(migration.presence).Scan(&present); err != nil {
 			return err
 		}
+		if err := tx.QueryRow(migration.legacyUpstream).Scan(&legacyUpstream); err != nil {
+			return err
+		}
+		old := 0
+		if applied[migration.legacy] == 1 && legacyUpstream == 0 {
+			old = migration.legacy
+		}
+		if applied[migration.old] == 1 && migration.upstream == 0 {
+			if old != 0 {
+				return fmt.Errorf("custom migration %d has competing identities", migration.old)
+			}
+			old = migration.old
+		}
+		// 197 is data-only upstream. Its identity needs both upstream schema
+		// markers, or both preceding fork identities; the row alone proves nothing.
+		if migration.old == 197 && applied[197] == 1 &&
+			((migration.upstream != 0 && migration.upstream != 3) ||
+				(migration.upstream == 0 && (applied[195] != 1 || applied[196] != 1))) {
+			return errors.New("migration 197 identity is ambiguous")
+		}
 		if present == 0 {
+			if migration.old == 195 {
+				var triggers int
+				if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name IN ('projects_revision_guard','projects_revision_update')`).Scan(&triggers); err != nil {
+					return err
+				}
+				if triggers != 0 {
+					return errors.New("custom project revision triggers have no matching column")
+				}
+			}
+			if old != 0 || applied[migration.next] == 1 {
+				return fmt.Errorf("custom migration %d history has no matching schema", migration.old)
+			}
 			continue
 		}
-		want := migration.next - 194
 		if err := tx.QueryRow(migration.valid).Scan(&valid); err != nil {
 			return err
 		}
-		if present != want || valid != want {
-			return fmt.Errorf("custom migration %d has incomplete or incompatible columns", migration.old)
+		if present != migration.want || valid != migration.want {
+			return fmt.Errorf("custom migration %d has incomplete or incompatible columns", migration.legacy)
 		}
-		if migration.old == 190 {
+		if migration.old == 195 {
 			var schema string
 			if err := tx.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='projects'`).Scan(&schema); err != nil {
 				return err
@@ -416,48 +486,64 @@ func repairCustom0134MigrationHistory(db *sql.DB) error {
 			if !strings.Contains(strings.Join(strings.Fields(schema), " "), "CHECK (typeof(revision) = 'integer' AND revision >= 0)") {
 				return errors.New("custom project revision constraint is incompatible")
 			}
-			body, err := migrationsFS.ReadFile("migrations/" + migration.file)
-			if err != nil {
-				return err
-			}
-			body = bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
 			for _, name := range []string{"projects_revision_guard", "projects_revision_update"} {
-				start := bytes.Index(body, []byte("CREATE TRIGGER "+name+"\n"))
-				if start < 0 {
-					return fmt.Errorf("custom migration lacks trigger %s", name)
-				}
-				expected := strings.TrimSpace(strings.Split(string(body)[start:], "-- +goose StatementEnd")[0])
-				var actual string
-				if err := tx.QueryRow(`SELECT sql FROM sqlite_master WHERE type='trigger' AND name=? AND tbl_name='projects'`, name).Scan(&actual); err != nil {
-					return fmt.Errorf("read custom trigger %s: %w", name, err)
-				}
-				if strings.Join(strings.Fields(strings.TrimSuffix(actual, ";")), " ") != strings.Join(strings.Fields(strings.TrimSuffix(expected, ";")), " ") {
-					return fmt.Errorf("custom trigger %s is incompatible", name)
+				if err := validateMigrationObject(tx, migration.file, "trigger", name); err != nil {
+					return err
 				}
 			}
 		}
-		for _, item := range []struct {
-			version int
-			value   *int
-		}{{migration.old, &old}, {migration.next, &next}} {
-			if err := tx.QueryRow(`SELECT COALESCE((SELECT is_applied FROM goose_db_version WHERE version_id=? ORDER BY id DESC LIMIT 1),0)`, item.version).Scan(item.value); err != nil {
+		if migration.old == 197 {
+			if err := validateMigrationObject(tx, migration.file, "index", "idx_conversation_provider_events_turn_completed"); err != nil {
 				return err
 			}
 		}
-		if next == 1 {
+		if applied[migration.next] == 1 && old == 0 {
 			continue
 		}
-		if err := tx.QueryRow(migration.upstream).Scan(&upstream); err != nil {
-			return err
-		}
-		if old != 1 || upstream != 0 {
+		if old == 0 || applied[migration.next] == 1 {
 			return fmt.Errorf("custom migration %d identity is ambiguous", migration.old)
 		}
-		if _, err := tx.Exec(`UPDATE goose_db_version SET version_id=? WHERE version_id=?`, migration.next, migration.old); err != nil {
+		var destinationRows int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM goose_db_version WHERE version_id=?`, migration.next).Scan(&destinationRows); err != nil {
+			return err
+		}
+		if destinationRows != 0 {
+			return fmt.Errorf("custom migration destination %d already has history", migration.next)
+		}
+		if _, err := tx.Exec(`UPDATE goose_db_version SET version_id=? WHERE version_id=?`, migration.next, old); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
+}
+
+// validateMigrationObject compares the actual DDL with the unchanged shipped
+// statement. Only whitespace and SQLite's removal of IF NOT EXISTS are ignored.
+// ponytail: These fingerprints cover v0.14.1; extend them before later DDL alters these objects.
+func validateMigrationObject(tx *sql.Tx, file, kind, name string) error {
+	body, err := migrationsFS.ReadFile("migrations/" + file)
+	if err != nil {
+		return err
+	}
+	body = bytes.ReplaceAll(body, []byte("\r\n"), []byte("\n"))
+	source := strings.ReplaceAll(string(body), "IF NOT EXISTS ", "")
+	start := strings.Index(source, "CREATE "+strings.ToUpper(kind)+" "+name)
+	if start < 0 {
+		return fmt.Errorf("migration %s lacks %s %s", file, kind, name)
+	}
+	end := ";"
+	if kind == "trigger" {
+		end = "-- +goose StatementEnd"
+	}
+	expected := strings.TrimSuffix(strings.TrimSpace(strings.Split(source[start:], end)[0]), ";")
+	var actual string
+	if err := tx.QueryRow(`SELECT sql FROM sqlite_master WHERE type=? AND name=?`, kind, name).Scan(&actual); err != nil {
+		return fmt.Errorf("read migration %s %s: %w", kind, name, err)
+	}
+	if strings.Join(strings.Fields(strings.TrimSuffix(actual, ";")), " ") != strings.Join(strings.Fields(expected), " ") {
+		return fmt.Errorf("migration %s %s is incompatible", kind, name)
+	}
+	return nil
 }
 
 // repairRenumberedCueMigrationHistory preserves preview Cue databases that

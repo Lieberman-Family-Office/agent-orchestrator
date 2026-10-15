@@ -53,6 +53,7 @@ type Store interface {
 	CreateReviewConversation(ctx context.Context, id, reviewID string, project domain.ProjectID, session domain.SessionID, now time.Time) (domain.ConversationRecord, error)
 	OpenNativeConversation(ctx context.Context, id string, scope domain.ConversationScope, project domain.ProjectID, session domain.SessionID, now time.Time) (domain.ConversationRecord, error)
 	CreateProjectConversationWithContextReset(ctx context.Context, id string, project domain.ProjectID, session domain.SessionID, reset domain.ConversationActivity, now time.Time) (domain.ConversationRecord, error)
+	CreateProjectConversationAdoptingQueue(ctx context.Context, id string, project domain.ProjectID, session domain.SessionID, reset domain.ConversationActivity, now time.Time) (domain.ConversationRecord, error)
 	ConversationForSession(ctx context.Context, session domain.SessionID) (domain.ConversationRecord, error)
 	ClaimChatControllerGeneration(ctx context.Context, session domain.SessionID, generation string) error
 	ClaimReviewChatController(ctx context.Context, reviewID, providerID, generation string, now time.Time) (bool, error)
@@ -157,6 +158,7 @@ type Store interface {
 	ClaimInputAnswer(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, branchID string, activity domain.ConversationActivity, answerJSON string, now time.Time) (bool, error)
 	ResolveInputAnswer(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, branchID, activityID, answerJSON string, now time.Time) (bool, error)
 	ReleaseInputAnswer(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, branchID, activityID, answerJSON string, now time.Time) (bool, error)
+	DismissDetachedQuestion(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, branchID string, activity domain.ConversationActivity, now time.Time) (bool, error)
 	DetachQuestion(ctx context.Context, conversationID, requestID string, now time.Time) (bool, error)
 	HasPendingConversationInteractions(ctx context.Context, conversationID string) (bool, error)
 	FailPendingApprovals(ctx context.Context, conversationID string, now time.Time) error
@@ -222,6 +224,10 @@ type Controller struct {
 	// sendMu serializes command dispatch so only one operation mutates the
 	// provider conversation at a time.
 	sendMu sync.Mutex
+	// A current-context copy fences dispatch, but Stop cancels it before waiting.
+	forkCancel context.CancelFunc
+	forkDone   chan struct{}
+	interrupts int
 	// configMu serializes live provider setting changes. Each response replaces
 	// the complete option catalog and updates durable next-turn settings, so
 	// concurrent writes could otherwise persist an older catalog last.
@@ -2416,15 +2422,30 @@ func (c *Controller) ResolveInput(
 		}
 		return domain.ErrClientMessageConflict
 	}
-	if activity.Status != domain.ActivityStatusPending {
-		return ports.ErrChatRequestNotPending
-	}
 	question := ports.ChatInputRequest{Mode: stored.InputMode, Message: stored.Message, Schema: stored.Schema, QuestionAgentID: stored.QuestionAgentID, QuestionParentToolUseID: stored.QuestionParentToolUseID}
 	persistent := stored.PersistentQuestion && c.harness == domain.HarnessClaudeCode && question.PersistentQuestion()
+	dismissing := persistent && !stored.ProviderPending && response.Action == ports.ChatInputActionCancel
+	if activity.Status != domain.ActivityStatusPending && (!dismissing || activity.Status != domain.ActivityStatusCancelled) {
+		return ports.ErrChatRequestNotPending
+	}
 	if persistent {
 		if err := question.ValidateQuestionResponse(response); err != nil {
 			return err
 		}
+	}
+	if dismissing {
+		if activity.Status == domain.ActivityStatusCancelled {
+			return nil
+		}
+		// Dismissal does not retract or retry an earlier answer with uncertain delivery.
+		dismissed, err := c.store.DismissDetachedQuestion(ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, c.conversation.ActiveBranchID, activity, c.now())
+		if err != nil {
+			return fmt.Errorf("dismiss input %s: %w", requestID, err)
+		}
+		if !dismissed {
+			return ports.ErrChatRequestNotPending
+		}
+		return nil
 	}
 	responder, ok := c.conv.(ports.ChatInputResponder)
 	if !ok {
@@ -2627,6 +2648,13 @@ func (c *Controller) interruptForHandoff(ctx context.Context) error {
 //     "no active turn" would leave the user staring at a Working bar they cannot
 //     dismiss. Reconcile the durable row instead.
 func (c *Controller) Interrupt(ctx context.Context) error {
+	c.mu.Lock()
+	c.interrupts++
+	if c.forkCancel != nil {
+		c.forkCancel()
+	}
+	c.mu.Unlock()
+	defer func() { c.mu.Lock(); c.interrupts--; c.mu.Unlock() }()
 	// Stop's linearization point is the dispatch lock. A Send that acquired the
 	// lock first is existing work Stop should cancel; a Send that arrives after
 	// this point waits and is therefore post-Stop work that must survive.
@@ -2900,6 +2928,11 @@ func (c *Controller) Close(ctx context.Context) error {
 // host. Daemon shutdown uses Close so the host survives; user/session teardown
 // and controller replacement use Terminate.
 func (c *Controller) Terminate(ctx context.Context) error {
+	c.mu.Lock()
+	if c.forkCancel != nil {
+		c.forkCancel()
+	}
+	c.mu.Unlock()
 	c.once.Do(func() {
 		if terminator, ok := c.conv.(ports.ChatProviderTerminator); ok {
 			c.closeErr = terminator.Terminate()
@@ -2968,6 +3001,20 @@ func (c *Controller) project() {
 	}
 
 	for event := range c.conv.Events() {
+		if event.Kind == ports.ChatEventControllerState && event.ControllerState == ports.ChatControllerStopped &&
+			errors.Is(event.Err, ports.ErrChatRecoveryInconclusive) {
+			// A lost attachment is not proof the persistent provider stopped. Keep
+			// its turn/request correlation and queued intake for a replacement.
+			c.mu.Lock()
+			c.preserveProviderOnStop = true
+			c.state = ports.ChatControllerStopped
+			suppressStoppedActivity := c.suppressStoppedActivity
+			c.mu.Unlock()
+			if !suppressStoppedActivity {
+				c.reportActivity(ctx, domain.ActivityExited, "chat.controller.disconnected", c.now())
+			}
+			continue
+		}
 		c.mu.Lock()
 		if event.Kind == ports.ChatEventControllerState && event.ControllerState == ports.ChatControllerStopped && (event.ProviderRetained || retainedProvider()) {
 			if preserver, ok := c.conv.(ports.ChatProviderPreserver); ok && preserver.PreservesProviderOnClose() {

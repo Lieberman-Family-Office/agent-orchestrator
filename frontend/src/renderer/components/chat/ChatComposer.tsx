@@ -59,6 +59,7 @@ import {
 	type ComposerEditorHandle,
 	type ComposerImage,
 	type ComposerEditorSnapshot,
+	type ComposerPromptSuggestion,
 	type ComposerTrigger,
 } from "./ComposerEditor";
 import { moveHighlight, rankFiles, rankSkills, type Suggestion } from "./composerSuggest";
@@ -127,6 +128,16 @@ const DEFINITIVE_SEND_REJECTIONS = new Set([
 	// references can only fail again; return them to the draft for removal.
 	"CHAT_EXCERPT_INVALID",
 	"CHAT_EXCERPT_STALE",
+	// A /btw or /side request the daemon refused never opened a side chat, so a
+	// retry cannot succeed; return the draft instead of locking the composer.
+	"CHAT_SIDE_UNAVAILABLE",
+	"CHAT_SIDE_UNSUPPORTED",
+	"CHAT_SIDE_ANCHOR_UNAVAILABLE",
+	"CHAT_SIDE_INVALID_REQUEST",
+	"CHAT_SIDE_NOT_READY",
+	"CHAT_SIDE_RECREATE_REQUIRED",
+	"CHAT_SIDE_CLOSED",
+	"CHAT_SIDE_IDEMPOTENCY_CONFLICT",
 ]);
 
 // Native image blocks are persisted with the chat turn and sent to the provider.
@@ -158,7 +169,12 @@ function restoredDeliveryNotice(delivery: ChatComposerDelivery | undefined): str
 }
 /** A retained server-owned attachment; image bytes stay in durable storage. */
 export type StoredComposerAttachment = ChatDraftRetainedAttachment & { dataUrl?: string };
-export type ChatComposerHandle = { focus(): void; isEmpty(): boolean };
+export type ChatComposerHandle = {
+	focus(): void;
+	isEmpty(): boolean;
+	/** Replaces the draft with text, saved like typed input, and focuses the editor. */
+	setDraft(text: string): void;
+};
 
 export const ChatComposer = memo(function ChatComposer({
 	focusRef,
@@ -189,6 +205,7 @@ export const ChatComposer = memo(function ChatComposer({
 	editingQueuedTurnId,
 	onCancelQueuedEdit,
 	onQueuedDraftChange,
+	onDraftEmptyChange,
 	queuedDraftScope,
 	onQueuedAttachmentsChange,
 	onQueuedRetainedAttachmentsChange,
@@ -210,6 +227,7 @@ export const ChatComposer = memo(function ChatComposer({
 	assetSessionId,
 	acceptedClientMessageIds,
 	emptyPlaceholder,
+	promptSuggestion,
 	onSelectAnnotation,
 }: {
 	onSelectAnnotation?: (annotation: { text: string; messageId?: string; revision?: number }) => void;
@@ -238,6 +256,8 @@ export const ChatComposer = memo(function ChatComposer({
 	starting?: boolean;
 	/** A contextual prompt shown before an otherwise empty conversation begins. */
 	emptyPlaceholder?: string;
+	/** A proposed next message, kept out of the draft until accepted with Tab. */
+	promptSuggestion?: ComposerPromptSuggestion;
 	/** The provider's skills. Empty leaves `/` an ordinary character. */
 	skills?: ChatSkill[];
 	/** Worktree-relative paths offered for `@`. Empty leaves `@` ordinary. */
@@ -276,6 +296,8 @@ export const ChatComposer = memo(function ChatComposer({
 	editingQueuedTurnId?: string;
 	onCancelQueuedEdit?: () => void;
 	onQueuedDraftChange?: (text: string) => void;
+	/** Called when the draft turns empty or non-empty, including after a restore. */
+	onDraftEmptyChange?: (empty: boolean) => void;
 	queuedDraftScope?: ChatDraftScope;
 	onQueuedAttachmentsChange?: (attachments: ChatDraftAttachment[]) => void;
 	onQueuedRetainedAttachmentsChange?: (attachments: ChatDraftRetainedAttachment[]) => void;
@@ -541,6 +563,9 @@ export const ChatComposer = memo(function ChatComposer({
 		path && IMAGE_ATTACHMENT_PATH.test(path) ? [{ path, name: file.name, src: preview }] : []);
 	const controlsDisabled = Boolean(disabled || submitting);
 	const hasDraft = hasText || staged || contextReferences.length > 0;
+	useEffect(() => {
+		onDraftEmptyChange?.(!hasDraft);
+	}, [hasDraft, onDraftEmptyChange]);
 	const savingQueuedEdit = Boolean(editingQueuedTurnId);
 	const acceptedMutationWaiting = Boolean(
 		composerMutation.accepted &&
@@ -680,7 +705,6 @@ export const ChatComposer = memo(function ChatComposer({
 		if (!autoFocus || disabled) return;
 		editor.current?.focus();
 	}, [autoFocus, disabled]);
-	useImperativeHandle(focusRef, () => ({ focus: focusEditor, isEmpty: () => !hasDraft }), [focusEditor, hasDraft]);
 
 	useEffect(() => {
 		focusEditor();
@@ -1026,6 +1050,20 @@ export const ChatComposer = memo(function ChatComposer({
 			setDismissedKey(null);
 		}
 	}, [draftScope, onQueuedDraftChange, optimisticSend]);
+	useImperativeHandle(
+		focusRef,
+		() => ({
+			focus: focusEditor,
+			isEmpty: () => !hasDraft,
+			setDraft: (text: string) => {
+				editor.current?.setText(text);
+				const snapshot = editor.current?.getSnapshot();
+				if (snapshot) onEditorChange(snapshot);
+				editor.current?.focus();
+			},
+		}),
+		[focusEditor, hasDraft, onEditorChange],
+	);
 
 	const pick = useCallback((value: string) => {
 		const currentTrigger = triggerRef.current;
@@ -1071,6 +1109,7 @@ export const ChatComposer = memo(function ChatComposer({
 		(snapshot: ComposerEditorSnapshot, key: "Enter" | "Tab"): string | undefined => {
 			const currentTrigger = snapshot.trigger;
 			if (!currentTrigger) return undefined;
+			if (key === "Enter" && /^\/(btw|side)$/.test(snapshot.text.trim()) && skills.some((skill) => skill.name === snapshot.text.trim().slice(1) && skill.source === "AO")) return undefined;
 			if (key === "Enter" && snapshot.text.trim() === "/compact" && onCompact) {
 				return undefined;
 			}
@@ -1082,7 +1121,7 @@ export const ChatComposer = memo(function ChatComposer({
 			dismissedKeyRef.current = null;
 			return chosen.value;
 		},
-		[onCompact, suggestionsFor],
+		[onCompact, skills, suggestionsFor],
 	);
 
 	function submit(event?: FormEvent, forceSteer?: boolean): Promise<void> {
@@ -1683,69 +1722,80 @@ export const ChatComposer = memo(function ChatComposer({
 						</button>
 					</div>
 				) : null}
-				{staged ? (
-					<ul className="flex flex-wrap gap-1.5" aria-label="Attached files">
-						{stripAttachments.map(({ file, path, preview }) => {
-							return (
-							<li
-								key={file.id}
-								className="flex items-center gap-1.5 rounded bg-interactive-hover py-0.5 pl-0.5 pr-1"
-							>
-								{preview ? (
-									<img src={preview} alt="" className="size-6 rounded-sm object-cover" />
-								) : (
-									<div className="flex size-6 items-center justify-center rounded-sm bg-surface">
-										<File aria-hidden="true" className="size-3.5 text-muted-foreground" />
-									</div>
-								)}
-								<span
-									className="max-w-[120px] truncate text-xs text-muted-foreground"
-									title={file.name}
-								>
-									{file.name}
-								</span>
-								<button
-									type="button"
-									onClick={() => {
-									if (submitInFlight.current) return;
-									if (path) editor.current?.removeImage(path);
-									if (visibleRetainedAttachments.some((attachment) => attachment.id === file.id)) {
-										const next = retainedAttachments.filter((attachment) => attachment.id !== file.id);
-										setRetainedAttachments(next);
-										onQueuedRetainedAttachmentsChange?.(next);
-									} else fileAttachments.remove(file.id);
-									}}
-									disabled={controlsDisabled || queuedEditRecovery || draftMutationPending || fileAttachments.preparing}
-									aria-label={`Remove ${file.name}`}
-									className="text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
-								>
-									<X aria-hidden="true" className="size-3" />
-								</button>
-							</li>
-							);
-						})}
-					</ul>
-				) : null}
-				{contextReferences.length > 0 ? (
-					<ChatAnnotationSummary
-						annotations={contextReferences}
-						onSelect={onSelectAnnotation}
-						disabled={controlsDisabled || draftMutationPending}
-						onRemove={(excerpt) => {
-							if (!draftScope || submitInFlight.current || !excerpt.id) return;
-							const result = writeChatExcerptReferences(
-								draftScope,
-								contextReferences.filter((item) => item.id !== excerpt.id),
-							);
-							composerRevision.current = result.draft.composer.revision;
-							setTextDraftPersistenceError(result.ok ? null : "chat.draft.saveFailed");
-						}}
-					/>
+				{staged || contextReferences.length > 0 ? (
+					<div className="flex flex-wrap items-center gap-1.5" data-testid="composer-attachments-and-annotations">
+						{staged ? (
+							<ul className="contents" aria-label="Attached files">
+								{stripAttachments.map(({ file, path, preview }) => {
+									return (
+									<li
+										key={file.id}
+										className="flex items-center gap-1.5 rounded bg-interactive-hover py-0.5 pl-0.5 pr-1"
+									>
+										{preview ? (
+											<img src={preview} alt="" className="size-6 rounded-sm object-cover" />
+										) : (
+											<div className="flex size-6 items-center justify-center rounded-sm bg-surface">
+												<File aria-hidden="true" className="size-3.5 text-muted-foreground" />
+											</div>
+										)}
+										<span
+											className="max-w-[120px] truncate text-xs text-muted-foreground"
+											title={file.name}
+										>
+											{file.name}
+										</span>
+										<button
+											type="button"
+											onClick={() => {
+											if (submitInFlight.current) return;
+											if (path) editor.current?.removeImage(path);
+											if (visibleRetainedAttachments.some((attachment) => attachment.id === file.id)) {
+												const next = retainedAttachments.filter((attachment) => attachment.id !== file.id);
+												setRetainedAttachments(next);
+												onQueuedRetainedAttachmentsChange?.(next);
+											} else fileAttachments.remove(file.id);
+											}}
+											disabled={controlsDisabled || queuedEditRecovery || draftMutationPending || fileAttachments.preparing}
+											aria-label={`Remove ${file.name}`}
+											className="text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+										>
+											<X aria-hidden="true" className="size-3" />
+										</button>
+									</li>
+									);
+								})}
+							</ul>
+						) : null}
+						{contextReferences.length > 0 ? (
+							<ChatAnnotationSummary
+								annotations={contextReferences}
+								onSelect={onSelectAnnotation}
+								disabled={controlsDisabled || draftMutationPending}
+								onRemoveAll={() => {
+									if (!draftScope || submitInFlight.current) return;
+									const result = writeChatExcerptReferences(draftScope, []);
+									composerRevision.current = result.draft.composer.revision;
+									setTextDraftPersistenceError(result.ok ? null : "chat.draft.saveFailed");
+								}}
+								onRemove={(excerpt) => {
+									if (!draftScope || submitInFlight.current || !excerpt.id) return;
+									const result = writeChatExcerptReferences(
+										draftScope,
+										contextReferences.filter((item) => item.id !== excerpt.id),
+									);
+									composerRevision.current = result.draft.composer.revision;
+									setTextDraftPersistenceError(result.ok ? null : "chat.draft.saveFailed");
+								}}
+							/>
+						) : null}
+					</div>
 				) : null}
 
 				<ComposerEditor
 					ref={editor}
 					images={composerImages}
+					promptSuggestion={willQueue || starting || editingQueuedTurnId || staged ? undefined : promptSuggestion}
 					disabled={Boolean(disabled || queuedEditRecovery || (!optimisticSend && (submitting || draftMutationPending)))}
 					concealed={sendConcealed && !optimisticSend}
 					label="Message the agent"

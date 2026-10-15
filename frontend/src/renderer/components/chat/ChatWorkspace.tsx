@@ -1,5 +1,8 @@
+import { TurnWorkSummary } from "./TurnWorkSummary";
 import { useChatDraftTranslation } from "../../lib/chat-draft-messages";
+import { isSettingsPageOpen } from "../../hooks/useAppShortcut";
 import { useLatestCallback, useStableSet } from "../../hooks/useStable";
+import { useTabListTabStop } from "../../hooks/useTabListTabStop";
 /**
  * The Chat surface for a session whose persisted mode is `chat`.
  *
@@ -32,11 +35,12 @@ import {
 	type ReactNode,
 	type WheelEvent as ReactWheelEvent,
 } from "react";
-import { ArrowDown, ChevronRight, Eye, EyeOff, Loader2,MessageSquarePlus, TriangleAlert, Undo2 } from "lucide-react";
-import { Reorder, useDragControls } from "motion/react";
+import { ArrowDown, Eye, EyeOff, Lightbulb, Loader2, MessageSquarePlus, TriangleAlert, Undo2 } from "lucide-react";
+import { AnimatePresence, motion, Reorder, useDragControls, useReducedMotion } from "motion/react";
 import { useTranslation } from "react-i18next";
 import { useChatSelectionPosition } from "../../hooks/useChatSelectionPosition";
 import { actionMenuContentClass, actionMenuItemClass } from "../ui/menu-styles";
+import { NAV_ROW_HIGHLIGHT_HOST_CLASS, NavRowHighlight } from "../NavRowHighlight";
 import { useScrollFollow } from "../../hooks/useScrollFollow";
 import {
 	defaultRangeExtractor,
@@ -101,7 +105,6 @@ import {
 import { AgentAvatar } from "../AgentAvatar";
 import { SessionPaneTab } from "../CenterPane";
 import { Button } from "../ui/button";
-import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "../ui/accordion";
 import { ConfirmDialog } from "../ConfirmDialog";
 import { SessionTopbarPortal } from "../SessionTopbarPortal";
 import { ShellTerminalTab } from "../ShellTerminalTab";
@@ -115,7 +118,6 @@ import {
 	OriginMessage,
 	SteerMessage,
 	TurnChangedFiles,
-	TurnDuration,
 	TurnOutcome,
 	LiveResponseStatus,
 	type TurnOutcomeRetryControl,
@@ -123,6 +125,7 @@ import {
 import { HumanMessageEditor } from "./HumanMessageEditor";
 import { ChatLinkProvider } from "./ChatMarkdown";
 import { ChatImageSourceProvider } from "./chat-image-source";
+import type { ComposerPromptSuggestion } from "./ComposerEditor";
 import { ChatComposer, type ChatComposerHandle, type StoredComposerAttachment } from "./ChatComposer";
 import { ContextMeter } from "./ContextMeter";
 import { stagedAttachmentParts, attachmentName } from "./messageAttachments";
@@ -229,6 +232,9 @@ function DraggableChatTab({ children, value }: { children: ReactNode; value: str
 				if ((event.target as HTMLElement).closest("[data-terminal-tab-action],input,a")) return;
 				dragControls.start(event);
 			}}
+			// Reorder needs layout measurement, but tabs should snap into place
+			// when a sibling opens or closes rather than slide.
+			transition={{ layout: { duration: 0 } }}
 			value={value}
 		>
 			{children}
@@ -313,7 +319,10 @@ function useQueuedMessages(snapshot: ConversationSnapshot, excludeTurnId?: strin
 }
 
 export interface ChatWorkspaceProps {
+	onAddToSideChat?: (excerpt: ChatDraftExcerptReference) => void | Promise<void>;
+	annotationNavigationRequest?: { id: string; text: string; messageId?: string; revision?: number };
 	snapshot: ConversationSnapshot;
+	promptSuggestion?: ComposerPromptSuggestion;
 	/** Renderer-owned state identity; the snapshot's sessionId remains the daemon wire ID. */
 	uiSessionId?: string;
 	/** Durable draft owner for a conversation that is not a worker session. */
@@ -600,7 +609,10 @@ export function ChatWorkspace(props: ChatWorkspaceProps) {
 }
 
 function ChatWorkspaceContent({
+	onAddToSideChat,
+	annotationNavigationRequest,
 	snapshot,
+	promptSuggestion,
 	sessionTitle,
 	sessionRole = "worker",
 	assetBaseUrl,
@@ -1118,10 +1130,15 @@ function ChatWorkspaceContent({
 	const [confirming, setConfirming] = useState<string | undefined>(undefined);
 	const surfaceRef = useRef<HTMLElement | null>(null);
 	const composerFocusRef = useRef<ChatComposerHandle>(null);
+	const artifactSession = session?.requestedOutput === "artifact";
+	// The sample prompts show only while the composer is empty: picking one hides
+	// them, and clearing the draft brings them back.
+	const [composerEmpty, setComposerEmpty] = useState(true);
 	const annotationNavigationRef = useRef<((annotation: { text: string; messageId?: string; revision?: number }) => void) | null>(null);
 	const navigateToAnnotation = useCallback((annotation: { text: string; messageId?: string; revision?: number }) => {
 		annotationNavigationRef.current?.(annotation);
 	}, []);
+	useEffect(() => { if (annotationNavigationRequest) navigateToAnnotation(annotationNavigationRequest); }, [annotationNavigationRequest, navigateToAnnotation]);
 	// Storage failures can be transient, so try again when the user comes back. Only while
 	// the composer is empty: recovering remounts it, which would drop unsaved text.
 	useEffect(() => {
@@ -1269,8 +1286,8 @@ function ChatWorkspaceContent({
 	);
 
 	useEffect(() => {
-		const disposePrevious = aoBridge.app.onPreviousTabShortcut(() => selectAdjacentTab(-1));
-		const disposeNext = aoBridge.app.onNextTabShortcut(() => selectAdjacentTab(1));
+		const disposePrevious = aoBridge.app.onPreviousTabShortcut(() => !isSettingsPageOpen() && selectAdjacentTab(-1));
+		const disposeNext = aoBridge.app.onNextTabShortcut(() => !isSettingsPageOpen() && selectAdjacentTab(1));
 		return () => {
 			disposePrevious();
 			disposeNext();
@@ -1685,6 +1702,7 @@ function ChatWorkspaceContent({
 						>
 							<ChatImageSourceProvider sessionId={snapshot.sessionId} assetBaseUrl={assetBaseUrl} remoteHost={Boolean(activeRemoteHostId)} artifacts={session?.artifactFiles}>
 								<Timeline
+							onAddToSideChat={onAddToSideChat}
 									annotationNavigationRef={annotationNavigationRef}
 									key={draftScopeKey}
 									snapshot={snapshot}
@@ -1727,16 +1745,21 @@ function ChatWorkspaceContent({
 								{discarded > 0 ? <RolledBackNotice count={discarded} /> : null}
 								{conversationEmpty ? (
 									<h1 className="mb-5 text-center text-2xl font-normal tracking-tight text-foreground sm:text-3xl">
-										{t("chat.welcome.heading")}
+										{t(artifactSession ? "chat.welcome.artifactHeading" : "chat.welcome.heading")}
 									</h1>
 								) : null}
+								<WelcomePromptSuggestions
+									open={conversationEmpty && !newWorkDisabled && composerEmpty}
+									artifact={artifactSession}
+									onPick={(text) => composerFocusRef.current?.setDraft(text)}
+								/>
 								<div ref={composerBoxRef} className="relative">
 									{welcomeLeaving ? (
 										<h1
 											aria-hidden="true"
 											className="chat-welcome-leaving pointer-events-none absolute inset-x-0 bottom-full mb-5 text-center text-2xl font-normal tracking-tight text-foreground sm:text-3xl"
 										>
-											{t("chat.welcome.heading")}
+											{t(artifactSession ? "chat.welcome.artifactHeading" : "chat.welcome.heading")}
 										</h1>
 									) : null}
 									<McpServerBanner
@@ -1757,6 +1780,11 @@ function ChatWorkspaceContent({
 										onSend={handleComposerSend}
 										onInterruptSend={newWorkDisabled ? undefined : onInterruptSend}
 										draftSeed={composerDraftSeed}
+										promptSuggestion={!queueEdit && !composerApproval && !composerElicitation && !turn &&
+											!busy && !sendPending && !steerPending && !agentInputDisabled && !newWorkDisabled &&
+											!controllerTransitioning && !loadingQuietly && !agentResuming &&
+											!workspaceActiveTabKey && !reviewerActive && !shellActive && snapshot.controller.state === "ready"
+											? promptSuggestion : undefined}
 										editingQueuedTurnId={queueEdit?.turnId}
 										queuedEditRecovery={Boolean(queueEdit?.clientMessageId)}
 										savingQueuedEditPending={Boolean(
@@ -1765,6 +1793,7 @@ function ChatWorkspaceContent({
 										)}
 										onCancelQueuedEdit={cancelQueuedEdit}
 										onQueuedDraftChange={queueEdit ? changeQueuedDraft : undefined}
+										onDraftEmptyChange={setComposerEmpty}
 										queuedDraftScope={queueEdit ? draftScope : undefined}
 										onQueuedAttachmentsChange={changeQueuedStagedAttachments}
 										onQueuedRetainedAttachmentsChange={changeQueuedRetainedAttachments}
@@ -1795,7 +1824,7 @@ function ChatWorkspaceContent({
 										// task can have non-message activity before its first visible chat
 										// message, and the generic placeholder makes a still-empty composer
 										// look like a regression.
-										emptyPlaceholder={conversationEmpty ? emptyChatPlaceholder : undefined}
+										emptyPlaceholder={conversationEmpty ? (artifactSession ? t("chat.welcome.artifactPlaceholder") : emptyChatPlaceholder) : undefined}
 										skills={skills}
 										filePaths={filePaths}
 										filePathsTruncated={filePathsTruncated}
@@ -2099,6 +2128,7 @@ function ChatHeader({
 	// space; chat must too or the back/forward buttons land on the tab label.
 	const isSidebarOpen = useUiStore(sidebarOccupiesLayout);
 	const clearanceRef = useSidebarChromeClearanceRef<HTMLDivElement>(isMac);
+	const tabListRef = useTabListTabStop<HTMLDivElement>();
 	const header = (
 		<header className="flex h-inspector-tabs w-full shrink-0 items-stretch bg-sidebar">
 			<div
@@ -2119,6 +2149,7 @@ function ChatHeader({
 						aria-label="Chat tabs"
 						className="flex h-full min-w-0 flex-1 items-stretch"
 						onKeyDown={onTabsKeyDown ?? handleTerminalTabListKeyDown}
+						ref={tabListRef}
 						role="tablist"
 					>
 						{session ? (
@@ -2154,7 +2185,7 @@ function ChatHeader({
 							</button>
 						)}
 						<div className="relative min-w-0 flex-1 self-stretch overflow-hidden">
-							<div ref={tabsOverflowRef} className="scrollbar-none flex h-full min-w-flex-min min-w-0 items-stretch overflow-x-auto">
+							<motion.div ref={tabsOverflowRef} className="scrollbar-none flex h-full min-w-flex-min min-w-0 items-stretch overflow-x-auto" layoutScroll>
 								<div className="flex w-max items-stretch">
 								<Reorder.Group
 									as="div"
@@ -2203,7 +2234,7 @@ function ChatHeader({
 								</Reorder.Group>
 								{workspaceTabActions}
 								</div>
-							</div>
+							</motion.div>
 							{showLeftFade ? <div aria-hidden="true" className="session-tab-scroll-fade session-tab-scroll-fade--left" /> : null}
 							{showRightFade ? <div aria-hidden="true" className="session-tab-scroll-fade" /> : null}
 						</div>
@@ -2372,7 +2403,15 @@ const CHAT_ESTIMATED_TURN_HEIGHT = 600;
 const CHAT_TURN_GAP = 18;
 const CHAT_INITIAL_VIEWPORT_HEIGHT = 800;
 
-function Timeline({
+/**
+ * The conversation transcript: turn grouping, live status, "Worked for", and
+ * scroll follow. Exported so a side chat renders its transcript with exactly
+ * this behavior while keeping its own composer.
+ */
+export function Timeline({
+	onAddToSideChat,
+	onAddToChat,
+	onForeignAnnotation,
 	annotationNavigationRef,
 	snapshot,
 	assetBaseUrl,
@@ -2402,6 +2441,11 @@ function Timeline({
 	startup,
 	arriving = false,
 }: {
+	onAddToSideChat?: ChatWorkspaceProps["onAddToSideChat"];
+	/** Replaces the default "Add to chat" (write to this draft scope's composer). */
+	onAddToChat?: (excerpt: ChatDraftExcerptReference) => void;
+	/** Handles annotations whose source is another conversation. */
+	onForeignAnnotation?: (annotation: { text: string; messageId?: string; revision?: number; conversationId?: string }) => void;
 	annotationNavigationRef: MutableRefObject<((annotation: { text: string; messageId?: string; revision?: number }) => void) | null>;
 	snapshot: ConversationSnapshot;
 	assetBaseUrl?: string;
@@ -2508,7 +2552,13 @@ function Timeline({
 	// that adds nothing (a failed page or a source outside this branch) must end
 	// the search instead of requesting the same page again.
 	const annotationOlderRequestGroups = useRef<number | undefined>(undefined);
-	const selectAnnotation = useCallback((annotation: { text: string; messageId?: string; revision?: number }) => {
+	const selectAnnotation = useCallback((annotation: { text: string; messageId?: string; revision?: number; conversationId?: string }) => {
+		if (onForeignAnnotation && annotation.conversationId && annotation.conversationId !== snapshot.conversationId) {
+			// The source lives in another conversation (a side chat quoting the main
+			// chat); its host navigates there instead of searching this transcript.
+			onForeignAnnotation(annotation);
+			return;
+		}
 		releaseFollow();
 		setAnnotationNavigationError(undefined);
 		annotationRetryCount.current = 0;
@@ -2524,7 +2574,7 @@ function Timeline({
 			return;
 		}
 		setAnnotationTarget({ ...annotation });
-	}, [releaseFollow]);
+	}, [onForeignAnnotation, releaseFollow, snapshot.conversationId]);
 	useEffect(() => {
 		annotationNavigationRef.current = selectAnnotation;
 		return () => { annotationNavigationRef.current = null; };
@@ -2623,6 +2673,13 @@ function Timeline({
 
 	const addSelectionToChat = useCallback(async () => {
 		if (!selectionAction) return;
+		if (onAddToChat) {
+			// A host with its own composer (a side chat) owns where references go.
+			onAddToChat(selectionAction.excerpt);
+			setSelectionAction(null);
+			window.getSelection()?.removeAllRanges();
+			return;
+		}
 		const composer = readChatSessionDraft(draftScope).composer;
 		// A pending delivery is cleared by revision on acceptance. Changing the
 		// draft now would keep the sent text and excerpts for a second send.
@@ -2642,7 +2699,7 @@ function Timeline({
 		setDraftPersistenceError(result.ok ? undefined : "chat.draft.saveFailed");
 		setSelectionAction(null);
 		window.getSelection()?.removeAllRanges();
-	}, [draftScope, selectionAction]);
+	}, [draftScope, onAddToChat, selectionAction]);
 	const inlineEditRecoveryLabel = durableInlineEditDelivery
 		? durableInlineEditDelivery.state === "accepted"
 			? "chat.draft.clearEdit"
@@ -3152,6 +3209,7 @@ function Timeline({
 				content: echo.excerpts?.map((excerpt) => ({
 					type: "excerpt",
 					text: excerpt.text,
+					sourceConversationId: excerpt.conversationId,
 					sourceMessageId: excerpt.messageId,
 					sourceRevision: excerpt.revision,
 				})),
@@ -3782,11 +3840,12 @@ function Timeline({
 					ref={selectionButton}
 					style={{ left: selectionPosition?.left ?? 0, top: selectionPosition?.top ?? 0, visibility: selectionPosition?.visible ? "visible" : "hidden" }}
 					onMouseDown={(event) => event.preventDefault()}
-					className={cn(actionMenuContentClass, "absolute min-w-0 w-max max-w-full shadow-lg")}
+					className={cn(actionMenuContentClass, "absolute flex-row min-w-0 w-max max-w-full shadow-lg")}
 				>
 					<button type="button" onClick={() => void addSelectionToChat()} className={cn(actionMenuItemClass, "shrink-0 whitespace-nowrap hover:bg-interactive-hover hover:text-foreground")}>
 						<MessageSquarePlus aria-hidden="true" className="size-3.5" /> Add to chat
 					</button>
+					{onAddToSideChat ? <button type="button" className={cn(actionMenuItemClass, "shrink-0 whitespace-nowrap hover:bg-interactive-hover")} onClick={() => { void onAddToSideChat(selectionAction.excerpt); clearSelectionAction(); window.getSelection()?.removeAllRanges(); }}><MessageSquarePlus aria-hidden="true" className="size-3.5" /> {t("sideChat.addToSideChat")}</button> : null}
 				</div>
 			) : null}
 			<div
@@ -4273,46 +4332,17 @@ const TurnGroup = memo(function TurnGroup({
 	const outcome = showSettledStatus ? group.outcome : undefined;
 	if (!outcome) {
 		body.push(...workedRuns.map(renderRun));
-	} else if (foldedRuns.length > 0) {
+	} else {
 		const disclosureKey = `${group.key}:worked`;
 		body.push(
-			<Accordion
+			<TurnWorkSummary
 				key="turn-worked"
-				type="single"
-				collapsible
-				className="-mx-1 border-b border-border"
-				// Held above the virtualizer, so the accordion stays open when its row scrolls away and back.
-				value={activityDisclosureOverrides[disclosureKey] ? "worked" : ""}
-				onValueChange={(value) => onActivityDisclosureChange(disclosureKey, value === "worked")}
+				durationMs={outcome.durationMs}
+				open={Boolean(activityDisclosureOverrides[disclosureKey])}
+				onOpenChange={(open) => onActivityDisclosureChange(disclosureKey, open)}
 			>
-				<AccordionItem value="worked" className="border-0">
-					<AccordionTrigger
-						className="chat-worked-trigger h-7 select-none gap-1 px-1 py-0 text-sm font-normal text-muted-foreground transition-colors hover:text-foreground active:transform-none"
-						headerClassName="hover:bg-transparent data-[state=open]:bg-transparent"
-						trailing={null}
-					>
-						<span className="inline-flex w-fit items-center gap-1">
-							Worked for
-							{outcome.durationMs !== undefined ? <TurnDuration durationMs={outcome.durationMs} inline /> : null}
-							<ChevronRight aria-hidden="true" className="size-3.5 shrink-0 transition-transform duration-200 group-data-[state=open]/row:rotate-90" />
-						</span>
-					</AccordionTrigger>
-					{/* Padding lives on the inner div: the content element's height is what animates,
-					    so any padding on it itself would stay put while it opens and closes. */}
-					<AccordionContent className="chat-worked-accordion-content">
-						<div className="space-y-2 px-1 pb-2 pt-1">{foldedRuns.map(renderRun)}</div>
-					</AccordionContent>
-				</AccordionItem>
-			</Accordion>,
-		);
-	} else {
-		body.push(
-			<div key="turn-worked-plain" className="-mx-1 flex h-7 select-none items-center border-b border-border px-1 py-0 text-sm font-normal text-muted-foreground">
-				<span className="inline-flex w-fit items-center gap-1">
-					Worked for
-					{outcome.durationMs !== undefined ? <TurnDuration durationMs={outcome.durationMs} inline /> : null}
-				</span>
-			</div>,
+				{foldedRuns.length > 0 ? foldedRuns.map(renderRun) : undefined}
+			</TurnWorkSummary>,
 		);
 	}
 	if (outcome) body.push(...noticeRuns.map(renderRun));
@@ -4874,4 +4904,62 @@ function rendersNothing(run: TimelineRun): boolean {
 	if (run.kind !== "single" || !item) return false;
 	if (item.kind === "message") return item.role === "assistant" && item.text.trim() === "";
 	return item.activityKind === "user_input" || (item.activityKind === "approval" && item.status === "pending");
+}
+
+const ARTIFACT_PROMPT_KEYS = [
+	"chat.welcome.artifactPrompt.plan",
+	"chat.welcome.artifactPrompt.compare",
+	"chat.welcome.artifactPrompt.notes",
+] as const;
+
+const CHAT_PROMPT_KEYS = [
+	"chat.welcome.prompt.review",
+	"chat.welcome.prompt.tests",
+	"chat.welcome.prompt.trace",
+] as const;
+
+/**
+ * Sample requests above an empty chat's composer; picking one fills the composer.
+ * The list collapses its height, and the gap below it, on the way in and out so the
+ * centered composer glides instead of jumping.
+ */
+function WelcomePromptSuggestions({ open, artifact, onPick }: { open: boolean; artifact: boolean; onPick: (text: string) => void }) {
+	const { t } = useTranslation();
+	const reducedMotion = useReducedMotion();
+	const keys = artifact ? ARTIFACT_PROMPT_KEYS : CHAT_PROMPT_KEYS;
+	return (
+		<AnimatePresence initial={false}>
+			{open ? (
+				<motion.div
+					key="welcome-prompts"
+					initial={{ height: 0, opacity: 0 }}
+					animate={{ height: "auto", opacity: 1, transition: { duration: reducedMotion ? 0 : 0.2, ease: [0.22, 1, 0.36, 1] } }}
+					exit={{ height: 0, opacity: 0, transition: { duration: reducedMotion ? 0 : 0.16, ease: [0.4, 0, 1, 1] } }}
+					// The dock's gap-2 sits outside this box. Cancel it and put the space back as
+					// padding inside, so it collapses with the height instead of snapping.
+					className="-mb-2 overflow-hidden"
+				>
+					<ul aria-label={t(artifact ? "chat.welcome.artifactPrompts" : "chat.welcome.prompts")} className="flex flex-col divide-y divide-border pb-3">
+						{keys.map((key) => (
+							<li key={key} className="py-0.5">
+								<button
+									type="button"
+									// Same growing pill as the sidebar rows; the host stays transparent.
+									className={cn(
+										"welcome-prompt-suggestion flex h-8 w-full items-center gap-2.5 rounded-lg px-2.5 text-left text-control text-muted-foreground focus-visible:outline-none",
+										NAV_ROW_HIGHLIGHT_HOST_CLASS,
+									)}
+									onClick={() => onPick(t(key))}
+								>
+									<NavRowHighlight />
+									<Lightbulb aria-hidden="true" className="relative z-[1] size-icon-sm shrink-0" />
+									<span className="relative z-[1] truncate">{t(key)}</span>
+								</button>
+							</li>
+						))}
+					</ul>
+				</motion.div>
+			) : null}
+		</AnimatePresence>
+	);
 }

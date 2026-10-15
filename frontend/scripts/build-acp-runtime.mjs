@@ -16,9 +16,12 @@ import {
 	createWorkDirectory,
 	npmInvocation,
 	patchClaudeContextUsage,
+	patchClaudeFoldedPromptSettlement,
 	patchClaudeHibernationCheck,
 	patchClaudeQueuedStop,
 	patchClaudeRetryDetails,
+	patchClaudeStaleIdleDebt,
+	patchClaudeSteerSettlement,
 	patchClaudeWorkerSteering,
 	pruneNodeDistribution,
 	runtimeSourceFiles,
@@ -90,6 +93,9 @@ patchClaudeContextUsage(claudeAdapter);
 patchClaudeHibernationCheck(claudeAdapter);
 patchClaudeWorkerSteering(claudeAdapter);
 patchClaudeQueuedStop(join(outDir, "node_modules", "@anthropic-ai", "claude-agent-sdk", "sdk.mjs"));
+patchClaudeFoldedPromptSettlement(claudeAdapter);
+patchClaudeStaleIdleDebt(claudeAdapter);
+patchClaudeSteerSettlement(claudeAdapter);
 
 // The Claude Agent SDK declares platform-native Claude executables as optional
 // dependencies. --omit=optional excludes them; this removal is defense-in-depth.

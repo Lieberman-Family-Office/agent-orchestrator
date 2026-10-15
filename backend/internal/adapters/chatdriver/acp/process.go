@@ -103,10 +103,10 @@ func spawnAgent(launch Launch, workdir string) (*process, error) {
 }
 
 func persistentStop(gate *gatedReader, stdin io.WriteCloser) func() error {
-	return func() error {
+	return sync.OnceValue(func() error {
 		gate.Open()
 		return stdin.Close()
-	}
+	})
 }
 
 func persistentTerminate(

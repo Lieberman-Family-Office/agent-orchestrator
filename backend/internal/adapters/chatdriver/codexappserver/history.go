@@ -35,11 +35,10 @@ import (
 //	blank title            "thread name must not be empty"
 //	unloaded thread        "thread not found: <id>"
 //
-// thread/rollback is annotated DEPRECATED in the protocol schema, and the
-// provider's own `undo` experimental feature already reports stage "removed". It
-// works on 0.146.0. When it goes, the replacement is thread/fork with lastTurnId,
-// which yields a different thread id — something ChatRollbacker cannot report, so
-// that day needs a port change and not a swap of the call in here.
+// thread/rollback works on 0.146.0. Codex 0.162 replaces it with thread/revert,
+// taking {threadId, beforeTurnId} and retaining the prefix before that turn in
+// the same thread. Neither operation reverts workspace files. An unknown-method
+// refusal is safe to retry through revert; an ordinary refusal is not.
 
 // Asserted so a refactor cannot silently drop one of these: the service
 // feature-detects each interface, and a missing method would read as "the provider
@@ -344,11 +343,12 @@ func (c *conversation) Rollback(ctx context.Context, providerTurnID string) erro
 	}, nil); err != nil {
 		var rpcErr *rpcError
 		unsupported := errors.As(err, &rpcErr) && (rpcErr.Code == -32601 ||
-			(rpcErr.Code == -32600 && strings.HasPrefix(rpcErr.Message, "Invalid request: unknown variant `thread/rollback`, expected one of ")))
+			(rpcErr.Code == -32600 && (rpcErr.Message == "Invalid request: unknown variant `thread/rollback`" ||
+				strings.HasPrefix(rpcErr.Message, "Invalid request: unknown variant `thread/rollback`, expected one of "))))
 		if !unsupported {
 			return asRefusal(fmt.Errorf("thread/rollback: %w", err))
 		}
-		// Current Codex removes the named turn inclusively through beforeTurnId.
+		// Revert retains only the prefix before the named turn.
 		// Retry only a proven unknown method, never a refusal or transport error.
 		if err := c.conn.request(ctx, "thread/revert", map[string]any{
 			"threadId": c.threadID, "beforeTurnId": providerTurnID,
@@ -433,4 +433,20 @@ func (c *conversation) SetTitle(ctx context.Context, title string) error {
 		return asRefusal(fmt.Errorf("thread/name/set: %w", err))
 	}
 	return nil
+}
+
+func (c *conversation) DeleteFork(ctx context.Context, providerConversationID string) error {
+	id := strings.TrimSpace(providerConversationID)
+	if id == "" || id == c.threadID {
+		return errors.New("refusing to delete the active provider conversation")
+	}
+	err := c.conn.request(ctx, codexproto.MethodThreadDelete,
+		codexproto.ThreadDeleteParams{ThreadID: id}, nil)
+	// Cleanup runs after the child host stops and must tolerate an already
+	// deleted rollout, including a deletion whose acknowledgement was lost.
+	var refusal *rpcError
+	if errors.As(err, &refusal) && refusal.Code == -32600 && refusal.Message == "no rollout found for thread id "+id {
+		return nil
+	}
+	return err
 }

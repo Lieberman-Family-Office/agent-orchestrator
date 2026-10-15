@@ -445,6 +445,13 @@ func (c *conversation) yieldWorkerQuestions(epoch uint64) {
 func (c *conversation) providerDetaching() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if !c.closed && c.proc != nil && c.proc.terminate != nil && c.conn != nil {
+		select {
+		case <-c.conn.Done():
+			return true
+		default:
+		}
+	}
 	return c.detaching
 }
 

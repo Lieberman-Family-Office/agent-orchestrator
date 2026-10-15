@@ -24,6 +24,10 @@ func (f fakeDesktopWorkspaceService) WorkspaceLocation(context.Context, domain.S
 	return f.path, f.err
 }
 
+func (f fakeDesktopWorkspaceService) ArtifactLocation(context.Context, domain.SessionID) (string, error) {
+	return f.path, f.err
+}
+
 func desktopWorkspaceServer(t *testing.T, svc fakeDesktopWorkspaceService) *httptest.Server {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -32,19 +36,6 @@ func desktopWorkspaceServer(t *testing.T, svc fakeDesktopWorkspaceService) *http
 	}, httpd.ControlDeps{}))
 	t.Cleanup(server.Close)
 	return server
-}
-
-func (f fakeDesktopWorkspaceService) ArtifactLocation(context.Context, domain.SessionID) (string, error) {
-	return f.path, f.err
-}
-
-func TestDesktopArtifactLocationReturnsPathToLoopbackSupervisor(t *testing.T) {
-	server := desktopWorkspaceServer(t, fakeDesktopWorkspaceService{path: "/tmp/ao/artifacts/ao-1"})
-	body, status, headers := doRequest(t, server, http.MethodGet, "/api/v1/desktop/sessions/ao-1/artifacts", "")
-	assertJSON(t, headers)
-	if status != http.StatusOK || !containsAll(body, `"workspacePath":"/tmp/ao/artifacts/ao-1"`) {
-		t.Fatalf("artifact root: status=%d body=%s", status, body)
-	}
 }
 
 func TestDesktopWorkspaceLocationReturnsPathToLoopbackSupervisor(t *testing.T) {
@@ -71,4 +62,24 @@ func TestDesktopWorkspaceLocationSurfacesServiceFailure(t *testing.T) {
 	server := desktopWorkspaceServer(t, fakeDesktopWorkspaceService{err: errors.New("storage unavailable")})
 	body, status, _ := doRequest(t, server, http.MethodGet, "/api/v1/desktop/sessions/ao-1/workspace", "")
 	assertErrorCode(t, body, status, http.StatusInternalServerError, "INTERNAL_ERROR")
+}
+
+func TestDesktopArtifactLocationReturnsDirToLoopbackSupervisor(t *testing.T) {
+	server := desktopWorkspaceServer(t, fakeDesktopWorkspaceService{path: "/tmp/ao/artifacts/ao-1"})
+	body, status, headers := doRequest(t, server, http.MethodGet, "/api/v1/desktop/sessions/ao-1/artifacts", "")
+	assertJSON(t, headers)
+	if status != http.StatusOK {
+		t.Fatalf("GET desktop artifacts = %d, want 200; body=%s", status, body)
+	}
+	if !containsAll(body, `"sessionId":"ao-1"`, `"artifactDir":"/tmp/ao/artifacts/ao-1"`) {
+		t.Fatalf("unexpected body: %s", body)
+	}
+}
+
+func TestDesktopArtifactLocationPreservesServiceNotFound(t *testing.T) {
+	server := desktopWorkspaceServer(t, fakeDesktopWorkspaceService{
+		err: apierr.NotFound("SESSION_ARTIFACTS_NOT_FOUND", "This session has no artifacts folder yet."),
+	})
+	body, status, _ := doRequest(t, server, http.MethodGet, "/api/v1/desktop/sessions/ao-1/artifacts", "")
+	assertErrorCode(t, body, status, http.StatusNotFound, "SESSION_ARTIFACTS_NOT_FOUND")
 }

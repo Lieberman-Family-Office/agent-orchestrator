@@ -15,6 +15,7 @@ import (
 // resolve a session handoff without teaching the renderer about local paths.
 type DesktopWorkspaceService interface {
 	WorkspaceLocation(ctx context.Context, id domain.SessionID) (string, error)
+	ArtifactLocation(ctx context.Context, id domain.SessionID) (string, error)
 }
 
 // DesktopWorkspaceController owns the loopback-only desktop handoff route.
@@ -22,7 +23,7 @@ type DesktopWorkspaceController struct {
 	Svc DesktopWorkspaceService
 }
 
-// Register mounts the desktop-only workspace-location route.
+// Register mounts the desktop-only workspace- and artifact-location routes.
 func (c *DesktopWorkspaceController) Register(r chi.Router) {
 	r.Get("/desktop/sessions/{sessionId}/workspace", c.location)
 	r.Get("/desktop/sessions/{sessionId}/artifacts", c.artifactLocation)
@@ -46,18 +47,18 @@ func (c *DesktopWorkspaceController) location(w http.ResponseWriter, r *http.Req
 }
 
 func (c *DesktopWorkspaceController) artifactLocation(w http.ResponseWriter, r *http.Request) {
-	svc, ok := c.Svc.(interface {
-		ArtifactLocation(context.Context, domain.SessionID) (string, error)
-	})
-	if !ok {
+	if c.Svc == nil {
 		apispec.NotImplemented(w, r, http.MethodGet, "/api/v1/desktop/sessions/{sessionId}/artifacts")
 		return
 	}
 	id := domain.SessionID(chi.URLParam(r, "sessionId"))
-	root, err := svc.ArtifactLocation(r.Context(), id)
+	artifactDir, err := c.Svc.ArtifactLocation(r.Context(), id)
 	if err != nil {
 		envelope.WriteError(w, r, err)
 		return
 	}
-	envelope.WriteJSON(w, http.StatusOK, DesktopWorkspaceLocationResponse{SessionID: id, WorkspacePath: root})
+	envelope.WriteJSON(w, http.StatusOK, DesktopArtifactLocationResponse{
+		SessionID:   id,
+		ArtifactDir: artifactDir,
+	})
 }

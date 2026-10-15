@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 import subprocess
-import sys
 
 from lib.deployment import validate_service, validate_task_artifacts
 
@@ -28,6 +27,11 @@ def main() -> None:
     parser.add_argument("--expected-task-definition")
     parser.add_argument("--expected-control-image")
     parser.add_argument("--expected-worker-image")
+    parser.add_argument(
+        "--allow-draining-targets",
+        action="store_true",
+        help="Ignore targets still draining after a rolling (200/100) deployment.",
+    )
     args = parser.parse_args()
     if bool(args.expected_control_image) != bool(args.expected_worker_image):
         parser.error(
@@ -95,6 +99,7 @@ def main() -> None:
             targets=targets,
             alarm_state=alarms[0].get("StateValue", ""),
             expected_task_definition=args.expected_task_definition,
+            ignore_draining=args.allow_draining_targets,
         )
         if args.expected_control_image:
             task_definition = aws(

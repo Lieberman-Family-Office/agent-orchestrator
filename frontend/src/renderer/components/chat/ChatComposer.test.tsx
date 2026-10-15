@@ -94,6 +94,23 @@ const textFile = (name = "notes.txt") => new File(["hello"], name, { type: "text
 /* ---- the keyboard contract the composer already had ---------------------- */
 
 describe("send keys", () => {
+	it("lays attachments beside annotations and clears only annotation references", async () => {
+		const sessionId = "composer-shared-attachment-row";
+		writeChatExcerptReferences(sessionId, EXCERPTS);
+		writeChatComposerText(sessionId, "keep this draft");
+		const { field } = renderComposer({ draftSessionId: sessionId, onStageAttachments: vi.fn().mockResolvedValue([".ao/attachments/shot.png"]) });
+		fireEvent.paste(field, { clipboardData: clipboardData([png()]) });
+		const removeImage = await screen.findByRole("button", { name: "Remove shot.png" });
+		const row = screen.getByTestId("composer-attachments-and-annotations");
+		expect(row).toHaveClass("flex", "flex-wrap", "items-center");
+		expect(row).toContainElement(removeImage);
+		expect(row).toContainElement(screen.getByRole("button", { name: "1 annotation" }));
+		await userEvent.click(screen.getByRole("button", { name: "Remove all annotations" }));
+		expect(screen.queryByRole("button", { name: "1 annotation" })).not.toBeInTheDocument();
+		expect(readChatSessionDraft(sessionId).composer.excerpts).toEqual([]);
+		expect(removeImage).toBeInTheDocument();
+		expect(field).toHaveTextContent("keep this draft");
+	});
 	it("navigates to the selected annotation from the composer popover", async () => {
 		const excerpt = { id: "navigation", conversationId: "conversation-1", messageId: "source-1", revision: 2, text: "navigate here", role: "assistant" as const };
 		writeChatExcerptReferences("composer-navigation", [excerpt]);
@@ -365,6 +382,16 @@ describe("send keys", () => {
 		expect(field.textContent).toBe("");
 	});
 
+	it("reports when the draft turns non-empty and empty again", async () => {
+		const onDraftEmptyChange = vi.fn();
+		const { field } = renderComposer({ onDraftEmptyChange });
+		expect(onDraftEmptyChange).toHaveBeenLastCalledWith(true);
+		await typeInComposer(field, "hello");
+		expect(onDraftEmptyChange).toHaveBeenLastCalledWith(false);
+		await userEvent.keyboard("{Enter}");
+		expect(onDraftEmptyChange).toHaveBeenLastCalledWith(true);
+	});
+
 	it("does not restore a sent draft through undo", async () => {
 		const { field } = renderComposer();
 		await typeInComposer(field, "already sent");
@@ -624,6 +651,9 @@ describe("send keys", () => {
 		["CHAT_CONTROLLER_NOT_READY", "Request was rejected"],
 		["validation_error", "Request was rejected"],
 		["CHAT_RESUME_FAILED", "The provider could not reopen the saved conversation"],
+		// A refused /btw or /side launch must not lock the main draft.
+		["CHAT_SIDE_UNSUPPORTED", "side chats support Codex, Claude Code, and OpenCode"],
+		["CHAT_SIDE_UNAVAILABLE", "side chats are unavailable"],
 	])("unlocks a definitively rejected first send (%s) and gives the edited send a new identity", async (code, message) => {
 		const sessionId = `composer-first-send-refused-${code}`;
 		const onSend = vi.fn()

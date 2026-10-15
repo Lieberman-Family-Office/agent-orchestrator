@@ -68,7 +68,7 @@ func fullSnapshotReader(st *sqlite.Store) chatsvc.SnapshotReader {
 			return chatsvc.ConversationRows{}, err
 		}
 		return chatsvc.ConversationRows{
-			Conversation: rows.Conversation, Turns: rows.Turns,
+			Conversation: rows.Conversation, ActiveBranch: rows.ActiveBranch, Turns: rows.Turns,
 			Messages: rows.Messages, Activities: rows.Activities,
 			BranchPoints: rows.BranchPoints, BranchedFromEarlierMessage: rows.BranchedFromEarlierMessage,
 		}, nil
@@ -3222,6 +3222,7 @@ func newHarnessWithConversationAndStoreForHarness(
 	chatStore := wrapStore(st)
 	svc := chatsvc.New(chatsvc.Options{
 		Store:    chatStore,
+		Reader:   fullSnapshotReader(st),
 		Sessions: st,
 		StopProviderHost: func(context.Context, domain.SessionID) error {
 			h.hostStops.Add(1)
@@ -3312,63 +3313,70 @@ func TestStaleControllerEventsDoNotReachTheTimeline(t *testing.T) {
 /* ---- tests ------------------------------------------------------------- */
 
 func TestSendVerifiesExcerptAndFallsBackToTextForProvider(t *testing.T) {
-	h := newHarness(t)
-	ctx := context.Background()
-	seed, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
-		Text: "seed", ClientMessageID: "excerpt-seed", Origin: domain.MessageOriginHuman,
-	})
-	if err != nil {
-		t.Fatalf("send seed: %v", err)
-	}
-	h.conv.emit(
-		ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: seed.ProviderTurnID},
-		ports.ChatEvent{Kind: ports.ChatEventMessageDelta, ProviderTurnID: seed.ProviderTurnID,
-			ProviderItemID: "excerpt-source", Delta: "Keep this exact sentence."},
-		ports.ChatEvent{Kind: ports.ChatEventMessageCompleted, ProviderTurnID: seed.ProviderTurnID,
-			ProviderItemID: "excerpt-source", Text: "Keep this exact sentence."},
-		ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: seed.ProviderTurnID,
-			TurnState: domain.TurnStateCompleted},
-	)
-	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
-		return len(s.Messages) == 2 && len(s.Turns) == 1 && s.Turns[0].State == domain.TurnStateCompleted
-	})
-	source := snapshot.Messages[1]
+	for _, tt := range []struct{ name, source, selected string }{
+		{"desktop", "Keep this exact sentence.", "exact sentence"},
+		{"native", "# Title\n\n- First\n- Second\n\n```ts\ncode();\n```", "Title\n\n• First\n• Second\n\nts\ncode();"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t)
+			ctx := context.Background()
+			seed, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+				Text: "seed", ClientMessageID: "excerpt-seed", Origin: domain.MessageOriginHuman,
+			})
+			if err != nil {
+				t.Fatalf("send seed: %v", err)
+			}
+			h.conv.emit(
+				ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: seed.ProviderTurnID},
+				ports.ChatEvent{Kind: ports.ChatEventMessageDelta, ProviderTurnID: seed.ProviderTurnID,
+					ProviderItemID: "excerpt-source", Delta: tt.source},
+				ports.ChatEvent{Kind: ports.ChatEventMessageCompleted, ProviderTurnID: seed.ProviderTurnID,
+					ProviderItemID: "excerpt-source", Text: tt.source},
+				ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: seed.ProviderTurnID,
+					TurnState: domain.TurnStateCompleted},
+			)
+			snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				return len(s.Messages) == 2 && len(s.Turns) == 1 && s.Turns[0].State == domain.TurnStateCompleted
+			})
+			source := snapshot.Messages[1]
 
-	_, err = h.svc.Send(ctx, testSession, ports.ChatUserMessage{
-		Text: "Use it", ClientMessageID: "excerpt-followup", Origin: domain.MessageOriginHuman,
-		Excerpts: []ports.ChatExcerptReference{{
-			ConversationID: h.ctrl.ConversationID(), MessageID: source.ID,
-			Revision: source.Revision, Text: "exact sentence",
-		}},
-	})
-	if err != nil {
-		t.Fatalf("send with excerpt: %v", err)
-	}
-	sent := h.conv.sentMessages()
-	if len(sent) != 2 || !strings.Contains(sent[1].Text, "Referenced chat excerpt") ||
-		!strings.Contains(sent[1].Text, "exact sentence") || len(sent[1].Content) != 0 {
-		t.Fatalf("provider delivery = %#v", sent)
-	}
-	duplicate, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
-		Text: "Use it", ClientMessageID: "excerpt-followup", Origin: domain.MessageOriginHuman,
-		Excerpts: []ports.ChatExcerptReference{{
-			ConversationID: h.ctrl.ConversationID(), MessageID: source.ID,
-			Revision: source.Revision + 1, Text: "no longer relevant to the accepted retry",
-		}},
-	})
-	if err != nil || duplicate.ID != "" {
-		t.Fatalf("idempotent excerpt retry = (%+v, %v), want duplicate success", duplicate, err)
-	}
+			_, err = h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+				Text: "Use it", ClientMessageID: "excerpt-followup", Origin: domain.MessageOriginHuman,
+				Excerpts: []ports.ChatExcerptReference{{
+					ConversationID: h.ctrl.ConversationID(), MessageID: source.ID,
+					Revision: source.Revision, Text: tt.selected,
+				}},
+			})
+			if err != nil {
+				t.Fatalf("send with excerpt: %v", err)
+			}
+			sent := h.conv.sentMessages()
+			if len(sent) != 2 || !strings.Contains(sent[1].Text, "Referenced chat excerpt") ||
+				!strings.Contains(sent[1].Text, tt.selected) || !strings.Contains(sent[1].Text, "User:\nseed\nAssistant:\n"+tt.source) || len(sent[1].Content) != 0 {
+				t.Fatalf("provider delivery = %#v", sent)
+			}
+			duplicate, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+				Text: "Use it", ClientMessageID: "excerpt-followup", Origin: domain.MessageOriginHuman,
+				Excerpts: []ports.ChatExcerptReference{{
+					ConversationID: h.ctrl.ConversationID(), MessageID: source.ID,
+					Revision: source.Revision + 1, Text: "no longer relevant to the accepted retry",
+				}},
+			})
+			if err != nil || duplicate.ID != "" {
+				t.Fatalf("idempotent excerpt retry = (%+v, %v), want duplicate success", duplicate, err)
+			}
 
-	_, err = h.svc.Send(ctx, testSession, ports.ChatUserMessage{
-		Text: "stale", Origin: domain.MessageOriginHuman,
-		Excerpts: []ports.ChatExcerptReference{{
-			ConversationID: h.ctrl.ConversationID(), MessageID: source.ID,
-			Revision: source.Revision + 1, Text: "exact sentence",
-		}},
-	})
-	if !errors.Is(err, chatsvc.ErrExcerptStale) {
-		t.Fatalf("stale excerpt error = %v, want ErrExcerptStale", err)
+			_, err = h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+				Text: "stale", Origin: domain.MessageOriginHuman,
+				Excerpts: []ports.ChatExcerptReference{{
+					ConversationID: h.ctrl.ConversationID(), MessageID: source.ID,
+					Revision: source.Revision + 1, Text: tt.selected,
+				}},
+			})
+			if !errors.Is(err, chatsvc.ErrExcerptStale) {
+				t.Fatalf("stale excerpt error = %v, want ErrExcerptStale", err)
+			}
+		})
 	}
 }
 
@@ -3804,8 +3812,11 @@ func (p *resolvingQuestionProvider) ResolveInput(context.Context, string, ports.
 }
 
 func TestQuestionResolutionRefusesStaleOwnerAndHandoff(t *testing.T) {
-	for _, boundary := range []string{"generation", "handoff"} {
-		t.Run(boundary, func(t *testing.T) {
+	for _, scenario := range []struct {
+		boundary string
+		dismiss  bool
+	}{{"generation", false}, {"handoff", false}, {"generation", true}, {"handoff", true}} {
+		t.Run(fmt.Sprint(scenario), func(t *testing.T) {
 			provider := &resolvingQuestionProvider{steerRecorder: newSteerRecorder()}
 			h := newHarnessWithConversationAndStoreForHarness(t, provider, func(st *sqlite.Store) chatsvc.Store { return st }, domain.HarnessClaudeCode)
 			ctx := context.Background()
@@ -3815,7 +3826,14 @@ func TestQuestionResolutionRefusesStaleOwnerAndHandoff(t *testing.T) {
 			}}
 			provider.emit(ports.ChatEvent{Kind: ports.ChatEventInputRequested, RequestID: "boundary-question", Input: &ports.ChatInputRequest{Mode: ports.ChatInputModeForm, Message: "Choice?", Schema: schema}})
 			h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Activities) == 1 })
-			if boundary == "generation" {
+			response := ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"question_0": "native"}}
+			if scenario.dismiss {
+				if _, err := h.st.DetachQuestion(ctx, h.ctrl.ConversationID(), "boundary-question", h.now()); err != nil {
+					t.Fatal(err)
+				}
+				response = ports.ChatInputResponse{Action: ports.ChatInputActionCancel}
+			}
+			if scenario.boundary == "generation" {
 				if err := h.st.ClaimChatControllerGeneration(ctx, testSession, "replacement"); err != nil {
 					t.Fatal(err)
 				}
@@ -3824,7 +3842,7 @@ func TestQuestionResolutionRefusesStaleOwnerAndHandoff(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if err := h.ctrl.ResolveInput(ctx, "boundary-question", ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"question_0": "native"}}); err == nil {
+			if err := h.ctrl.ResolveInput(ctx, "boundary-question", response); err == nil {
 				t.Fatal("answer crossed owner transition")
 			}
 			if provider.answers.Load() != 0 {
@@ -3900,6 +3918,82 @@ func TestDeferredQuestionAnswerWaitsForCompletion(t *testing.T) {
 	}
 	if len(provider.sentMessages()) != 1 {
 		t.Fatal("answer delivered twice")
+	}
+}
+
+func TestDetachedQuestionCanBeDismissedAfterUncertainAnswer(t *testing.T) {
+	provider := &deferredQuestionProvider{&cancelledQuestionProvider{steerRecorder: newSteerRecorder()}}
+	h := newHarnessWithConversationAndStoreForHarness(t, provider, func(st *sqlite.Store) chatsvc.Store { return st }, domain.HarnessClaudeCode)
+	ctx := context.Background()
+	schema := map[string]any{"type": "object", "properties": map[string]any{
+		"question_0":        map[string]any{"type": "string", "oneOf": []any{map[string]any{"const": "native"}}},
+		"question_0_custom": map[string]any{"type": "string", "_meta": map[string]any{"_askUserQuestionCustomAnswer": map[string]any{"isCustomAnswer": true, "questionId": "question_0"}}},
+	}}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventInputRequested, RequestID: "stuck-question", Input: &ports.ChatInputRequest{Mode: ports.ChatInputModeForm, Schema: schema}})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool { return len(s.Activities) == 1 })
+	if _, err := h.st.DetachQuestion(ctx, h.ctrl.ConversationID(), "stuck-question", h.now()); err != nil {
+		t.Fatal(err)
+	}
+	answer := ports.ChatInputResponse{Action: ports.ChatInputActionAccept, Content: map[string]any{"question_0": "native"}}
+	if err := h.ctrl.ResolveInput(ctx, "stuck-question", answer); !errors.Is(err, chatsvc.ErrSteerDeliveryUncertain) {
+		t.Fatalf("want uncertain answer delivery, got %v", err)
+	}
+	message, found, err := h.st.ConversationMessageByClientID(ctx, h.ctrl.ConversationID(), "question-answer/stuck-question")
+	if err != nil || !found {
+		t.Fatalf("missing attempted answer: %v", err)
+	}
+	turn, err := h.st.TurnByID(ctx, message.TurnID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: turn.ProviderTurnID, TurnState: domain.TurnStateFailed})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Turns) == 1 && s.Turns[0].State == domain.TurnStateFailed
+	})
+	before, err := h.st.ConversationInput(ctx, h.ctrl.ConversationID(), "stuck-question")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel := ports.ChatInputResponse{Action: ports.ChatInputActionCancel}
+	if err := h.ctrl.ResolveInput(ctx, "stuck-question", cancel); err != nil {
+		t.Fatalf("Cancel leaves the detached question stuck: %v", err)
+	}
+	after, err := h.st.ConversationInput(ctx, h.ctrl.ConversationID(), "stuck-question")
+	if err != nil || after.Status != domain.ActivityStatusCancelled {
+		t.Fatalf("dismissed question remains actionable: %+v %v", after, err)
+	}
+	var original, dismissed map[string]any
+	if err := json.Unmarshal(before.Detail, &original); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(after.Detail, &dismissed); err != nil {
+		t.Fatal(err)
+	}
+	if original["answerIntent"] == nil || original["answerIntent"] != dismissed["answerIntent"] {
+		t.Fatal("dismissal discarded the uncertain answer claim")
+	}
+	if len(provider.sentMessages()) != 1 || len(provider.steers()) != 0 {
+		t.Fatal("dismissal sent another answer")
+	}
+	if err := h.ctrl.ResolveInput(ctx, "stuck-question", cancel); err != nil {
+		t.Fatalf("duplicate cancellation failed: %v", err)
+	}
+	if err := h.ctrl.ResolveInput(ctx, "stuck-question", answer); !errors.Is(err, ports.ErrChatRequestNotPending) {
+		t.Fatalf("dismissed question accepted another answer: %v", err)
+	}
+	if err := h.st.UpsertActivity(ctx, h.ctrl.ConversationID(), "", before, h.now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.st.DetachQuestion(ctx, h.ctrl.ConversationID(), "stuck-question", h.now()); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := h.st.ConversationInput(ctx, h.ctrl.ConversationID(), "stuck-question")
+	if err != nil || replayed.Status != domain.ActivityStatusCancelled || string(replayed.Detail) != string(before.Detail) {
+		t.Fatalf("replay reopened the question or changed its history: %+v %v", replayed, err)
+	}
+	retained, found, err := h.st.ConversationMessageByClientID(ctx, h.ctrl.ConversationID(), "question-answer/stuck-question")
+	if err != nil || !found || retained.ID != message.ID || retained.Text != message.Text {
+		t.Fatalf("dismissal changed the attempted answer: %+v %v", retained, err)
 	}
 }
 
