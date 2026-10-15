@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, expect, test, vi } from "vitest";
 import { TooltipProvider } from "./ui/tooltip";
@@ -59,6 +59,7 @@ vi.mock("../lib/api-client", () => ({
 
 import {
 	ConnectMobileContent,
+	mobileStatusQueryKey,
 	mobileStatusRefetchInterval,
 	pairingPayload,
 	qrIsReady,
@@ -67,13 +68,14 @@ import {
 
 function renderMobileSettings() {
 	const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-	return render(
+	render(
 		<QueryClientProvider client={client}>
 			<TooltipProvider>
 				<ConnectMobileContent active />
 			</TooltipProvider>
 		</QueryClientProvider>,
 	);
+	return client;
 }
 
 // Read the payload off the wrapper used by the shared styled QR component.
@@ -89,12 +91,8 @@ function decodeQr(value: string): Record<string, unknown> {
 	return JSON.parse(atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4)));
 }
 
-async function selectConnectionMethod(mode: "LAN" | "Tailscale") {
-	await userEvent.click(await screen.findByRole("button", { name: "Connection method" }));
-	await userEvent.click(await screen.findByRole("menuitem", { name: mode }));
-}
-
 beforeEach(() => {
+	vi.mocked(apiClient.POST).mockClear();
 	mobileStatus.enabled = true;
 	mobileStatus.noPublicTunnel = false;
 	mobileStatus.host = "192.168.1.42";
@@ -269,19 +267,14 @@ test.each([
 	}
 });
 
-// SKIPPED: drives the connection picker, which is commented out in
-// ConnectMobileContent. Un-skip with it — the behaviour is unchanged, only
-// the way in is gone. TLS coverage does NOT live here any more: it keys off
-// the tailnet address, so those tests run without the picker.
-test.skip("keeps the connection-method dropdown at its fixed width", async () => {
+test("offers pairing without a connection-method selector", async () => {
 	renderMobileSettings();
 	await waitFor(() => expect(qrPayload()).not.toBeNull());
 
-	const control = screen.getByRole("button", { name: "Connection method" });
-	expect(control).toHaveClass("w-44", "justify-between");
-
-	await userEvent.click(control);
-	expect(screen.getByRole("menu")).toHaveClass("!w-44", "!min-w-0");
+	expect(screen.queryByRole("button", { name: "Connection method" })).not.toBeInTheDocument();
+	expect(screen.queryByRole("radiogroup", { name: "Connection method" })).not.toBeInTheDocument();
+	expect(screen.getByTestId("mobile-pairing-address")).toHaveTextContent("192.168.1.42:3011");
+	expect(screen.getByRole("button", { name: "Copy password" })).toBeEnabled();
 });
 
 // The QR is withheld until the tunnel is ready, so a scannable code already
@@ -321,47 +314,37 @@ test("shows a QR-only App Store tooltip", async () => {
 	expect(tooltip.querySelector("svg")).toBeInTheDocument();
 });
 
-// v1 encoded one chosen address, so switching mode had to re-encode the code.
-// A v2 code carries every endpoint the daemon advertises and the phone races
-// them, so the mode selector now only changes which address is *displayed* —
-// the code itself is the same either way. Re-encoding per mode would defeat the
-// race by handing the phone a single path again.
-// SKIPPED: drives the connection picker, which is commented out in
-// ConnectMobileContent. Un-skip with it — the behaviour is unchanged, only
-// the way in is gone. TLS coverage does NOT live here any more: it keys off
-// the tailnet address, so those tests run without the picker.
-test.skip("keeps one code across modes, carrying every advertised endpoint", async () => {
+// The phone races every advertised endpoint from one v2 offer.
+test("carries LAN, Tailscale, and tunnel endpoints in one code", async () => {
 	mobileStatus.endpoints = [
 		{ kind: "lan", host: "192.168.1.42", port: 3011, secure: false },
 		{ kind: "tailscale", host: "100.72.46.7", port: 3011, secure: false },
+		{ kind: "tunnel", host: "host.example.net", port: 443, secure: true },
 	];
 	renderMobileSettings();
 	await waitFor(() => expect(qrPayload()).not.toBeNull());
-	const before = qrPayload()!;
 
-	await selectConnectionMethod("Tailscale");
-	await waitFor(() => expect(qrPayload()).not.toBeNull());
-
-	expect(decodeQr(qrPayload()!).endpoints).toEqual([
-		{ kind: "lan", host: "192.168.1.42", port: 3011, secure: false },
-		{ kind: "tailscale", host: "100.72.46.7", port: 3011, secure: false },
-	]);
-	expect(decodeQr(before).endpoints).toEqual(decodeQr(qrPayload()!).endpoints);
+	expect(decodeQr(qrPayload()!)).toEqual({
+		v: 2,
+		hostId: "h_fixture",
+		name: "192.168.1.42",
+		platform: "",
+		endpoints: mobileStatus.endpoints,
+		token: "fake-password-for-testing",
+	});
+	expect(document.querySelectorAll("[data-qr-value]")).toHaveLength(1);
 });
 
-// SKIPPED: drives the connection picker, which is commented out in
-// ConnectMobileContent. Un-skip with it — the behaviour is unchanged, only
-// the way in is gone. TLS coverage does NOT live here any more: it keys off
-// the tailnet address, so those tests run without the picker.
-test.skip("shows a hint instead of a QR when Tailscale is not running", async () => {
+test("keeps LAN pairing available when Tailscale is not running", async () => {
 	mobileStatus.tailscaleHost = "";
+	mobileStatus.securePairing.available = true;
 	renderMobileSettings();
 	await waitFor(() => expect(qrPayload()).not.toBeNull());
 
-	await selectConnectionMethod("Tailscale");
-
-	await waitFor(() => expect(screen.getByText(/Tailscale isn't running/i)).toBeInTheDocument());
-	expect(qrPayload()).toBeNull();
+	expect(decodeQr(qrPayload()!).endpoints).toEqual(mobileStatus.endpoints);
+	expect(screen.getByTestId("mobile-pairing-address")).toHaveTextContent("192.168.1.42:3011");
+	expect(screen.queryByText(/Tailscale isn't running/i)).not.toBeInTheDocument();
+	expect(apiClient.POST).not.toHaveBeenCalled();
 });
 
 test("shows a hint instead of an unscannable QR when no endpoint is available", async () => {
@@ -396,17 +379,23 @@ test.each([
 	expect(qrPayload()).toBeNull();
 });
 
-// SKIPPED: drives the connection picker, which is commented out in
-// ConnectMobileContent. Un-skip with it — the behaviour is unchanged, only
-// the way in is gone. TLS coverage does NOT live here any more: it keys off
-// the tailnet address, so those tests run without the picker.
-test.skip("the address line follows the selected mode", async () => {
-	renderMobileSettings();
+test("updates the address and QR together when advertised endpoints change", async () => {
+	const client = renderMobileSettings();
 	const address = await screen.findByTestId("mobile-pairing-address");
 	expect(within(address).getByText("192.168.1.42:3011")).toBeInTheDocument();
+	const before = decodeQr(qrPayload()!);
+	const endpoints = [
+		{ kind: "tailscale", host: "100.72.46.7", port: 4011, secure: false },
+		...mobileStatus.endpoints,
+	];
 
-	await selectConnectionMethod("Tailscale");
-	await waitFor(() => expect(within(address).getByText("100.72.46.7:3011")).toBeInTheDocument());
+	await act(async () => {
+		client.setQueryData(mobileStatusQueryKey, { ...mobileStatus, endpoints });
+	});
+
+	await waitFor(() => expect(within(address).getByText("100.72.46.7:4011")).toBeInTheDocument());
+	expect(decodeQr(qrPayload()!)).toEqual({ ...before, name: "100.72.46.7", endpoints });
+	expect(within(address).queryByText("192.168.1.42:3011")).not.toBeInTheDocument();
 });
 
 test("omits the secure key entirely for plaintext pairing", () => {
@@ -421,49 +410,37 @@ test("encodes secure:true when secure pairing is active", () => {
 	});
 });
 
-// KNOWN GAP, recorded rather than asserted away: a v2 code is built purely from
-// the daemon's endpoint list, and Endpoints() only ever marks the tunnel
-// secure — tailscale entries are the plain tailnet IP. So the MagicDNS host
-// secure pairing sets up is not carried in the code at all.
-//
-// This predates the v1 removal; it was hidden because the old fixture
-// advertised no endpoints, which forced the v1 branch that did encode it. The
-// tunnel's publicly trusted certificate is what satisfies iOS ATS now, so this
-// may be intentional obsolescence — but the setting is still offered, and a
-// user who enables it gets a code that does not use it.
-// SKIPPED: drives the connection picker, which is commented out in
-// ConnectMobileContent. Un-skip with it — the behaviour is unchanged, only
-// the way in is gone. TLS coverage does NOT live here any more: it keys off
-// the tailnet address, so those tests run without the picker.
-test.skip("does not carry the secure-pairing MagicDNS host in the code", async () => {
+// The offer uses advertised endpoints, not the separate TLS status.
+// This preserves the documented limitation; it does not verify Tailscale HTTPS pairing.
+test("does not invent a MagicDNS endpoint from secure-pairing status", async () => {
+	mobileStatus.endpoints = [
+		{ kind: "lan", host: "192.168.1.42", port: 3011, secure: false },
+		{ kind: "tailscale", host: "100.72.46.7", port: 3011, secure: false },
+	];
 	mobileStatus.securePairing = {
 		enabled: true, available: true, active: true,
-		host: "prasads-macbook-pro.tail057d04.ts.net", port: 443, reason: "",
+		host: "host.tail1.ts.net", port: 443, reason: "",
 	};
 	renderMobileSettings();
 	await waitFor(() => expect(qrPayload()).not.toBeNull());
-	await selectConnectionMethod("Tailscale");
 
-	await waitFor(() => expect(qrPayload()).not.toBeNull());
-	const hosts = (decodeQr(qrPayload()!).endpoints as { host: string }[]).map((e) => e.host);
-	expect(hosts).not.toContain("prasads-macbook-pro.tail057d04.ts.net");
+	const offer = decodeQr(qrPayload()!);
+	expect(offer.endpoints).toEqual(mobileStatus.endpoints);
+	expect(offer.endpoints).not.toContainEqual(expect.objectContaining({ host: "host.tail1.ts.net" }));
 });
 
-// SKIPPED: drives the connection picker, which is commented out in
-// ConnectMobileContent. Un-skip with it — the behaviour is unchanged, only
-// the way in is gone. TLS coverage does NOT live here any more: it keys off
-// the tailnet address, so those tests run without the picker.
-test.skip("shows setup steps and no QR when certs are not enabled", async () => {
+test("shows certificate setup guidance without blocking the advertised LAN QR", async () => {
 	mobileStatus.securePairing = {
 		enabled: true, available: false, active: false,
 		host: "h.tail1.ts.net", port: 0, reason: "no_certs",
 	};
 	renderMobileSettings();
-	await waitFor(() => expect(qrPayload()).not.toBeNull());
-	await selectConnectionMethod("Tailscale");
 
-	await waitFor(() => expect(screen.getByText(/HTTPS certificates/i)).toBeInTheDocument());
-	expect(qrPayload()).toBeNull();
+	expect(await screen.findByTestId("secure-pairing-reason")).toHaveTextContent(/HTTPS certificates/i);
+	expect(qrPayload()).not.toBeNull();
+	expect(decodeQr(qrPayload()!).endpoints).toEqual(mobileStatus.endpoints);
+	expect(screen.getByTestId("mobile-pairing-address")).toHaveTextContent("192.168.1.42:3011");
+	expect(apiClient.POST).not.toHaveBeenCalled();
 });
 
 // A failing secure-pairing POST must surface an error rather than silently
