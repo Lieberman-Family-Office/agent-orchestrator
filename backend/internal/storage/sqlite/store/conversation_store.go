@@ -2781,6 +2781,18 @@ func (s *Store) ClaimInputAnswer(ctx context.Context, conversationID string, ses
 	return rows == 1, err
 }
 
+// DismissDetachedQuestion closes the prompt without changing an uncertain answer claim.
+func (s *Store) DismissDetachedQuestion(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, branchID string, activity domain.ConversationActivity, now time.Time) (bool, error) {
+	q, unlock := s.conversationWriter(ctx)
+	defer unlock()
+	rows, err := q.DismissDetachedConversationQuestion(ctx, gen.DismissDetachedConversationQuestionParams{
+		ConversationID: conversationID, SessionID: session, ReviewID: reviewID,
+		Generation: generation, BranchID: branchID, ActivityID: activity.ID,
+		ExpectedRevision: activity.Revision, UpdatedAt: now,
+	})
+	return rows == 1, err
+}
+
 // ResolveInputAnswer requires the same answer claim and current controller ownership.
 func (s *Store) ResolveInputAnswer(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, branchID, activityID, answerJSON string, now time.Time) (bool, error) {
 	q, unlock := s.conversationWriter(ctx)

@@ -157,6 +157,7 @@ type Store interface {
 	ClaimInputAnswer(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, branchID string, activity domain.ConversationActivity, answerJSON string, now time.Time) (bool, error)
 	ResolveInputAnswer(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, branchID, activityID, answerJSON string, now time.Time) (bool, error)
 	ReleaseInputAnswer(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, branchID, activityID, answerJSON string, now time.Time) (bool, error)
+	DismissDetachedQuestion(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation, branchID string, activity domain.ConversationActivity, now time.Time) (bool, error)
 	DetachQuestion(ctx context.Context, conversationID, requestID string, now time.Time) (bool, error)
 	HasPendingConversationInteractions(ctx context.Context, conversationID string) (bool, error)
 	FailPendingApprovals(ctx context.Context, conversationID string, now time.Time) error
@@ -2416,15 +2417,30 @@ func (c *Controller) ResolveInput(
 		}
 		return domain.ErrClientMessageConflict
 	}
-	if activity.Status != domain.ActivityStatusPending {
-		return ports.ErrChatRequestNotPending
-	}
 	question := ports.ChatInputRequest{Mode: stored.InputMode, Message: stored.Message, Schema: stored.Schema, QuestionAgentID: stored.QuestionAgentID, QuestionParentToolUseID: stored.QuestionParentToolUseID}
 	persistent := stored.PersistentQuestion && c.harness == domain.HarnessClaudeCode && question.PersistentQuestion()
+	dismissing := persistent && !stored.ProviderPending && response.Action == ports.ChatInputActionCancel
+	if activity.Status != domain.ActivityStatusPending && !(dismissing && activity.Status == domain.ActivityStatusCancelled) {
+		return ports.ErrChatRequestNotPending
+	}
 	if persistent {
 		if err := question.ValidateQuestionResponse(response); err != nil {
 			return err
 		}
+	}
+	if dismissing {
+		if activity.Status == domain.ActivityStatusCancelled {
+			return nil
+		}
+		// Dismissal does not retract or retry an earlier answer with uncertain delivery.
+		dismissed, err := c.store.DismissDetachedQuestion(ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, c.conversation.ActiveBranchID, activity, c.now())
+		if err != nil {
+			return fmt.Errorf("dismiss input %s: %w", requestID, err)
+		}
+		if !dismissed {
+			return ports.ErrChatRequestNotPending
+		}
+		return nil
 	}
 	responder, ok := c.conv.(ports.ChatInputResponder)
 	if !ok {

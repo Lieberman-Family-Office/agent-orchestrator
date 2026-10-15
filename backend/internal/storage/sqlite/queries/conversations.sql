@@ -1269,6 +1269,24 @@ WHERE conversation_activities.id = sqlc.arg(activity_id) AND conversation_activi
       AND NOT EXISTS (SELECT 1 FROM session_interface_transitions tr WHERE tr.session_id = s.id AND tr.phase NOT IN ('completed','failed','cancelled','recovery_required'))
   );
 
+-- Dismiss only a detached question. Preserve any answer claim and delivery history.
+-- name: DismissDetachedConversationQuestion :execrows
+UPDATE conversation_activities
+SET status = 'cancelled', revision = revision + 1, updated_at = sqlc.arg(updated_at)
+WHERE conversation_activities.id = sqlc.arg(activity_id) AND conversation_activities.conversation_id = sqlc.arg(conversation_id)
+  AND conversation_activities.kind = 'user_input' AND conversation_activities.status = 'pending' AND conversation_activities.revision = sqlc.arg(expected_revision)
+  AND json_extract(detail_json, '$.persistentQuestion') = 1
+  AND json_extract(detail_json, '$.providerPending') = 0
+  AND EXISTS (
+    SELECT 1 FROM conversations c JOIN sessions s ON s.id = sqlc.arg(session_id)
+    LEFT JOIN review r ON r.id = c.current_review_id
+    WHERE c.id = conversation_activities.conversation_id AND c.active_branch_id = sqlc.arg(branch_id)
+      AND s.is_terminated = 0
+      AND ((sqlc.arg(review_id) = '' AND c.current_session_id = s.id AND s.session_mode = 'chat' AND s.controller_generation = sqlc.arg(generation))
+        OR (sqlc.arg(review_id) <> '' AND c.current_review_id = sqlc.arg(review_id) AND r.session_id = s.id AND r.interface_mode = 'chat' AND r.controller_generation = sqlc.arg(generation)))
+      AND NOT EXISTS (SELECT 1 FROM session_interface_transitions tr WHERE tr.session_id = s.id AND tr.phase NOT IN ('completed','failed','cancelled','recovery_required'))
+  );
+
 -- The answer claim remains pending if ownership changes or delivery is unproved.
 -- name: ResolveClaimedConversationInputAnswer :execrows
 UPDATE conversation_activities

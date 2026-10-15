@@ -650,6 +650,53 @@ func (q *Queries) DetachPersistentConversationQuestion(ctx context.Context, arg 
 	return result.RowsAffected()
 }
 
+const dismissDetachedConversationQuestion = `-- name: DismissDetachedConversationQuestion :execrows
+UPDATE conversation_activities
+SET status = 'cancelled', revision = revision + 1, updated_at = ?1
+WHERE conversation_activities.id = ?2 AND conversation_activities.conversation_id = ?3
+  AND conversation_activities.kind = 'user_input' AND conversation_activities.status = 'pending' AND conversation_activities.revision = ?4
+  AND json_extract(detail_json, '$.persistentQuestion') = 1
+  AND json_extract(detail_json, '$.providerPending') = 0
+  AND EXISTS (
+    SELECT 1 FROM conversations c JOIN sessions s ON s.id = ?5
+    LEFT JOIN review r ON r.id = c.current_review_id
+    WHERE c.id = conversation_activities.conversation_id AND c.active_branch_id = ?6
+      AND s.is_terminated = 0
+      AND ((?7 = '' AND c.current_session_id = s.id AND s.session_mode = 'chat' AND s.controller_generation = ?8)
+        OR (?7 <> '' AND c.current_review_id = ?7 AND r.session_id = s.id AND r.interface_mode = 'chat' AND r.controller_generation = ?8))
+      AND NOT EXISTS (SELECT 1 FROM session_interface_transitions tr WHERE tr.session_id = s.id AND tr.phase NOT IN ('completed','failed','cancelled','recovery_required'))
+  )
+`
+
+type DismissDetachedConversationQuestionParams struct {
+	UpdatedAt        time.Time
+	ActivityID       string
+	ConversationID   string
+	ExpectedRevision int64
+	SessionID        domain.SessionID
+	BranchID         string
+	ReviewID         interface{}
+	Generation       string
+}
+
+// Dismiss only a detached question. Preserve any answer claim and delivery history.
+func (q *Queries) DismissDetachedConversationQuestion(ctx context.Context, arg DismissDetachedConversationQuestionParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, dismissDetachedConversationQuestion,
+		arg.UpdatedAt,
+		arg.ActivityID,
+		arg.ConversationID,
+		arg.ExpectedRevision,
+		arg.SessionID,
+		arg.BranchID,
+		arg.ReviewID,
+		arg.Generation,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const failOrphanedConversationActivities = `-- name: FailOrphanedConversationActivities :exec
 UPDATE conversation_activities
 SET status = 'failed', revision = revision + 1, updated_at = ?1
