@@ -183,7 +183,25 @@ export function configureFeed(
   autoUpdater.allowDowngrade = false;
 }
 
-let lastStatus: UpdateStatus = { state: "idle" };
+// Baked by Vite: shell environment changes cannot enable updates in this build.
+const MANUAL_UPDATES = process.env.AO_MANUAL_UPDATES === "true";
+const MANUAL_UPDATE_STATUS: UpdateStatus = {
+  state: "unsupported",
+  manualOnly: true,
+  message: "This custom build uses manual updates. Install a verified fork build to update; automatic update checks are disabled.",
+};
+if (MANUAL_UPDATES) {
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = false;
+}
+
+function reportManualUpdates(requestId?: string): boolean {
+  if (!MANUAL_UPDATES) return false;
+  broadcast({ ...MANUAL_UPDATE_STATUS, requestId });
+  return true;
+}
+
+let lastStatus: UpdateStatus = MANUAL_UPDATES ? MANUAL_UPDATE_STATUS : { state: "idle" };
 let independentStatusRevision = 0;
 let eventsWired = false;
 let lastCheckError: string | undefined;
@@ -2289,6 +2307,7 @@ function reconcileAutomaticUpdateSchedule(
   stateDir: string,
   settings: UpdateSettings,
 ): void {
+  if (MANUAL_UPDATES) return;
   schedulePeriodicAutomaticUpdateCheck(
     stateDir,
     automaticUpdateCheckInterval(settings),
@@ -2312,6 +2331,7 @@ async function requestAutomaticUpdateCheck(
 // downloaded automatically. Both preferences come from update-settings.
 // Caller guards on app.isPackaged.
 export async function startAutoUpdates(stateDir: string): Promise<void> {
+  if (reportManualUpdates()) return;
   escalationStateDir = stateDir;
   restoreStagedBuild(stateDir);
   startRetirementPollTimer(stateDir);
@@ -2366,6 +2386,7 @@ export async function checkForUpdatesNow(
   stateDir: string,
   options: UpdateCheckOptions = {},
 ): Promise<void> {
+  if (reportManualUpdates(options.requestId)) return;
   escalationStateDir = stateDir;
   wireUpdaterEvents();
   // Asking again IS the explicit retry the exhausted message points at.
@@ -2475,6 +2496,7 @@ export async function returnToHome(
   stateDir: string,
   requestId?: string,
 ): Promise<void> {
+  if (reportManualUpdates(requestId)) return;
   escalationStateDir = stateDir;
   wireUpdaterEvents();
   if (!app.isPackaged) {
@@ -2538,6 +2560,7 @@ export async function returnToHome(
 
 // downloadUpdateNow starts downloading the update found by checkForUpdatesNow.
 export async function downloadUpdateNow(requestId?: string): Promise<void> {
+  if (reportManualUpdates(requestId)) return;
   if (manualDownloadPending || lastStatus.state === "downloading" || lastStatus.state === "preparing") return;
   const version = lastStatus.version;
   wireUpdaterEvents();
@@ -2710,7 +2733,7 @@ export async function quitAndInstallUpdate(confirmedVersion?: string): Promise<U
   if (confirmedVersion !== undefined && (typeof confirmedVersion !== "string" || !confirmedVersion.trim())) {
     throw new Error("A valid confirmed update version is required.");
   }
-  if (!app.isPackaged) return;
+  if (reportManualUpdates() || !app.isPackaged) return;
   if (awaitingStagedReplacement) {
     throw new Error("Check for updates and download an update before restarting to install.");
   }
@@ -2878,6 +2901,7 @@ async function prepareRememberedNonDarwinUpdate(): Promise<void> {
 // ensureUpdatePrefs prompts once (first run, before any settings file exists)
 // for auto-update opt-in + channel, with a nightly instability disclaimer.
 export async function ensureUpdatePrefs(stateDir: string): Promise<void> {
+  if (MANUAL_UPDATES) return;
   if (existsSync(path.join(stateDir, UPDATE_SETTINGS_FILE_NAME))) return;
 
   const installedNightly = installedUpdateChannel() === "nightly";

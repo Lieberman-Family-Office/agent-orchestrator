@@ -4,6 +4,9 @@ import { defineConfig } from "vite";
 // of Vite's bundle so the packaged app loads the rebuilt binary from
 // node_modules (the auto-unpack plugin moves that binary outside app.asar).
 export default defineConfig({
+	define: {
+		"process.env.AO_MANUAL_UPDATES": JSON.stringify(process.env.AO_MANUAL_UPDATES === "true" ? "true" : "false"),
+	},
 	build: {
 		rollupOptions: {
 			external: ["better-sqlite3"],
