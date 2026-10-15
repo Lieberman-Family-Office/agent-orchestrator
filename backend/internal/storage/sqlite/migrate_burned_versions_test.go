@@ -208,6 +208,9 @@ var shippedMigrations = map[int64]string{
 	198: "0198_project_revision.sql",
 	199: "0199_interrupt_and_send.sql",
 	200: "0200_provider_events_turn_completed_index.sql",
+	// Upstream 198 follows the fork's already shipped 198–200.
+	201: "0201_harness_defaults.sql",
+	202: "0202_conversation_turn_lineage_indexes.sql",
 }
 
 // burnedVersion reports version numbers that must never be (re)used: they

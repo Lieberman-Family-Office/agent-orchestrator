@@ -34,7 +34,7 @@ func TestCustom0134HistoryRepairRollsBackIncompleteSchema(t *testing.T) {
 }
 
 func TestOfficialAndFreshDatabasesOpenTwice(t *testing.T) {
-	for _, version := range []int64{0, 194, 195, 196, 197} {
+	for _, version := range []int64{0, 194, 195, 196, 197, 198, 199, 200} {
 		t.Run(fmt.Sprint(version), func(t *testing.T) {
 			dir := t.TempDir()
 			if version != 0 {
@@ -70,6 +70,10 @@ func TestOfficialAndFreshDatabasesOpenTwice(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer db.Close()
+			var defaults string
+			if err := db.QueryRow(`SELECT harness_defaults FROM app_settings`).Scan(&defaults); err != nil || defaults != "{}" {
+				t.Fatalf("harness defaults=%q error=%v", defaults, err)
+			}
 			var columns int
 			if err := db.QueryRow(`SELECT (SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name='revision')+(SELECT COUNT(*) FROM pragma_table_info('conversation_turns') WHERE name IN ('interrupt_target_provider_turn_id','interrupt_delivered'))+(SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name IN ('hibernated_at','branch_state','requested_output'))+(SELECT COUNT(*) FROM pragma_table_info('session_artifact_versions'))+(SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_conversation_provider_events_turn_completed')`).Scan(&columns); err != nil || columns != 15 {
 				t.Fatalf("columns=%d error=%v", columns, err)
@@ -91,6 +95,75 @@ func TestOfficialAndFreshDatabasesOpenTwice(t *testing.T) {
 				if err := db.QueryRow(`SELECT config FROM projects WHERE id='official'`).Scan(&config); err != nil || config != `{"env":{"MCP_PROFILE":"retained"}}` {
 					t.Fatalf("config=%q error=%v", config, err)
 				}
+			}
+		})
+	}
+}
+
+func TestOfficial0142UpgradePreservesHarnessDefaults(t *testing.T) {
+	for name, damage := range map[string]string{
+		"valid":                     "",
+		"missing column":            `ALTER TABLE app_settings DROP COLUMN harness_defaults`,
+		"wrong type":                `ALTER TABLE app_settings DROP COLUMN harness_defaults; ALTER TABLE app_settings ADD COLUMN harness_defaults INTEGER NOT NULL DEFAULT 0`,
+		"missing constraint":        `ALTER TABLE app_settings DROP COLUMN harness_defaults; ALTER TABLE app_settings ADD COLUMN harness_defaults TEXT NOT NULL DEFAULT '{}'`,
+		"occupied destination":      `INSERT INTO goose_db_version(version_id,is_applied) VALUES(201,1)`,
+		"historical destination":    `INSERT INTO goose_db_version(version_id,is_applied) VALUES(201,0)`,
+		"incomplete upstream":       `DROP INDEX idx_session_artifact_versions_sha`,
+		"orphaned revision trigger": `CREATE TRIGGER projects_revision_guard BEFORE UPDATE ON projects BEGIN SELECT 1; END`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			db := openMigratedDatabaseCopyAt(t, dir, 197, pragmas)
+			// Upstream v0.14.2 shipped this unchanged SQL as migration 198.
+			applyForkMigration(t, db, "0201_harness_defaults.sql", 198)
+			const defaults = `{"claude-code":{"model":"retained-model"}}`
+			if _, err := db.Exec(`UPDATE app_settings SET harness_defaults=?`, defaults); err != nil {
+				t.Fatal(err)
+			}
+			if damage != "" {
+				if _, err := db.Exec(damage); err != nil {
+					t.Fatal(err)
+				}
+				const history = `SELECT group_concat(id || ':' || version_id || ':' || is_applied, ',') FROM (SELECT * FROM goose_db_version ORDER BY id)`
+				var before, after string
+				if err := db.QueryRow(history).Scan(&before); err != nil {
+					t.Fatal(err)
+				}
+				if err := repairCustom0134MigrationHistory(db); err == nil {
+					t.Fatal("ambiguous upstream migration was accepted")
+				}
+				if err := db.QueryRow(history).Scan(&after); err != nil || before != after {
+					t.Fatalf("refused repair changed migration history: %v", err)
+				}
+				return
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			for range 2 {
+				upgraded, err := Open(dir)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := upgraded.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			db, err := sql.Open("sqlite", databaseURI(dir)+readOnlyPragmas)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			var got string
+			if err := db.QueryRow(`SELECT harness_defaults FROM app_settings`).Scan(&got); err != nil || got != defaults {
+				t.Fatalf("harness defaults=%q error=%v", got, err)
+			}
+			var count int
+			if err := db.QueryRow(`SELECT COUNT(DISTINCT version_id) FROM goose_db_version WHERE version_id BETWEEN 198 AND 202 AND is_applied=1`).Scan(&count); err != nil || count != 5 {
+				t.Fatalf("applied migrations=%d error=%v", count, err)
+			}
+			if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name='revision'`).Scan(&count); err != nil || count != 1 {
+				t.Fatalf("fork revision column=%d error=%v", count, err)
 			}
 		})
 	}

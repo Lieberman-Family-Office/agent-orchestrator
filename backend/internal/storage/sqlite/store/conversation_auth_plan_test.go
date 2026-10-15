@@ -56,7 +56,38 @@ func TestSelectVerifiedAuthenticationTurnUsesTurnCompletedIndex(t *testing.T) {
 	}
 }
 
-// queryCapture records the SQL text and args a generated :one query sends.
+func TestSelectConversationTurnsUsesLineageIndexes(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	s, err := sqlite.Open(dataDir)
+	mustNoError(t, err)
+	mustNoError(t, s.Close())
+	raw, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "ao.db"))
+	mustNoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	capture := &queryCapture{DBTX: raw}
+	_, err = gen.New(capture).SelectConversationTurns(ctx, "conv")
+	mustNoError(t, err)
+	rows, err := raw.QueryContext(ctx, "EXPLAIN QUERY PLAN "+capture.query, capture.args...)
+	mustNoError(t, err)
+	defer func() { _ = rows.Close() }()
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		mustNoError(t, rows.Scan(&id, &parent, &unused, &detail))
+		plan = append(plan, detail)
+	}
+	mustNoError(t, rows.Err())
+	for _, table := range []string{"messages", "activities"} {
+		want := "USING COVERING INDEX idx_conversation_" + table + "_turn_sequence (turn_id=? AND sequence<?)"
+		if !strings.Contains(strings.Join(plan, "\n"), want) {
+			t.Errorf("lineage query does not use %s:\n%s", want, strings.Join(plan, "\n"))
+		}
+	}
+}
+
+// queryCapture records the SQL text and args a generated query sends.
 type queryCapture struct {
 	gen.DBTX
 	query string
@@ -66,4 +97,9 @@ type queryCapture struct {
 func (c *queryCapture) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
 	c.query, c.args = query, args
 	return c.DBTX.QueryRowContext(ctx, query, args...)
+}
+
+func (c *queryCapture) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	c.query, c.args = query, args
+	return c.DBTX.QueryContext(ctx, query, args...)
 }

@@ -123,7 +123,7 @@ import {
 	type TurnOutcomeRetryControl,
 } from "./ChatTimelineItems";
 import { HumanMessageEditor } from "./HumanMessageEditor";
-import { ChatLinkProvider } from "./ChatMarkdown";
+import { ChatLinkProvider, ChatOpeningRef } from "./ChatMarkdown";
 import { ChatImageSourceProvider } from "./chat-image-source";
 import type { ComposerPromptSuggestion } from "./ComposerEditor";
 import { ChatComposer, type ChatComposerHandle, type StoredComposerAttachment } from "./ChatComposer";
@@ -2745,6 +2745,21 @@ export function Timeline({
 	// widens chat; shorter histories (common on non-Codex harnesses) often
 	// stop overflowing and used to lose the minimap exactly then.
 	const minimapEnabled = scrollbar.markers.length > 0;
+	// Replies rendered with the chat's first commit were already on screen
+	// before the switch; streamed text in them must not fade in again.
+	const chatOpening = useRef(true);
+	useEffect(() => {
+		chatOpening.current = false;
+	}, []);
+	// The minimap appears once the opened chat is measured. That first reveal is
+	// part of opening the chat, so it is instant; only later changes (the inspector
+	// covering it) fade.
+	const [minimapRevealed, setMinimapRevealed] = useState(false);
+	useEffect(() => {
+		if (!minimapEnabled || minimapRevealed) return;
+		const frame = window.requestAnimationFrame(() => setMinimapRevealed(true));
+		return () => window.cancelAnimationFrame(frame);
+	}, [minimapEnabled, minimapRevealed]);
 	const { t } = useTranslation();
 	const openingTurnId = startup?.openingTurnId;
 	// The checklist holds the working slot until the agent is up and its first
@@ -3807,6 +3822,7 @@ export function Timeline({
 	}
 
 	return (
+		<ChatOpeningRef.Provider value={chatOpening}>
 		<div
 			className="relative flex min-h-0 flex-1 flex-col"
 			data-testid="chat-timeline"
@@ -4040,7 +4056,8 @@ export function Timeline({
 				onBlur={() => setHoveredMarker(null)}
 				onPointerLeave={() => setHoveredMarker(null)}
 					className={cn(
-						"group/scroll absolute inset-y-3 right-1 z-10 w-6 touch-none rounded-full outline-none transition-opacity focus-visible:ring-1 focus-visible:ring-logo-accent/60",
+						"group/scroll absolute inset-y-3 right-1 z-10 w-6 touch-none rounded-full outline-none focus-visible:ring-1 focus-visible:ring-logo-accent/60",
+						minimapRevealed && "transition-opacity",
 						minimapEnabled && !inspectorOpenRef.current
 							? "cursor-pointer opacity-100"
 							: "pointer-events-none opacity-0",
@@ -4117,6 +4134,7 @@ export function Timeline({
 				</Button>
 			) : null}
 		</div>
+		</ChatOpeningRef.Provider>
 	);
 }
 
