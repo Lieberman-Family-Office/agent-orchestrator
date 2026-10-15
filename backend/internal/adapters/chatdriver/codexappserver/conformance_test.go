@@ -196,6 +196,11 @@ func TestGeneratedProtocolMatchesTheInstalledProvider(t *testing.T) {
 			continue
 		}
 		if !live[name] {
+			// Rollback explicitly supports both protocol generations. Its fallback
+			// target/dispatch safety is covered by the history regression suite.
+			if name == "thread/rollback" && live["thread/revert"] {
+				continue
+			}
 			extra = append(extra, name)
 		}
 	}

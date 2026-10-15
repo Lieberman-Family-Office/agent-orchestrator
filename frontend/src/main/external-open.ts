@@ -23,13 +23,13 @@ export async function openAllowedAppExternalURL(rawUrl: string, opener: External
 	await opener.openExternal(rawUrl);
 }
 
-/** Renderer supplies a relative catalog path; main resolves and confines the native file. */
+/** Main confines relative catalog paths and absolute chat references to the session root. */
 export async function openSessionFileInDefaultApp(
 	sessionId:string, reference:string, source:"workspace"|"artifact",
 	resolveRoot:(sessionId:string,source:"workspace"|"artifact")=>Promise<string>,
 	opener:{openPath:(file:string)=>Promise<string>},
 ):Promise<void> {
-	if(typeof sessionId!=="string" || !sessionId || typeof reference!=="string" || !reference || reference.includes("\0") || path.isAbsolute(reference) || (source!=="workspace" && source!=="artifact")) throw new Error("Invalid session file request");
+	if(typeof sessionId!=="string" || !sessionId || typeof reference!=="string" || !reference || reference.includes("\0") || (source!=="workspace" && source!=="artifact")) throw new Error("Invalid session file request");
 	const root=await realpath(await resolveRoot(sessionId,source));
 	const target=await realpath(path.resolve(root,reference));
 	const relative=path.relative(root,target);

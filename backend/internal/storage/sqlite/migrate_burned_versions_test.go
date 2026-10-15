@@ -1,6 +1,8 @@
 package sqlite
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -197,11 +199,15 @@ var shippedMigrations = map[int64]string{
 	192: "0192_allow_openhands_harness.sql",
 	193: "0193_allow_codewhale_harness.sql",
 	194: "0194_allow_command_code_harness.sql",
-	// Supersedes custom 0.13.4 migration IDs 190/191 without changing their DDL.
-	// repairCustom0134MigrationHistory validates and remaps those installed identities.
-	195: "0195_project_revision.sql",
-	196: "0196_interrupt_and_send.sql",
-	197: "0197_provider_events_turn_completed_index.sql",
+	195: "0195_session_requested_output.sql",
+	196: "0196_session_artifact_versions.sql",
+	197: "0197_detach_split_orchestrator_conversations.sql",
+	// Explicit exception: unchanged fork DDL supersedes custom 190/191 and
+	// fork 195–197. repairCustom0134MigrationHistory validates each identity
+	// before remapping it; upstream 195–197 retain their shipped identities.
+	198: "0198_project_revision.sql",
+	199: "0199_interrupt_and_send.sql",
+	200: "0200_provider_events_turn_completed_index.sql",
 }
 
 // burnedVersion reports version numbers that must never be (re)used: they
@@ -228,6 +234,22 @@ func burnedVersion(v int64) bool {
 // produces silently-skipped migrations and unexplainable 500s months later
 // (issue #3475).
 func TestMigrationVersionLedger(t *testing.T) {
+	// These hashes come from fork HEAD 146777a53. Identity repair must never
+	// become permission to alter the SQL already applied by a shipped build.
+	for name, want := range map[string]string{
+		"0198_project_revision.sql":                     "beb8d9d9e4da93a9afebf3ae2a04d295ca959c56b0d63571d2e1fb3345cd1152",
+		"0199_interrupt_and_send.sql":                   "c0b0b5c4e62315bfe5d97c21a124c8f3c80bdf123c749abb64673cc917583468",
+		"0200_provider_events_turn_completed_index.sql": "67f3c33d027bbacfbb86198b031627bf7e0dabaa6728bb394e5a6cb94d2cae12",
+	} {
+		body, err := migrationsFS.ReadFile("migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Ignore checkout line endings, not SQL changes.
+		if got := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.ReplaceAll(string(body), "\r\n", "\n")))); got != want {
+			t.Errorf("renumbered migration %s changed its shipped SQL: %s", name, got)
+		}
+	}
 	entries, err := migrationsFS.ReadDir("migrations")
 	if err != nil {
 		t.Fatalf("read migrations dir: %v", err)

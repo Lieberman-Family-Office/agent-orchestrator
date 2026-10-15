@@ -116,6 +116,7 @@ return { parseSteerRequest, agent, initialized, handleAskUserQuestion: questionB
 	commandLifecycle({ command_uuid: "worker-message", state: "started" });
 	assert.equal(session.aoWorkerSteering.size, 0);
 	assert.deepEqual([...session.turnQueue[0].steeredEchoes], ["human-message"]);
+	assert.equal(session.turnQueue[0].steeredAwaitingResult, true, "native start must wait for a result before idle settlement");
 	commandLifecycle({ command_uuid: "human-message", state: "started" });
 	assert.deepEqual([...session.turnQueue[0].steeredEchoes], ["human-message"]);
 	await agent.steer(parseSteerRequest({ sessionId: "test", prompt: "explicit human correction" }));

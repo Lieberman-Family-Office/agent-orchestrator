@@ -85,11 +85,14 @@ func TestACPReplayCaptureDefersNormalization(t *testing.T) {
 
 func TestACPReplayDrainReconstructsTurnsInOrder(t *testing.T) {
 	conv := replayConversation()
+	conv.historyNotice = func(text string) bool { return strings.HasPrefix(text, "<note>") }
 	conv.beginHistoryReplay("session-1")
 
 	updates := []acpsdk.SessionNotification{
 		replayUserChunk("session-1", "u1", "hello"),
 		replayAgentChunk("session-1", "a1", "hi"),
+		// The agent's own note starts no turn; its answer stays in this one.
+		replayUserChunk("session-1", "n1", "<note>task finished</note>"),
 		replayAgentChunk("session-1", "a1", " there"),
 		replayUserChunk("session-1", "u2", "bye"),
 		replayAgentChunk("session-1", "a2", "later"),
@@ -268,9 +271,10 @@ func TestACPReplayLoadLargeHistoryThroughSDK(t *testing.T) {
 	agent.conn = acpsdk.NewAgentSideConnection(agent, agentW, clientR)
 	conv.updateProcessed = make(chan string, 1)
 	conv.streamDone = make(chan struct{})
-	transport, sdkWriter, sdkReader := newLegacyACPTransport(clientW, agentR, conv.updateProcessed, conv.streamDone)
+	transport, sdkWriter, sdkReader := newLegacyACPTransport(clientW, conv.updateProcessed, conv.streamDone)
 	conv.legacyWire = transport
 	conv.conn = acpsdk.NewClientSideConnection(conv, sdkWriter, sdkReader)
+	go transport.forward(agentR)
 	t.Cleanup(func() {
 		close(conv.streamDone)
 		_ = clientR.Close()

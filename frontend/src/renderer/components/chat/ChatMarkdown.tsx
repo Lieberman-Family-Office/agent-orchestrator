@@ -45,7 +45,8 @@ import { isLoopbackHostname } from "../../lib/loopback";
 import { canonicalLanguage } from "../../lib/code-highlight";
 import { fenceOf } from "../../lib/markdown-fence";
 import { EMOJI_GRAPHEME, rehypeStreamFade } from "../../lib/rehype-stream-fade";
-import { findSessionLinks, isSessionLink, remarkSessionLinks } from "../../lib/session-links";
+import { artifactLinkForPath, findSessionLinks, isAoLink, isSessionLink, remarkSessionLinks } from "../../lib/session-links";
+import { useSessionLinkSource } from "../../lib/use-session-link-navigation";
 import {
 	isPotentialWorkspaceFileLink,
 	isWebLink,
@@ -53,10 +54,11 @@ import {
 	workspaceFilePath,
 } from "../../lib/external-link-policy";
 import { AppLink } from "../AppLink";
-import { SessionLinkPreviewCard } from "../SessionLinkPreviewCard";
+import { ArtifactLinkPreviewCard, SessionLinkPreviewCard } from "../SessionLinkPreviewCard";
 import {
 	explicitWorkspaceFilePath,
 	findWorkspaceFilePath,
+	workspaceFileOpenTarget,
 	workspaceFileReferenceLine,
 } from "../../lib/workspace-file-path";
 import { HighlightedCode } from "./HighlightedCode";
@@ -162,7 +164,7 @@ function chatUrlTransform(url: string, key: string): string | undefined {
 	// react-markdown correctly strips unknown schemes, but a Windows absolute
 	// path resembles one (C:). Preserve only hrefs that look like local paths;
 	// the click still goes through the workspace-confined preview endpoint.
-	if (isSessionLink(url)) return url;
+	if (isAoLink(url)) return url;
 	if (key === "href" && isPotentialWorkspaceFileLink(url)) return url;
 	return defaultUrlTransform(url);
 }
@@ -317,9 +319,9 @@ function MarkdownLink({ href, children }: { href?: string; children?: ReactNode 
 	const filePath = href && onFileOpen
 		? workspaceFilePath(href, workspacePaths) ?? findWorkspaceFilePath(href, workspacePaths) ?? explicitWorkspaceFilePath(href)
 		: undefined;
-	const sessionLink = Boolean(href && isSessionLink(href));
+	const sessionLink = Boolean(href && isAoLink(href));
 	if (safeOriginContent && !sessionLink) return <>{children}</>;
-	const openInFiles = filePath && !/\.html?$/i.test(filePath) ? filePath : undefined;
+	const openInFiles = filePath && href && !/\.html?$/i.test(filePath) ? workspaceFileOpenTarget(href, filePath) : undefined;
 	if (remoteHost && href && (isHostLocalWebLink(href) || (isPotentialWorkspaceFileLink(href) && !openInFiles))) {
 		return <span className="text-muted-foreground" title={REMOTE_PREVIEW_UNAVAILABLE}>
 			{children}<span className="sr-only"> (remote preview unavailable)</span>
@@ -331,9 +333,13 @@ function MarkdownLink({ href, children }: { href?: string; children?: ReactNode 
 			href={href}
 			onBrowserOpen={onLinkOpen}
 			inAppLink={href ? () => browserLink : undefined}
-			filePath={filePath}
+			filePath={filePath && href ? workspaceFileOpenTarget(href, filePath) : filePath}
 			onFileOpen={onFileOpen}
-			hoverPreview={sessionLink ? () => <SessionLinkPreviewCard href={href!} sourceHostId={sessionLinkHostId} sourceKind={sessionLinkSourceKind} /> : undefined}
+			hoverPreview={sessionLink
+				? () => isSessionLink(href!)
+					? <SessionLinkPreviewCard href={href!} sourceHostId={sessionLinkHostId} sourceKind={sessionLinkSourceKind} />
+					: <ArtifactLinkPreviewCard href={href!} sourceHostId={sessionLinkHostId} sourceKind={sessionLinkSourceKind} />
+				: undefined}
 			onClick={(event) => {
 				if (href && sessionLink) {
 					event.preventDefault();
@@ -363,7 +369,7 @@ function MarkdownLink({ href, children }: { href?: string; children?: ReactNode 
 	);
 }
 
-/** Render one safe in-app session link using the surrounding ChatLinkProvider. */
+/** Render one safe in-app session or artifact link using the surrounding ChatLinkProvider. */
 export function SessionLabelLink({ href, children }: { href: string; children: ReactNode }) {
 	return <MarkdownLink href={href}>{children}</MarkdownLink>;
 }
@@ -379,7 +385,7 @@ function MarkdownImage({ src, alt }: { src?: string | Blob; alt?: string }) {
 
 const ORIGIN_PREVIEW_ELEMENTS = ["a", "br", "code", "del", "em", "img", "strong"];
 const ORIGIN_PREVIEW_COMPONENTS: Components = {
-	a: ({ href, children }) => href && isSessionLink(href)
+	a: ({ href, children }) => href && isAoLink(href)
 		? <MarkdownLink href={href}>{children}</MarkdownLink>
 		: <>{children}</>,
 	img: ({ alt }) => <span className="text-muted-foreground">{alt}</span>,
@@ -448,8 +454,16 @@ function MermaidFence({ code }: { code: string }) {
 		: diagram;
 }
 
+/** Inline code naming a listed session artifact, linked to that artifact. */
+function ArtifactPathCode({ text, children }: { text: string; children: ReactNode }) {
+	const { sessionLinkHostId, sessionLinkSourceKind } = useContext(OpenChatLink);
+	const { workspaces } = useSessionLinkSource(sessionLinkHostId, sessionLinkSourceKind);
+	const href = artifactLinkForPath(text, workspaces);
+	return href ? <MarkdownLink href={href}>{children}</MarkdownLink> : <>{children}</>;
+}
+
 function InlineCode({ children }: { children?: ReactNode }) {
-	const { openFile: onFileOpen, openArtifact:onArtifactOpen,openFileExternal:onFileExternalOpen,workspacePaths,artifactPaths,remoteHost } = useContext(OpenChatLink);
+	const { openFile: onFileOpen, openArtifact: onArtifactOpen, openFileExternal: onFileExternalOpen, openSession, workspacePaths, artifactPaths, remoteHost } = useContext(OpenChatLink);
 	const insideLink = useContext(InsideMarkdownLink);
 	const text = typeof children === "string" ? children : undefined;
 	const workspacePath = text && onFileOpen ? findWorkspaceFilePath(text, workspacePaths) : undefined;
@@ -461,17 +475,19 @@ function InlineCode({ children }: { children?: ReactNode }) {
 			{children}
 		</code>
 	);
-	if (!filePath || insideLink) return code;
+	if (insideLink || (workspacePath && artifactPath)) return code;
+	if (!filePath) return text?.includes("/") && openSession ? <ArtifactPathCode text={text}>{code}</ArtifactPathCode> : code;
 	return (
 		<a
 			href={filePath}
 			onClick={(event) => {
 				event.preventDefault();
-				if (event.metaKey && !remoteHost && onFileExternalOpen) {onFileExternalOpen(filePath,source);return;}
+				const target = workspaceFileOpenTarget(text ?? "", filePath);
+				if (event.metaKey && !remoteHost && onFileExternalOpen) {onFileExternalOpen(target,source);return;}
 				if(source==="artifact") {onArtifactOpen?.(filePath);return;}
 				const line = workspaceFileReferenceLine(text ?? "");
-				if (line == null) onFileOpen?.(filePath);
-				else onFileOpen?.(filePath, line);
+				if (line == null) onFileOpen?.(target);
+				else onFileOpen?.(target, line);
 			}}
 			aria-label={`Open ${filePath} in Files`}
 			title={!remoteHost && onFileExternalOpen ? "Click to open in AO; Command-click to open in the default app" : "Open in AO"}
@@ -515,8 +531,9 @@ const COMPONENTS: Components = {
 		),
 
 	ul: ({ children }) => <ul className="my-2 ml-4 list-disc space-y-1 first:mt-0">{children}</ul>,
-	ol: ({ children }) => (
-		<ol className="my-2 ml-4 list-decimal space-y-1 first:mt-0">{children}</ol>
+	// Keep the source's first number: a reply of "6." is one item numbered 6, not 1.
+	ol: ({ children, start }) => (
+		<ol start={start} className="my-2 ml-4 list-decimal space-y-1 first:mt-0">{children}</ol>
 	),
 	li: ({ children, className }) => (
 		// A task-list item drops its bullet: the checkbox is the marker.

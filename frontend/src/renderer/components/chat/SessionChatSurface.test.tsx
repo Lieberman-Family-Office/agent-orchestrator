@@ -74,6 +74,20 @@ const configState = vi.hoisted(() => ({
 	options: [] as ChatConfigOption[], loaded: false, error: undefined as string | undefined,
 }));
 
+const sideMocks = vi.hoisted(() => ({
+	create: vi.fn(),
+	send: vi.fn(),
+	show: vi.fn(),
+	addReference: vi.fn(),
+	sides: [] as { hasWork: boolean }[],
+	workspaceSend: undefined as
+		| undefined
+		| ((text: string, attachments: undefined, clientMessageId: string) => Promise<void>),
+}));
+vi.mock("./IndependentSideChats", () => ({
+	useIndependentSideChats: () => ({ ...sideMocks, panel: null, activeId: "existing-side" }),
+}));
+
 const visibilityMocks = vi.hoisted(() => ({
 	presentation: vi.fn(),
 	route: vi.fn(),
@@ -82,6 +96,7 @@ const visibilityMocks = vi.hoisted(() => ({
 vi.mock("../../lib/api-client", () => ({
 	apiClient: { GET: getMock, POST: postMock },
 	getApiBaseUrl: () => "",
+	subscribeApiBaseUrl: () => () => {},
 	apiErrorMessage: (_error: unknown, fallback: string) => fallback,
 }));
 
@@ -123,9 +138,12 @@ vi.mock("./ChatWorkspace", async () => {
 			onRememberPermissions,
 			onChooseSettings,
 			configOptionError,
+			promptSuggestion,
 			snapshot,
 			shellTarget,
+			onSend,
 		}: {
+			onSend: typeof sideMocks.workspaceSend;
 			agentInputDisabled?: boolean;
 			headerActions?: ReactNode;
 			sessionTabAction?: ReactNode;
@@ -134,9 +152,11 @@ vi.mock("./ChatWorkspace", async () => {
 			onRememberPermissions?: unknown;
 			onChooseSettings?: unknown;
 			configOptionError?: string;
+			promptSuggestion?: { id: string; text: string };
 			snapshot: { sessionId?: string };
 			shellTarget?: { handleId: string };
 		}) => {
+			sideMocks.workspaceSend = onSend;
 			const [mountedSessionId] = useState(snapshot.sessionId);
 			return (
 				<div>
@@ -153,6 +173,7 @@ vi.mock("./ChatWorkspace", async () => {
 					<div data-testid="remember-available">{String(Boolean(onRememberPermissions))}</div>
 					<div data-testid="turn-settings-available">{String(Boolean(onChooseSettings))}</div>
 					<div data-testid="config-option-error">{configOptionError}</div>
+					<div data-testid="prompt-suggestion">{promptSuggestion?.text}</div>
 					{headerActions}
 					{sessionTabAction}
 					<button type="button" onClick={() => onLinkOpen?.(LINK)}>
@@ -219,6 +240,67 @@ beforeEach(() => {
 
 afterEach(() => {
 	vi.useRealTimers();
+});
+
+describe("SessionChatSurface prompt suggestions", () => {
+	function settleConversation() {
+		conversationState.snapshot = {
+			...snapshotFor(session.id),
+			turns: [{ id: "turn-1", state: "completed", requestedAt: "2026-10-12T00:00:00Z" }],
+		};
+		postMock.mockResolvedValue({ data: { turnId: "turn-1", prompt: "Explain the fix." } });
+	}
+
+	it("forwards a settled conversation suggestion and hides it while new work is fenced", async () => {
+		settleConversation();
+		const client = new QueryClient();
+		const tree = (newWorkDisabled = false) =>
+			<Wrapper client={client}><SessionChatSurface session={session} newWorkDisabled={newWorkDisabled} /></Wrapper>;
+		const view = render(tree());
+		await waitFor(() => expect(screen.getByTestId("prompt-suggestion")).toHaveTextContent("Explain the fix."));
+		view.rerender(tree(true));
+		expect(screen.getByTestId("prompt-suggestion")).toBeEmptyDOMElement();
+		view.rerender(tree());
+		expect(screen.getByTestId("prompt-suggestion")).toHaveTextContent("Explain the fix.");
+		expect(postMock).toHaveBeenCalledOnce();
+	});
+
+	it("keeps an in-flight suggestion while a file pane temporarily hides the composer", async () => {
+		settleConversation();
+		let signal: AbortSignal | undefined;
+		let resolve!: (value: unknown) => void;
+		postMock.mockImplementation((_path, options: { signal: AbortSignal }) => {
+			signal = options.signal;
+			return new Promise((complete) => { resolve = complete; });
+		});
+		const client = new QueryClient();
+		const tree = (workspaceFileActive = false) => <Wrapper client={client}><SessionChatSurface session={session} workspaceFileActive={workspaceFileActive} /></Wrapper>;
+		const view = render(tree());
+		await waitFor(() => expect(postMock).toHaveBeenCalledOnce());
+		view.rerender(tree(true));
+		expect(signal?.aborted).toBe(false);
+		expect(screen.getByTestId("prompt-suggestion")).toBeEmptyDOMElement();
+		await act(async () => resolve({ data: { turnId: "turn-1", prompt: "Explain the fix." } }));
+		view.rerender(tree());
+		await waitFor(() => expect(screen.getByTestId("prompt-suggestion")).toHaveTextContent("Explain the fix."));
+		expect(postMock).toHaveBeenCalledOnce();
+	});
+
+	it.each([
+		{ workspaceFileActive: true },
+		{ workspaceActiveTabKey: "file:README.md" },
+		{ reviewerChatSelected: true },
+		{ reviewerTarget: { kind: "reviewer" as const, handleId: "review-1", harness: "codex", sessionId: session.id } },
+		{ shellTarget: { kind: "shell" as const, handleId: "shell-1", generation: "generation-1", title: "Shell" } },
+		{ controllerTransitioning: true },
+		{ handoffDialogOpen: true },
+		{ agentResuming: true },
+	])("does not generate while the primary chat is inactive or blocked %#", (props) => {
+		settleConversation();
+		render(<Wrapper client={new QueryClient()}><SessionChatSurface session={session} {...props} /></Wrapper>);
+		expect(postMock).not.toHaveBeenCalled();
+		expect(screen.getByTestId("prompt-suggestion")).toBeEmptyDOMElement();
+	});
 });
 
 describe("SessionChatSurface link routing", () => {
@@ -656,6 +738,11 @@ describe("SessionChatSurface link routing", () => {
 		const localSession = { ...session, id: "session-local-html" };
 		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
 		const openInBrowser = vi.fn().mockResolvedValue(undefined);
+		// The link is absolute, so the daemon says which root owns it before the
+		// page is previewed.
+		getMock.mockImplementation(async (path: string) => path === "/api/v1/sessions/{sessionId}/workspace/resolve"
+			? { data: { sessionId: localSession.id, kind: "workspace", path: "test-ui.html" }, error: undefined }
+			: { data: { switches: agentSwitchState.data }, error: undefined, response: { status: 200 } });
 		const view = render(<Wrapper client={queryClient}><SessionChatSurface session={localSession} onOpenLinkInBrowser={openInBrowser} /></Wrapper>);
 		conversationState.snapshot = {
 			capabilities: [],
@@ -665,6 +752,30 @@ describe("SessionChatSurface link routing", () => {
 		await waitFor(() => expect(openInBrowser).toHaveBeenCalledWith(
 			expect.stringContaining("/api/v1/sessions/session-local-html/preview/files/test-ui.html"),
 		));
+		expect(postMock).not.toHaveBeenCalled();
+	});
+
+	it("does not automatically preview or open an absolute HTML link outside the session", async () => {
+		workspacePathsState.paths = ["test-ui.html"];
+		const localSession = { ...session, id: "session-outside-html" };
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+		const openInBrowser = vi.fn().mockResolvedValue(undefined);
+		const onOpenFile = vi.fn();
+		getMock.mockImplementation(async (path: string) => path === "/api/v1/sessions/{sessionId}/workspace/resolve"
+			? { data: { sessionId: localSession.id, kind: "outside", path: "" }, error: undefined }
+			: { data: { switches: agentSwitchState.data }, error: undefined, response: { status: 200 } });
+		const view = render(<Wrapper client={queryClient}><SessionChatSurface session={localSession} onOpenFile={onOpenFile} onOpenLinkInBrowser={openInBrowser} /></Wrapper>);
+		conversationState.snapshot = {
+			capabilities: [],
+			items: [{ kind: "message", id: "assistant-outside-html", sequence: 1, revision: 1, role: "assistant", origin: "provider", text: "Done: [`test-ui.html`](/other-repo/test-ui.html)", streaming: false, createdAt: "2026-08-08T00:00:01Z" }],
+		};
+		view.rerender(<Wrapper client={queryClient}><SessionChatSurface session={localSession} onOpenFile={onOpenFile} onOpenLinkInBrowser={openInBrowser} /></Wrapper>);
+		await waitFor(() => expect(getMock).toHaveBeenCalledWith("/api/v1/sessions/{sessionId}/workspace/resolve", {
+			params: { path: { sessionId: localSession.id }, query: { path: "/other-repo/test-ui.html" } },
+		}));
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(openInBrowser).not.toHaveBeenCalled();
+		expect(onOpenFile).not.toHaveBeenCalled();
 		expect(postMock).not.toHaveBeenCalled();
 	});
 
@@ -1172,5 +1283,90 @@ describe("project remembering waits for provider permissions", () => {
 		// session identity to model that notification through the memo boundary.
 		rerender(<Wrapper client={client}><SessionChatSurface session={{ ...session }} /></Wrapper>);
 		expect(screen.getByTestId("remember-available")).toHaveTextContent("true");
+	});
+});
+
+describe("side command routing", () => {
+	beforeEach(() => {
+		useUiStore.setState({ developerMode: true, sideChats: true });
+		conversationState.snapshot = { ...conversationState.snapshot, capabilities: ["resume"] };
+	});
+	afterEach(() => {
+		useUiStore.setState({ developerMode: false, sideChats: false });
+	});
+
+	it.each([
+		["side chats are off", { developerMode: true, sideChats: false }, "codex"],
+		["Developer mode is off", { developerMode: false, sideChats: true }, "codex"],
+	] as const)("sends /btw to the main chat when %s", async (_case, flags, provider) => {
+		useUiStore.setState(flags);
+		sideMocks.create.mockReset();
+		const mainSend = vi.fn().mockResolvedValue(undefined);
+		(conversationCommandState as { send?: unknown }).send = mainSend;
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		render(
+			<Wrapper client={queryClient}>
+				<SessionChatSurface session={{ ...session, provider }} />
+			</Wrapper>,
+		);
+		await act(async () => {
+			await sideMocks.workspaceSend!("/btw what is this?", undefined, "submission-main");
+		});
+		expect(sideMocks.create).not.toHaveBeenCalled();
+		expect(mainSend).toHaveBeenCalledWith(expect.objectContaining({ text: "/btw what is this?", clientMessageId: "submission-main" }));
+		delete (conversationCommandState as { send?: unknown }).send;
+	});
+
+	it.each(["btw", "side"])(
+		"/%s creates a new side for every new submission and reuses a retry key",
+		async (command) => {
+			sideMocks.create.mockReset().mockImplementation(async (_excerpt, _force, key) => ({ id: `side-${key}` }));
+			sideMocks.send.mockReset().mockResolvedValue(undefined);
+			const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+			render(
+				<Wrapper client={queryClient}>
+					<SessionChatSurface session={session} />
+				</Wrapper>,
+			);
+			await act(async () => {
+				await sideMocks.workspaceSend!(`/${command} first`, undefined, "submission-1");
+				await sideMocks.workspaceSend!(`/${command} second`, undefined, "submission-2");
+				await sideMocks.workspaceSend!(`/${command} second`, undefined, "submission-2");
+			});
+			expect(sideMocks.create.mock.calls).toEqual([
+				[undefined, true, "submission-1"],
+				[undefined, true, "submission-2"],
+				[undefined, true, "submission-2"],
+			]);
+			expect(sideMocks.send).toHaveBeenNthCalledWith(
+				1,
+				"side-submission-1",
+				"first",
+				undefined,
+				undefined,
+				true,
+				"submission-1",
+			);
+			expect(sideMocks.send).toHaveBeenNthCalledWith(
+				2,
+				"side-submission-2",
+				"second",
+				undefined,
+				undefined,
+				true,
+				"submission-2",
+			);
+		},
+	);
+	it.each(["btw", "side"])("preserves provider /%s when resume is unavailable", async (command) => {
+		conversationState.snapshot = { ...conversationState.snapshot, capabilities: [] };
+		sideMocks.create.mockReset();
+		const mainSend = vi.fn().mockResolvedValue(undefined);
+		(conversationCommandState as { send?: unknown }).send = mainSend;
+		render(<Wrapper client={new QueryClient()}><SessionChatSurface session={session} /></Wrapper>);
+		await act(async () => { await sideMocks.workspaceSend!(`/${command} question`, undefined, "provider-command"); });
+		expect(sideMocks.create).not.toHaveBeenCalled();
+		expect(mainSend).toHaveBeenCalledWith(expect.objectContaining({ text: `/${command} question` }));
+		delete (conversationCommandState as { send?: unknown }).send;
 	});
 });

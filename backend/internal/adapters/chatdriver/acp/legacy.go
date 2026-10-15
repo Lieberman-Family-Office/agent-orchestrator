@@ -13,15 +13,19 @@ import (
 	"sync/atomic"
 
 	acpsdk "github.com/coder/acp-go-sdk"
+
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/persistenthost"
 )
 
 // ACP 0.13.5 removed the legacy model selector from its generated API while
 // deployed agents such as Kimi still advertise `models` and implement
 // session/set_model. This narrow wire shim preserves that compatibility without
-// downgrading or forking the SDK: ordinary SDK traffic is forwarded unchanged,
-// and only AO-owned string request ids are intercepted.
+// downgrading or forking the SDK. Original frames still pass through the SDK;
+// local barriers order updates and host receipts so replay backpressure reaches
+// the provider socket instead of overflowing the SDK's notification queue.
 type legacyACPTransport struct {
 	writer *lockedWriteCloser
+	output *io.PipeWriter
 	nextID atomic.Uint64
 
 	mu              sync.Mutex
@@ -74,7 +78,7 @@ type legacyACPEnvelope struct {
 
 const localNotificationBarrierMethod = "_ao/local_notification_barrier"
 
-func newLegacyACPTransport(stdin io.WriteCloser, stdout io.Reader, updateProcessed <-chan string, streamDone <-chan struct{}) (*legacyACPTransport, io.WriteCloser, io.Reader) {
+func newLegacyACPTransport(stdin io.WriteCloser, updateProcessed <-chan string, streamDone <-chan struct{}) (*legacyACPTransport, io.WriteCloser, io.Reader) {
 	writer := &lockedWriteCloser{inner: stdin}
 	transport := &legacyACPTransport{
 		writer:          writer,
@@ -84,14 +88,16 @@ func newLegacyACPTransport(stdin io.WriteCloser, stdout io.Reader, updateProcess
 	}
 	sdkReader, sdkWriter := io.Pipe()
 	transport.reader = sdkReader
-	go transport.forward(stdout, sdkWriter)
+	transport.output = sdkWriter
 	return transport, writer, sdkReader
 }
 
-func (t *legacyACPTransport) forward(source io.Reader, destination *io.PipeWriter) {
-	reader := bufio.NewReader(source)
+func (t *legacyACPTransport) forward(source io.Reader) {
+	destination := t.output
+	reader := &extensionMethodReader{reader: bufio.NewReader(source), maxFrame: maxACPFrameSize}
+	defer func() { _ = destination.Close() }()
 	for {
-		line, err := reader.ReadBytes('\n')
+		line, err := reader.readFrame()
 		// Decode once for interception and SDK-compatible notification admission.
 		var notification legacyACPEnvelope
 		// Only successful temporary decodes are used; legacy wire semantics stay intact.
@@ -111,8 +117,11 @@ func (t *legacyACPTransport) forward(source io.Reader, destination *io.PipeWrite
 					_ = destination.CloseWithError(errors.New("provider used reserved ACP barrier method"))
 					return
 				}
-				if notification.ID == nil && notification.Method == acpsdk.ClientMethodSessionUpdate {
-					ackID = fmt.Sprintf("ao-local-%d", t.nextID.Add(1))
+				if notification.ID == nil {
+					switch notification.Method {
+					case acpsdk.ClientMethodSessionUpdate, persistenthost.ACPPromptResultMethod, persistenthost.ACPInteractionCommandMethod:
+						ackID = fmt.Sprintf("ao-local-%d", t.nextID.Add(1))
+					}
 				}
 			}
 			if _, writeErr := destination.Write(line); writeErr != nil {

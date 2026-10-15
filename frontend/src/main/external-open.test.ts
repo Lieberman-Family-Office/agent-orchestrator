@@ -14,10 +14,13 @@ describe("session file default-app handoff", () => {
 		const openPath=vi.fn().mockResolvedValue("");
 		await openSessionFileInDefaultApp("session","draft.txt","artifact",async()=>root,{openPath});
 		expect(openPath).toHaveBeenCalledWith(realpathSync(file));
+		await openSessionFileInDefaultApp("session",file,"workspace",async()=>root,{openPath});
+		expect(openPath).toHaveBeenLastCalledWith(realpathSync(file));
 		openPath.mockClear();
 		await expect(openSessionFileInDefaultApp("session","../outside.txt","artifact",async()=>root,{openPath})).rejects.toThrow();
 		const outside=mkdtempSync(path.join(tmpdir(),"ao-file-outside-"));temporary.push(outside);
 		writeFileSync(path.join(outside,"secret.txt"),"secret");
+		await expect(openSessionFileInDefaultApp("session",path.join(outside,"secret.txt"),"workspace",async()=>root,{openPath})).rejects.toThrow();
 		symlinkSync(outside,path.join(root,"escape"));
 		await expect(openSessionFileInDefaultApp("session","escape/secret.txt","artifact",async()=>root,{openPath})).rejects.toThrow();
 		mkdirSync(path.join(root,"directory"));
