@@ -309,7 +309,9 @@ describe("packaged native dependencies", () => {
 		expect(ignore).toBeTypeOf("function");
 		if (typeof ignore !== "function") return;
 
-		expect(ignore("/.vite/build/main.js")).toBe(false);
+		expect(ignore("/.vite/build/main.cjs")).toBe(false);
+		expect(ignore("/.vite/build/preload.cjs")).toBe(false);
+		expect(ignore("/.vite/build/annotate-preload.cjs")).toBe(false);
 		expect(ignore("/node_modules")).toBe(false);
 		expect(ignore("/node_modules/better-sqlite3/build/Release/better_sqlite3.node")).toBe(false);
 		expect(ignore("/node_modules/bindings/bindings.js")).toBe(false);

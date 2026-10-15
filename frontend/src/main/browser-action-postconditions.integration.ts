@@ -122,8 +122,11 @@ async function run(): Promise<void> {
 					await activeWebContents().loadURL(String(args.url));
 					return {};
 				case "snapshot":
-					// A real provider snapshot cannot complete before Chromium has produced
-					// a frame. Force the same readiness before dispatching native input.
+					// Wait for a painted frame before capture; Electron 41 rejects an early
+					// capture with UnknownVizError. Keep capture errors visible to this test.
+					await activeWebContents().executeJavaScript(
+						"new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))",
+					);
 					await activeWebContents().capturePage();
 					return {
 						snapshot: [

@@ -510,11 +510,11 @@ function rendererUrl(): string {
 }
 
 function preloadPath(): string {
-	return path.join(__dirname, "preload.js");
+	return path.join(__dirname, "preload.cjs");
 }
 
 function annotatePreloadPath(): string {
-	return path.join(__dirname, "annotate-preload.js");
+	return path.join(__dirname, "annotate-preload.cjs");
 }
 
 // Runtime window/taskbar icon for Linux and Windows. macOS ignores this and
@@ -540,7 +540,7 @@ function applyRuntimeAppIcon(): void {
 	if (!iconPath) return;
 	const icon = nativeImage.createFromPath(iconPath);
 	if (!icon.isEmpty()) {
-		app.dock.setIcon(icon);
+		app.dock?.setIcon(icon);
 	}
 }
 
