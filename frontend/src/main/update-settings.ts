@@ -33,6 +33,8 @@ export type UpdateState =
 
 export interface UpdateStatus {
 	state: UpdateState;
+	/** The packaged build requires manual installation instead of a release feed. */
+	manualOnly?: boolean;
 	version?: string;
 	/** Absent while a requested download is waiting for its first progress event. */
 	percent?: number;

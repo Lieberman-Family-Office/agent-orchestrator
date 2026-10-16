@@ -26,6 +26,7 @@ type ImportOptions = {
     settings: UpdateSettings,
   ) => Promise<{ settings: UpdateSettings; cleared: boolean }>;
   isPackaged?: boolean;
+  manualUpdates?: boolean;
   rolloutReady?: boolean;
   version?: string;
 };
@@ -91,6 +92,7 @@ beforeEach(() => {
   stateDir = mkdtempSync(nodePath.join(os.tmpdir(), "ao-updater-state-"));
 });
 afterEach(() => {
+  vi.unstubAllEnvs();
   Object.defineProperty(process, "platform", hostPlatform);
   rmSync(stateDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 25 });
 });
@@ -324,6 +326,7 @@ async function importAutoUpdater(
   options: ImportOptions = {},
 ) {
   vi.resetModules();
+  vi.stubEnv("AO_MANUAL_UPDATES", options.manualUpdates ? "true" : "false");
   const updaterEvents = new Map<string, UpdaterEventHandler>();
   const autoUpdater = createAutoUpdaterMock();
   const nativeUpdaterEvents = new Map<string, UpdaterEventHandler>();
@@ -486,6 +489,40 @@ async function flushMicrotasks(turns = 16): Promise<void> {
     await Promise.resolve();
   }
 }
+
+describe("manual-update builds", () => {
+  afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+
+  it("blocks feed checks, downloads, installs and prompts without changing saved preferences", async () => {
+    const { module, autoUpdater, dialog, writeUpdateSettings } = await importAutoUpdater(undefined, { manualUpdates: true });
+    const timers = vi.spyOn(globalThis, "setInterval");
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const expected = {
+      state: "unsupported", manualOnly: true,
+      message: "This custom build uses manual updates. Install a verified fork build to update; automatic update checks are disabled.",
+    };
+    expect(module.getUpdateStatus()).toMatchObject(expected);
+    await module.ensureUpdatePrefs(stateDir);
+    await module.startAutoUpdates(stateDir);
+    await module.checkForUpdatesNow(stateDir, { requestId: "manual-check" });
+    expect(module.getUpdateStatus()).toMatchObject({ ...expected, requestId: "manual-check" });
+    await module.returnToHome(stateDir, "return-home");
+    expect(module.getUpdateStatus()).toMatchObject({ ...expected, requestId: "return-home" });
+    await module.downloadUpdateNow("download");
+    expect(module.getUpdateStatus()).toMatchObject({ ...expected, requestId: "download" });
+    await module.quitAndInstallUpdate();
+    expect(autoUpdater.checkForUpdates).not.toHaveBeenCalled();
+    expect(autoUpdater.downloadUpdate).not.toHaveBeenCalled();
+    expect(autoUpdater.quitAndInstall).not.toHaveBeenCalled();
+    expect(autoUpdater.autoInstallOnAppQuit).toBe(false);
+    expect(dialog.showMessageBox).not.toHaveBeenCalled();
+    expect(writeUpdateSettings).not.toHaveBeenCalled();
+    await module.setUpdateSettings(stateDir, { enabled: true, channel: "nightly", nightlyAck: true, feature: { pr: 1 } });
+    expect(timers).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(module.getUpdateStatus()).toMatchObject(expected);
+  });
+});
 
 describe("startAutoUpdates", () => {
   // stateDir comes from the per-test beforeEach above.

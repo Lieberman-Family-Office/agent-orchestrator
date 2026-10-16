@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -360,8 +361,32 @@ func TestSteerOrSendSendsWhenIdleAndRecoversWithoutRedispatch(t *testing.T) {
 	}
 }
 
-func TestSteerOrSendFallsBackWithoutLeavingAQueuedTurn(t *testing.T) {
-	h, provider := steerHarness(t)
+type receiptSteerRecorder struct {
+	*steerRecorder
+	acknowledged atomic.Bool
+}
+
+func (p *receiptSteerRecorder) AcknowledgeProviderEvent(_ context.Context, id string) error {
+	if id == "completion" {
+		p.acknowledged.Store(true)
+	}
+	return nil
+}
+
+func (p *receiptSteerRecorder) SendTurn(ctx context.Context, msg ports.ChatUserMessage) (ports.ChatTurnRef, error) {
+	if p.sendCallCount() > 0 && !p.acknowledged.Load() {
+		return ports.ChatTurnRef{}, errors.New("previous ACP prompt is active or not acknowledged")
+	}
+	return p.steerRecorder.SendTurn(ctx, msg)
+}
+
+func TestSteerOrSendQueuesFallbackUntilPreviousCompletion(t *testing.T) {
+	provider := &receiptSteerRecorder{steerRecorder: newSteerRecorder()}
+	h := newHarnessWithConversation(t, provider)
+	if _, err := h.ctrl.Send(context.Background(), ports.ChatUserMessage{Text: "original"}); err != nil {
+		t.Fatal(err)
+	}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: "provider-turn-1"})
 	provider.failWith(ports.ErrChatNoSteerableTurn)
 	msg := ports.ChatUserMessage{
 		Text: "continue as the next turn", ClientMessageID: "atomic-race-1",
@@ -372,16 +397,26 @@ func TestSteerOrSendFallsBackWithoutLeavingAQueuedTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SteerOrSend: %v", err)
 	}
-	if result.Steered || result.Turn.ID == "" || result.Turn.State != domain.TurnStateRunning {
-		t.Fatalf("result = %+v, want definitive running fallback", result)
+	if result.Steered || result.Turn.ID == "" || result.Turn.State != domain.TurnStateQueued {
+		t.Fatalf("result = %+v, want fallback queued until completion", result)
 	}
 	recovered, err := h.svc.SteerOrSend(context.Background(), testSession,
 		ports.ChatUserMessage{ClientMessageID: msg.ClientMessageID}, true)
 	if err != nil {
 		t.Fatalf("recover SteerOrSend: %v", err)
 	}
-	if recovered.Steered || recovered.Turn.ID != result.Turn.ID || !recovered.Duplicate {
-		t.Fatalf("recovered = %+v, want sent turn %s", recovered, result.Turn.ID)
+	if recovered.Steered || recovered.Turn.ID != result.Turn.ID || !recovered.Duplicate || recovered.Turn.State != domain.TurnStateQueued {
+		t.Fatalf("recovered = %+v, want queued turn %s", recovered, result.Turn.ID)
+	}
+	if calls := provider.sendCallCount(); calls != 1 {
+		t.Fatalf("provider received %d sends before completion, want only the original", calls)
+	}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-1", ProviderEventID: "completion", TurnState: domain.TurnStateCompleted})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return turnStateByText(t, s)[msg.Text] == domain.TurnStateRunning
+	})
+	if !provider.acknowledged.Load() {
+		t.Fatal("fallback dispatched before the terminal receipt was acknowledged")
 	}
 	if calls := provider.sendCallCount(); calls != 2 {
 		t.Fatalf("provider send calls = %d, want initial turn plus one fallback", calls)

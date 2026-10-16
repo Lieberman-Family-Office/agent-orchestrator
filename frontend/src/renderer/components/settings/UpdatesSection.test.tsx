@@ -76,6 +76,18 @@ beforeEach(() => {
 	useUiStore.setState({ developerMode: false });
 });
 
+it("shows manual-update guidance without offering managed update controls", async () => {
+	const message = "This custom build uses manual updates. Install a verified fork build to update; automatic update checks are disabled.";
+	updGetStatus.mockResolvedValue({ state: "unsupported", manualOnly: true, message });
+	renderUpdates();
+
+	expect(await screen.findByText(message)).toBeVisible();
+	expect(screen.getByRole("button", { name: "Check for updates" })).toBeDisabled();
+	expect(screen.getByRole("switch")).toBeDisabled();
+	expect(screen.getByRole("button", { name: "Updates channel" })).toBeDisabled();
+	expect(screen.queryByText(/update check failed/i)).toBeNull();
+});
+
 it("renders the installed nightly build time as the device-local instant", async () => {
 	// The stamp 202609070300 encodes 03:00 UTC. The expected string is derived
 	// from that absolute instant, so the assertion holds in every timezone —

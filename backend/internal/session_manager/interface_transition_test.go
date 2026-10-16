@@ -870,6 +870,77 @@ func useFastInterfaceTransitionTimings(manager *Manager) {
 	}
 }
 
+func TestInterfaceTransitionRefusesUncertainWorkspace(t *testing.T) {
+	for _, mode := range []domain.SessionMode{domain.SessionModeChat, domain.SessionModeTUI} {
+		for _, setup := range []domain.SessionProvisionStepStatus{"", domain.SessionProvisionStepRunning, domain.SessionProvisionStepDone} {
+			t.Run(fmt.Sprintf("%s/setup=%s", mode, setup), func(t *testing.T) {
+				manager, store, _, _, log := newTransitionManager(t, mode)
+				rec := store.sessions["session-1"]
+				rec.Metadata = domain.SessionMetadata{WorkspacePath: t.TempDir(), Branch: "retained", ControllerGeneration: "reserved"}
+				rec.ClientRequestID = "uncommitted-request"
+				if setup != "" {
+					rec.ProvisionSteps = []domain.SessionProvisionStep{{ID: domain.SessionProvisionStepSetup, Status: setup}}
+				}
+				store.sessions[rec.ID] = rec
+				status, err := manager.InterfaceTransitionStatus(context.Background(), rec.ID)
+				if err != nil || status.Supported || status.ReasonCode != "SESSION_INCOMPLETE_HANDLE" {
+					t.Fatalf("uncertain launch switch status=%+v error=%v", status, err)
+				}
+				_, err = manager.StartInterfaceTransition(context.Background(), rec.ID, oppositeSessionMode(mode),
+					domain.SessionInterfaceTransitionDrain, domain.SessionInterfaceTransitionHistoryStrict)
+				if !errors.Is(err, ErrWorkspaceWriterStopUnproven) {
+					t.Fatalf("switch did not preserve uncertain launch: %v", err)
+				}
+				if len(store.transitions) != 0 || len(*log) != 0 || !reflect.DeepEqual(store.sessions[rec.ID], rec) {
+					t.Fatalf("refusal changed session: transitions=%v log=%v", store.transitions, *log)
+				}
+			})
+		}
+	}
+}
+
+func TestInterfaceTransitionRefusesUncertainEmptyChat(t *testing.T) {
+	manager, store, _, log, id := neverStartedChatOrchestrator(t, func(store *sqlite.Store) lifecycleRecorder {
+		return &sqliteTransitionLifecycle{store: store}
+	})
+	ctx := context.Background()
+	if err := store.SetSessionProvisionSteps(ctx, id, []domain.SessionProvisionStep{{
+		ID: domain.SessionProvisionStepAgent, Status: domain.SessionProvisionStepPending,
+	}}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	status, err := manager.InterfaceTransitionStatus(ctx, id)
+	if err != nil || status.Supported || status.ReasonCode != "SESSION_INCOMPLETE_HANDLE" {
+		t.Fatalf("uncertain empty Chat switch status=%+v error=%v", status, err)
+	}
+	_, err = manager.StartInterfaceTransition(ctx, id, domain.SessionModeTUI,
+		domain.SessionInterfaceTransitionDrain, domain.SessionInterfaceTransitionHistoryStrict)
+	if !errors.Is(err, ErrWorkspaceWriterStopUnproven) {
+		t.Fatalf("switch did not preserve uncertain empty Chat: %v", err)
+	}
+	if _, found, err := store.GetLatestSessionInterfaceTransition(ctx, id); err != nil || found || len(*log) != 0 {
+		t.Fatalf("refusal changed session: transition=%v error=%v log=%v", found, err, *log)
+	}
+}
+
+func TestInterfaceTransitionRechecksUnfinishedSetup(t *testing.T) {
+	manager, store, _, _, log := newTransitionManager(t, domain.SessionModeTUI)
+	store.beforeCreate = func(domain.SessionInterfaceTransition) {
+		rec := store.sessions["session-1"]
+		rec.ProvisionSteps = []domain.SessionProvisionStep{{ID: domain.SessionProvisionStepSetup, Status: domain.SessionProvisionStepRunning}}
+		store.sessions[rec.ID] = rec
+	}
+	transition, err := manager.StartInterfaceTransition(context.Background(), "session-1", domain.SessionModeChat,
+		domain.SessionInterfaceTransitionDrain, domain.SessionInterfaceTransitionHistoryStrict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settled := awaitTransition(t, store, transition.ID)
+	if settled.Phase != domain.SessionInterfaceTransitionFailed || settled.ErrorCode != "SESSION_INCOMPLETE_HANDLE" || len(*log) != 0 {
+		t.Fatalf("worker did not preserve unfinished setup: transition=%+v log=%v", settled, *log)
+	}
+}
+
 func TestInterfaceTransitionStatusHidesSwitchWhenChatUnsupported(t *testing.T) {
 	manager, _, _, chat, _ := newTransitionManager(t, domain.SessionModeTUI)
 	chat.supportsChat = false

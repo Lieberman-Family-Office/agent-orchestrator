@@ -416,6 +416,36 @@ func repairCustom0134MigrationHistory(db *sql.DB) error {
 			}
 		}
 	}
+	var harnessDefaults, projectRevision int
+	if err := tx.QueryRow(`SELECT (SELECT COUNT(*) FROM pragma_table_info('app_settings') WHERE name='harness_defaults'),(SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name='revision')`).Scan(&harnessDefaults, &projectRevision); err != nil {
+		return err
+	}
+	// Upstream v0.14.2 used 198 for harness defaults; this fork already owns
+	// 198 for project revision. Move only the complete upstream identity to 201.
+	if applied[198] == 1 && projectRevision == 0 && harnessDefaults != 0 {
+		var valid, destinationRows int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('app_settings') WHERE name='harness_defaults' AND upper(type)='TEXT' AND "notnull"=1 AND dflt_value="'{}'" AND pk=0`).Scan(&valid); err != nil {
+			return err
+		}
+		var schema string
+		if err := tx.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='app_settings'`).Scan(&schema); err != nil {
+			return err
+		}
+		if valid != 1 || applied[197] != 1 || requestedOutput != 1 || artifactVersions != 2 ||
+			!strings.Contains(strings.Join(strings.Fields(schema), " "), "CHECK (json_valid(harness_defaults) AND json_type(harness_defaults) = 'object')") {
+			return errors.New("upstream migration 198 schema or identity is incompatible")
+		}
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM goose_db_version WHERE version_id=201`).Scan(&destinationRows); err != nil {
+			return err
+		}
+		if destinationRows != 0 {
+			return errors.New("upstream migration destination 201 already has history")
+		}
+		if _, err := tx.Exec(`UPDATE goose_db_version SET version_id=201 WHERE version_id=198`); err != nil {
+			return err
+		}
+		applied[198] = 0
+	}
 	for _, migration := range []struct {
 		legacy, old, next, want, upstream     int
 		file, presence, valid, legacyUpstream string

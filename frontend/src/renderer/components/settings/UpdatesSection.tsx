@@ -276,7 +276,7 @@ export function UpdatesSection({ titleHidden }: { titleHidden?: boolean } = {}) 
 								{t("settings.updates.featureTracking", { pr: featurePr })}
 							</p>
 						</div>
-						<Button type="button" variant="outline" size="sm" onClick={() => void handleReturnToHome()}>
+						<Button type="button" variant="outline" size="sm" disabled={status.manualOnly} onClick={() => void handleReturnToHome()}>
 							{form.channel === "nightly" ? t("settings.updates.returnToNightly") : t("settings.updates.returnToStable")}
 						</Button>
 					</div>
@@ -288,9 +288,9 @@ export function UpdatesSection({ titleHidden }: { titleHidden?: boolean } = {}) 
 				>
 					<Switch
 						aria-label={t("settings.updates.automatic")}
-						checked={form.enabled}
+						checked={!status.manualOnly && form.enabled}
 						onCheckedChange={setEnabled}
-						disabled={savingField === "automatic"}
+						disabled={status.manualOnly || savingField === "automatic"}
 					/>
 				</SettingsRow>
 
@@ -303,11 +303,11 @@ export function UpdatesSection({ titleHidden }: { titleHidden?: boolean } = {}) 
 						value={primaryValue}
 						options={developerMode ? channelOptions : channelOptions.filter((option) => option.value !== "feature")}
 						onChange={handlePrimaryChannel}
-						disabled={savingField === "channel"}
+						disabled={status.manualOnly || savingField === "channel"}
 					/>
 				</SettingsRow>
 
-				{primaryValue === "feature" && (
+				{!status.manualOnly && primaryValue === "feature" && (
 					<FeatureBuildsSelect
 						currentPr={form.feature?.pr ?? null}
 						onPin={(pr, title) => setPendingPin({ pr, title })}
@@ -405,7 +405,7 @@ function UpdateActions({
 	// whenever Settings was opened during one — every 15 minutes on nightly.
 	// A click during a background check is fine: the main process serializes
 	// updater operations, so the manual check simply queues behind it.
-	const busy = manualCheckPending || downloading;
+	const busy = status.manualOnly || manualCheckPending || downloading;
 	// The minimum-spinner window keeps "checking" on screen briefly after the
 	// updater has already answered. The button is the single visible in-progress
 	// indicator; the status row resumes with the updater's terminal result.

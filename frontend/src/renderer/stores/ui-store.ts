@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { appI18n } from "../i18n";
 import { aoBridge } from "../lib/bridge";
+import { developerModeStorageKey, windowTranslucencyStorageKey } from "../lib/window-translucency";
 import { sessionUiKey } from "../lib/hosts";
 import type { ProjectSettingsSection as ProjectFormSection } from "../components/ProjectSettingsForm";
 import type { TerminalTarget } from "../types/terminal";
@@ -249,11 +250,9 @@ export type OrchestratorReplacementFailure = {
 };
 
 const sidebarStorageKey = "ao.sidebar.open";
-const developerModeStorageKey = "ao.developerMode";
 const remoteHostsStorageKey = "ao.remoteHosts";
 const diagnosticsStorageKey = "ao.diagnostics";
 const sideChatsStorageKey = "ao.sideChats";
-const windowTranslucencyStorageKey = "ao.windowTranslucency";
 const terminalCopyOnSelectStorageKey = "ao.terminalCopyOnSelect";
 // ponytail: Renderer-local preference; add storage-event sync if separate AO windows need live synchronization.
 const hideAutomationMessagesStorageKey = "ao.chat.hideAutomationMessages";

@@ -1783,8 +1783,12 @@ func (s *Service) CompactSideChat(ctx context.Context, session domain.SessionID,
 	if s.sides == nil {
 		return ports.ChatCompactionResult{}, ErrSideUnavailable
 	}
-	if _, err := s.sides.ownedSide(ctx, session, sideID); err != nil {
+	side, err := s.sides.ownedSide(ctx, session, sideID)
+	if err != nil {
 		return ports.ChatCompactionResult{}, err
+	}
+	if side.State != "ready" {
+		return ports.ChatCompactionResult{}, ErrSideNotReady
 	}
 	s.sides.mu.Lock()
 	runtime := s.sides.runtimes[sideID]
@@ -1797,6 +1801,10 @@ func (s *Service) CompactSideChat(ctx context.Context, session domain.SessionID,
 		return ports.ChatCompactionResult{}, ErrCompactionUnsupported
 	}
 	runtime.mu.Lock()
+	if runtime.dispatchBlocked {
+		runtime.mu.Unlock()
+		return ports.ChatCompactionResult{}, ErrSideNotReady
+	}
 	if runtime.activeTurnID != "" || runtime.compacting {
 		runtime.mu.Unlock()
 		return ports.ChatCompactionResult{}, ErrCompactionWhileBusy

@@ -554,7 +554,9 @@ func (c *Controller) steerOrSendLocked(ctx context.Context, msg ports.ChatUserMe
 		}
 	}
 
-	turn, err := c.sendLocked(ctx, msg, false)
+	// A steering refusal can precede the prompt's terminal receipt. Queue until
+	// projection commits and acknowledges that receipt before starting a prompt.
+	turn, err := c.sendLocked(ctx, msg, true)
 	if err != nil {
 		return SteerOrSendResult{}, err
 	}

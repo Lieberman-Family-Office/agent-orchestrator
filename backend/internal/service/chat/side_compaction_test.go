@@ -103,6 +103,9 @@ func TestSideCompactionAcknowledgesReceiptBeforeDispatch(t *testing.T) {
 				if err != nil || stored.State != "failed" || stored.ErrorMessage == "" {
 					t.Fatalf("ack failure not surfaced: %#v, %v", stored, err)
 				}
+				if _, err := svc.CompactSideChat(ctx, side.SessionID, side.ID); !errors.Is(err, ErrSideNotReady) {
+					t.Fatalf("compaction after failed acknowledgement = %v", err)
+				}
 			} else if _, err := conv.SendTurn(ctx, ports.ChatUserMessage{Text: "next question"}); err != nil {
 				t.Fatalf("next prompt rejected after compaction: %v", err)
 			}
