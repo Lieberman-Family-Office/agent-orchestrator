@@ -1106,6 +1106,21 @@ func (s *Store) LatestConversationTurn(ctx context.Context, conversationID strin
 	return turnToDomain(row), nil
 }
 
+// TurnByProviderID is the conversation's turn the provider knows as
+// providerTurnID.
+func (s *Store) TurnByProviderID(ctx context.Context, conversationID, providerTurnID string) (domain.ConversationTurn, error) {
+	row, err := s.qr.SelectConversationTurnByProviderID(ctx, gen.SelectConversationTurnByProviderIDParams{
+		ConversationID: conversationID, ProviderTurnID: providerTurnID,
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.ConversationTurn{}, domain.ErrNoConversationTurn
+	}
+	if err != nil {
+		return domain.ConversationTurn{}, fmt.Errorf("select turn by provider id %s: %w", providerTurnID, err)
+	}
+	return turnToDomain(row), nil
+}
+
 // LatestVisibleUserTurnSettled checks the current branch's latest user prompt
 // without loading the full conversation history.
 func (s *Store) LatestVisibleUserTurnSettled(ctx context.Context, conversationID string, sessionID domain.SessionID) (bool, error) {
@@ -1263,6 +1278,7 @@ func (s *Store) appendUserMessage(
 			ClientMessageID:     msg.ClientMessageID,
 			ClientPayloadHash:   sql.NullString{String: msg.ClientPayloadHash, Valid: msg.ClientPayloadHash != ""},
 			DeliveryContentJson: msg.DeliveryContentJSON,
+			Continuation:        boolInt(msg.Continuation),
 			SenderSessionID:     msg.SenderSessionID,
 			SenderProjectID:     msg.SenderProjectID,
 			SenderDisplayName:   msg.SenderDisplayName,
@@ -2288,14 +2304,6 @@ func (s *Store) HasAcceptedInterrupt(ctx context.Context, conversationID, provid
 	return s.qr.HasAcceptedConversationInterrupt(ctx, gen.HasAcceptedConversationInterruptParams{
 		ConversationID: conversationID, InterruptTargetProviderTurnID: providerTurnID,
 	})
-}
-
-// TurnByProviderID reads one exact durable cancellation target.
-func (s *Store) TurnByProviderID(ctx context.Context, conversationID, providerTurnID string) (domain.ConversationTurn, error) {
-	row, err := s.qr.SelectConversationTurnByProviderID(ctx, gen.SelectConversationTurnByProviderIDParams{
-		ConversationID: conversationID, ProviderTurnID: providerTurnID,
-	})
-	return turnToDomain(row), err
 }
 
 // MarkTurnInterruptDelivered retains cancellation acceptance for request retries.
@@ -4027,6 +4035,7 @@ func messageToDomain(row gen.ConversationMessage) domain.ConversationMessage {
 		ClientMessageID:     row.ClientMessageID,
 		ClientPayloadHash:   row.ClientPayloadHash.String,
 		DeliveryContentJSON: row.DeliveryContentJson,
+		Continuation:        row.Continuation != 0,
 		SenderSessionID:     row.SenderSessionID,
 		SenderProjectID:     row.SenderProjectID,
 		SenderDisplayName:   row.SenderDisplayName,
@@ -4098,6 +4107,7 @@ func (s *Store) RetryPrompt(ctx context.Context, conversationID, turnID string) 
 		return domain.RetryPrompt{}, err
 	}
 	return domain.RetryPrompt{
+		Continuation:        row.Continuation != 0,
 		Text:                row.Text,
 		Origin:              row.Origin,
 		DeliveryContentJSON: row.DeliveryContentJson,

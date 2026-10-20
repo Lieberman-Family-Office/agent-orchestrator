@@ -75,6 +75,14 @@ func fullSnapshotReader(st *sqlite.Store) chatsvc.SnapshotReader {
 	})
 }
 
+func boundedSnapshotReader(st *sqlite.Store) chatsvc.SnapshotPageReader {
+	return chatsvc.SnapshotPageReaderFunc(func(ctx context.Context, id string, before, limit int64) (chatsvc.ConversationRows, error) {
+		rows, err := st.LoadConversationSnapshotPage(ctx, id, before, limit)
+		return chatsvc.ConversationRows{Conversation: rows.Conversation, ActiveBranch: rows.ActiveBranch,
+			Turns: rows.Turns, Messages: rows.Messages, Activities: rows.Activities}, err
+	})
+}
+
 /* ---- a fake conversation the controller can drive ---------------------- */
 
 type fakeConversation struct {
@@ -3221,9 +3229,10 @@ func newHarnessWithConversationAndStoreForHarness(
 	)
 	chatStore := wrapStore(st)
 	svc := chatsvc.New(chatsvc.Options{
-		Store:    chatStore,
-		Reader:   fullSnapshotReader(st),
-		Sessions: st,
+		Store:      chatStore,
+		Reader:     fullSnapshotReader(st),
+		PageReader: boundedSnapshotReader(st),
+		Sessions:   st,
 		StopProviderHost: func(context.Context, domain.SessionID) error {
 			h.hostStops.Add(1)
 			return nil
@@ -8154,7 +8163,7 @@ func TestProviderStartedTurnIsAdoptedSoItsItemsCorrelate(t *testing.T) {
 	)
 
 	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
-		return len(s.Activities) == 2
+		return len(s.Turns) == 1 && len(s.Activities) == 2
 	})
 
 	if len(snapshot.Turns) != 1 {

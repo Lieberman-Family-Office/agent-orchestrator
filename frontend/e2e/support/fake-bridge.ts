@@ -125,6 +125,11 @@ export async function installFakeBridge(page: Page, opts: FakeBridgeOptions = {}
 				clipboard: {
 					writeText: async () => undefined,
 					readText: async () => "",
+					writeImage: async () => undefined,
+				},
+				chatImage: {
+					fetch: async () => ({ bytes: new Uint8Array(), mimeType: "image/png" }),
+					save: async () => true,
 				},
 				daemon: {
 					getStatus: async () => status,
@@ -162,7 +167,7 @@ export async function installFakeBridge(page: Page, opts: FakeBridgeOptions = {}
 				},
 				browser: {
 					reconnectRuntime: async () => undefined,
-					getRuntimeState: async () => ({ connected: false }),
+					getRuntimeState: async () => ({ connected: false, connecting: false, rejected: false }),
 					nativeCompositionEnabled: true,
 					ensure: async (sessionId: string) => navState(`preview:${sessionId}`),
 					setBounds: () => undefined,
@@ -351,6 +356,8 @@ export async function installFakeBridge(page: Page, opts: FakeBridgeOptions = {}
 					disconnect: async () => undefined,
 					previewUrl: async (_hostId: string, _sessionId: string, sourceUrl: string) => sourceUrl,
 					resolvePreviewUrl: async (_hostId: string, _sessionId: string, viewedUrl: string) => viewedUrl,
+					agentBrowserUrl: async () => "",
+					externalUrl: async (_hostId: string, url: string) => url,
 				},
 				cloud: {
 					getSession: async () => null,
@@ -372,6 +379,7 @@ export async function installFakeBridge(page: Page, opts: FakeBridgeOptions = {}
 					openStream: async () => ({ streamId: "stream_test" }),
 					closeStream: () => undefined,
 					onStreamEvent: unsubscribe,
+					agentBrowserUrl: async () => "",
 				},
 			} satisfies AoBridge;
 			(window as unknown as { __aoFakeUpdates: { setStatus: (status: UpdateStatus) => void } }).__aoFakeUpdates = {
@@ -992,7 +1000,11 @@ export async function installFakeAgent(page: Page, opts: FakeAgentOptions = {}):
 					setWindowTranslucent: async () => undefined,
 				},
 				menu: { action: async () => undefined, notifyShellFocus: () => undefined },
-				clipboard: { writeText: async () => undefined, readText: async () => "" },
+				clipboard: { writeText: async () => undefined, readText: async () => "", writeImage: async () => undefined },
+				chatImage: {
+					fetch: async () => ({ bytes: new Uint8Array(), mimeType: "image/png" }),
+					save: async () => true,
+				},
 				daemon: {
 					getStatus: async () => status,
 					start: async () => status,
@@ -1029,7 +1041,7 @@ export async function installFakeAgent(page: Page, opts: FakeAgentOptions = {}):
 				},
 				browser: {
 					reconnectRuntime: async () => undefined,
-					getRuntimeState: async () => ({ connected: false }),
+					getRuntimeState: async () => ({ connected: false, connecting: false, rejected: false }),
 					nativeCompositionEnabled: true,
 					ensure: async (sessionId: string) => navState(`preview:${sessionId}`),
 					setBounds: () => undefined,
@@ -1210,6 +1222,8 @@ export async function installFakeAgent(page: Page, opts: FakeAgentOptions = {}):
 					disconnect: async () => undefined,
 					previewUrl: async (_hostId: string, _sessionId: string, sourceUrl: string) => sourceUrl,
 					resolvePreviewUrl: async (_hostId: string, _sessionId: string, viewedUrl: string) => viewedUrl,
+					agentBrowserUrl: async () => "",
+					externalUrl: async (_hostId: string, url: string) => url,
 				},
 				cloud: {
 					getSession: async () => null,
@@ -1231,6 +1245,7 @@ export async function installFakeAgent(page: Page, opts: FakeAgentOptions = {}):
 					openStream: async () => ({ streamId: "stream_test" }),
 					closeStream: () => undefined,
 					onStreamEvent: unsubscribe,
+					agentBrowserUrl: async () => "",
 				},
 			} satisfies AoBridge;
 			(window as unknown as { ao: unknown }).ao = ao;

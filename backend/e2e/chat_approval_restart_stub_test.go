@@ -28,7 +28,16 @@ func TestFakeApprovalACP(t *testing.T) {
 		return
 	}
 	logPath := os.Getenv("AO_E2E_ACP_CALLS")
+	var pending []string
+	classified, background := false, false
 	record := func(method string) {
+		if !classified {
+			pending = append(pending, method)
+			return
+		}
+		if background {
+			return
+		}
 		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
 			os.Exit(2)
@@ -48,6 +57,7 @@ func TestFakeApprovalACP(t *testing.T) {
 					Type string `json:"type"`
 					Text string `json:"text"`
 				} `json:"prompt"`
+				Cwd string `json:"cwd"`
 			} `json:"params"`
 		}
 		if json.Unmarshal(scanner.Bytes(), &frame) != nil {
@@ -58,6 +68,16 @@ func TestFakeApprovalACP(t *testing.T) {
 			_, _ = fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-provider-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"approved once"}}}}`)
 			_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}`+"\n", promptID)
 			continue
+		}
+		if frame.Method == "session/new" {
+			// Cosmetic naming uses a disposable background workspace. The restart
+			// assertions below count only the durable worker's provider calls.
+			classified = true
+			background = strings.Contains(filepath.ToSlash(frame.Params.Cwd), "/background-tasks/")
+			for _, method := range pending {
+				record(method)
+			}
+			pending = nil
 		}
 		record(frame.Method)
 		switch frame.Method {
@@ -76,6 +96,11 @@ func TestFakeApprovalACP(t *testing.T) {
 			}
 			encoded, _ := json.Marshal(text.String())
 			record("prompt-text:" + string(encoded))
+			if background {
+				_, _ = fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"fake-provider-session","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"{\"title\":\"Request approval\",\"slug\":\"approval-restart\"}"}}}}`)
+				_, _ = fmt.Fprintf(os.Stdout, `{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}`+"\n", frame.ID)
+				continue
+			}
 			promptID = append(promptID[:0], frame.ID...)
 			record("session/request_permission")
 			_, _ = fmt.Fprintln(os.Stdout, `{"jsonrpc":"2.0","id":"permission-1","method":"session/request_permission","params":{"sessionId":"fake-provider-session","toolCall":{"toolCallId":"tool-1","title":"Approve restart","kind":"edit"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"reject","name":"Reject","kind":"reject_once"}]}}`)
