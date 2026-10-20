@@ -2,11 +2,39 @@
 # Build the browser service and (re)start its container, then wait until ready.
 #   NAME=rbpoc PORT=8080 NETNS=<the AO daemon's container> ./up.sh
 # The daemon then gets AO_AGENT_BROWSER_URL=http://127.0.0.1:8080 and
-# AO_AGENT_BROWSER_TOKEN=$(cat /tmp/rbpoc-token); agents get ./browser with RB_TOKEN.
+# AO_AGENT_BROWSER_TOKEN=$(cat "${AO_DATA_DIR:-$HOME/.ao}/remote-browser-poc/token"); agents get ./browser with RB_TOKEN.
 set -euo pipefail
 cd "$(dirname "$0")"
 NAME=${NAME:-rbpoc}; PORT=${PORT:-8080}
-[ -s /tmp/rbpoc-token ] || (umask 077; openssl rand -hex 24 > /tmp/rbpoc-token)
+TOKEN_FILE="${AO_DATA_DIR:-$HOME/.ao}/remote-browser-poc/token"
+RB_TOKEN=$(node - "$TOKEN_FILE" <<'NODE'
+const fs = require("node:fs"), path = require("node:path"), crypto = require("node:crypto");
+const file = process.argv[2], dir = path.dirname(file);
+fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+const directory = fs.lstatSync(dir);
+if (!directory.isDirectory() || directory.uid !== process.getuid() || (directory.mode & 0o777) !== 0o700) {
+  throw new Error("token directory must be owned by this user with mode 0700");
+}
+let created;
+try { created = fs.openSync(file, "wx", 0o600); }
+catch (error) { if (error.code !== "EEXIST") throw error; }
+if (created !== undefined) {
+  try { fs.writeFileSync(created, crypto.randomBytes(24).toString("hex") + "\n"); }
+  finally { fs.closeSync(created); }
+}
+const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+try {
+  const stat = fs.fstatSync(fd);
+  if (!stat.isFile() || stat.uid !== process.getuid() || stat.nlink !== 1 || (stat.mode & 0o777) !== 0o600 || stat.size !== 49) {
+    throw new Error("token must be a private owned regular file with one link and 49 bytes");
+  }
+  const token = fs.readFileSync(fd, "utf8");
+  if (!/^[0-9a-f]{48}\n$/.test(token)) throw new Error("invalid browser token");
+  process.stdout.write(token);
+} finally { fs.closeSync(fd); }
+NODE
+)
+export RB_TOKEN
 free_mb=$(df -k / | tail -1 | awk '{print int($4/1024)}')
 if [ "$free_mb" -lt 500 ]; then echo "refusing to build: only ${free_mb} MB free on /" >&2; exit 3; fi
 # Builds, downloads and lookups run before the old container is removed, so a failure
@@ -54,8 +82,11 @@ extra=(-p "127.0.0.1:${PORT}:8080")
 # it. --init reaps Chromium's exited helper processes.
 docker run -d --init --name "$NAME" --shm-size=1g -v "$NAME-profile:/tmp/rb-profile" ${extra[@]+"${extra[@]}"} \
   -e RB_TZ="${RB_TZ:-$tz}" -e RB_LANG="${RB_LANG:-$lang}" -e RB_SCHEME="${RB_SCHEME:-$scheme}" \
-  -e RB_CHROME_LOG="${RB_CHROME_LOG:-}" -e RB_TOKEN="$(cat /tmp/rbpoc-token)" rbpoc:latest >/dev/null
-for _ in $(seq 1 120); do curl -sf "http://127.0.0.1:${PORT}/stats?token=$(cat /tmp/rbpoc-token)" >/dev/null && { echo "up $NAME on :$PORT"; exit 0; }; sleep 0.5; done
+  -e RB_CHROME_LOG="${RB_CHROME_LOG:-}" -e RB_TOKEN rbpoc:latest >/dev/null
+for _ in $(seq 1 120); do
+  printf 'header = "Authorization: Bearer %s"\n' "$RB_TOKEN" | curl -sf --config - "http://127.0.0.1:${PORT}/stats" >/dev/null && { echo "up $NAME on :$PORT"; exit 0; }
+  sleep 0.5
+done
 echo "$NAME did not answer on :$PORT within 60 s; its last log lines:" >&2
 docker logs --tail 20 "$NAME" >&2
 exit 1
