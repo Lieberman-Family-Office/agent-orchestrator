@@ -383,7 +383,7 @@ func repairCustom0134MigrationHistory(db *sql.DB) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 	applied := make(map[int]int)
-	for _, version := range []int{190, 191, 195, 196, 197, 198, 199, 200} {
+	for _, version := range []int{190, 191, 195, 196, 197, 198, 199, 200, 204} {
 		var state int
 		if err := tx.QueryRow(`SELECT COALESCE((SELECT is_applied FROM goose_db_version WHERE version_id=? ORDER BY id DESC LIMIT 1),0)`, version).Scan(&state); err != nil {
 			return err
@@ -411,7 +411,11 @@ func repairCustom0134MigrationHistory(db *sql.DB) error {
 			return errors.New("upstream migration 196 schema or identity is incomplete")
 		}
 		for kind, name := range map[string]string{"table": "session_artifact_versions", "index": "idx_session_artifact_versions_sha"} {
-			if err := validateMigrationObject(tx, "0196_session_artifact_versions.sql", kind, name); err != nil {
+			var updates []string
+			if kind == "table" && applied[204] == 1 {
+				updates = append(updates, "0204_session_artifact_version_source.sql")
+			}
+			if err := validateMigrationObject(tx, "0196_session_artifact_versions.sql", kind, name, updates...); err != nil {
 				return err
 			}
 		}
@@ -547,10 +551,10 @@ func repairCustom0134MigrationHistory(db *sql.DB) error {
 	return tx.Commit()
 }
 
-// validateMigrationObject compares the actual DDL with the unchanged shipped
-// statement. Only whitespace and SQLite's removal of IF NOT EXISTS are ignored.
-// ponytail: These fingerprints cover v0.14.1; extend them before later DDL alters these objects.
-func validateMigrationObject(tx *sql.Tx, file, kind, name string) error {
+// validateMigrationObject compares actual DDL with the shipped statement and updates.
+// Only whitespace and SQLite's removal of IF NOT EXISTS are ignored.
+// ponytail: Fingerprints cover v0.14.3; pass later DDL updates when these objects change.
+func validateMigrationObject(tx *sql.Tx, file, kind, name string, updates ...string) error {
 	body, err := migrationsFS.ReadFile("migrations/" + file)
 	if err != nil {
 		return err
@@ -566,6 +570,29 @@ func validateMigrationObject(tx *sql.Tx, file, kind, name string) error {
 		end = "-- +goose StatementEnd"
 	}
 	expected := strings.TrimSuffix(strings.TrimSpace(strings.Split(source[start:], end)[0]), ";")
+	if len(updates) > 0 {
+		reference, err := sql.Open("sqlite", ":memory:")
+		if err != nil {
+			return err
+		}
+		defer func() { _ = reference.Close() }()
+		reference.SetMaxOpenConns(1)
+		if _, err := reference.Exec(expected); err != nil {
+			return err
+		}
+		for _, update := range updates {
+			body, err := migrationsFS.ReadFile("migrations/" + update)
+			if err != nil {
+				return err
+			}
+			if _, err := reference.Exec(strings.Split(string(body), "-- +goose Down")[0]); err != nil {
+				return err
+			}
+		}
+		if err := reference.QueryRow(`SELECT sql FROM sqlite_master WHERE type=? AND name=?`, kind, name).Scan(&expected); err != nil {
+			return err
+		}
+	}
 	var actual string
 	if err := tx.QueryRow(`SELECT sql FROM sqlite_master WHERE type=? AND name=?`, kind, name).Scan(&actual); err != nil {
 		return fmt.Errorf("read migration %s %s: %w", kind, name, err)
@@ -2332,8 +2359,9 @@ func reconcileHarnessConstraint(db *sql.DB) error {
 	needsMiMo := !strings.Contains(schema, "'mimo-code'")
 	needsDeepSeek := !strings.Contains(schema, "'deepseek-harness'")
 	needsOpenHands := !strings.Contains(schema, "'openhands'")
+	needsMemcode := !strings.Contains(schema, "'memcode'")
 	needsCommandCode := !strings.Contains(schema, "'command-code'")
-	if !needsMuse && !needsKimchi && !needsPrimeAgent && !needsOMP && !needsGemini && !needsUnreal && !needsCodewhale && !needsMiMo && !needsDeepSeek && !needsOpenHands && !needsCommandCode {
+	if !needsMuse && !needsKimchi && !needsPrimeAgent && !needsOMP && !needsGemini && !needsUnreal && !needsCodewhale && !needsMiMo && !needsDeepSeek && !needsOpenHands && !needsCommandCode && !needsMemcode {
 		return nil
 	}
 	if _, err := db.Exec(`PRAGMA writable_schema = ON`); err != nil {
@@ -2447,6 +2475,9 @@ func reconcileHarnessConstraint(db *sql.DB) error {
 		// without Command Code, so anchor there instead of enumerating shapes.
 		repairs = append(repairs, replacement{"'fake'))", "'command-code', 'fake'))"})
 	}
+	if needsMemcode {
+		repairs = append(repairs, replacement{"'fake'))", "'memcode', 'fake'))"})
+	}
 	for _, r := range repairs {
 		if _, err := db.Exec(
 			`UPDATE sqlite_master
@@ -2498,6 +2529,9 @@ WHERE type = 'table' AND name = 'sessions'`,
 	}
 	if !strings.Contains(schema, "'command-code'") {
 		return fmt.Errorf("schema repair: sessions harness constraint is missing Command Code and did not match known pre-Command-Code schema")
+	}
+	if !strings.Contains(schema, "'memcode'") {
+		return fmt.Errorf("schema repair: sessions harness constraint is missing Memcode and did not match known pre-Memcode schema")
 	}
 	return nil
 }

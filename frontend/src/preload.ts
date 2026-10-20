@@ -30,6 +30,7 @@ import type { ConnectedHostView } from "./main/remote-registry";
 import type { RemoteHealth } from "./main/remote-request";
 import type {
 	EditorHandoffState,
+	EditorHandoffStateOptions,
 	OpenSessionArtifactsInput,
 	OpenSessionTargetInput,
 	OpenSessionTargetResult,
@@ -359,6 +360,11 @@ const api = {
 	clipboard: {
 		writeText: (text: string) => ipcRenderer.invoke("clipboard:writeText", text) as Promise<void>,
 		readText: () => ipcRenderer.invoke("clipboard:readText") as Promise<string>,
+		writeImage: (bytes: Uint8Array) => ipcRenderer.invoke("clipboard:writeImage", bytes) as Promise<void>,
+	},
+	chatImage: {
+		fetch: (url: string) => ipcRenderer.invoke("chatImage:fetch", url) as Promise<{ bytes: Uint8Array; mimeType: string }>,
+		save: (input: { name: string; bytes: Uint8Array }) => ipcRenderer.invoke("chatImage:save", input) as Promise<boolean>,
 	},
 	daemon: {
 		getStatus: () => ipcRenderer.invoke("daemon:getStatus") as Promise<DaemonStatus>,
@@ -377,8 +383,8 @@ const api = {
 		capture: (closedSideId?: string, cancelClose = false) => ipcRenderer.invoke("sideChats:capture", closedSideId, cancelClose) as Promise<void>,
 	},
 	editorHandoff: {
-		getState: (sessionId: string) =>
-			ipcRenderer.invoke("editorHandoff:getState", sessionId) as Promise<EditorHandoffState>,
+		getState: (sessionId: string, options?: EditorHandoffStateOptions) =>
+			ipcRenderer.invoke("editorHandoff:getState", sessionId, options) as Promise<EditorHandoffState>,
 		open: (input: OpenSessionTargetInput) =>
 			ipcRenderer.invoke("editorHandoff:open", input) as Promise<OpenSessionTargetResult>,
 		openArtifacts: (input: OpenSessionArtifactsInput) =>
@@ -415,7 +421,7 @@ const api = {
 		reconnectRuntime: () => ipcRenderer.invoke("browser:runtime:reconnect") as Promise<void>,
 		getRuntimeState: () => ipcRenderer.invoke("browser:runtime:state") as Promise<BrowserRuntimeState>,
 		nativeCompositionEnabled: true,
-		ensure: (sessionId: string) => ipcRenderer.invoke("browser:ensure", sessionId) as Promise<BrowserNavState>,
+		ensure: (sessionId: string, createInitialTab = true) => ipcRenderer.invoke("browser:ensure", sessionId, createInitialTab) as Promise<BrowserNavState>,
 		setBounds: (input: BrowserBoundsInput) => ipcRenderer.send("browser:setBounds", input),
 		onBoundsApplied: (listener: (result: BrowserBoundsApplied) => void) => {
 			const wrapped = (_event: Electron.IpcRendererEvent, result: BrowserBoundsApplied) => listener(result);
@@ -734,6 +740,12 @@ const api = {
 			ipcRenderer.invoke("remotes:previewUrl", hostId, sessionId, sourceUrl) as Promise<string>,
 		resolvePreviewUrl: (hostId: string, sessionId: string, viewedUrl: string) =>
 			ipcRenderer.invoke("remotes:resolvePreviewUrl", hostId, sessionId, viewedUrl) as Promise<string>,
+		// The host's agent browser for the session's agent tab ("" when none).
+		agentBrowserUrl: (hostId: string, sessionId: string) =>
+			ipcRenderer.invoke("remotes:agentBrowserUrl", hostId, sessionId) as Promise<string>,
+		// A preview's address for a browser outside AO; any other URL unchanged.
+		externalUrl: (hostId: string, url: string) =>
+			ipcRenderer.invoke("remotes:externalUrl", hostId, url) as Promise<string>,
 	},
 	cloud: {
 		getSession: () => ipcRenderer.invoke("cloud:getSession") as Promise<CloudAccount | null>,
@@ -775,6 +787,9 @@ const api = {
 		closeStream: (streamId: string) => {
 			ipcRenderer.send("cloudCp:closeStream", streamId);
 		},
+		/** A cloud session's agent browser for its agent tab; "" when its sandbox has none. */
+		agentBrowserUrl: (baseUrl: string, orgId: string, sessionId: string) =>
+			ipcRenderer.invoke("cloudCp:agentBrowserUrl", baseUrl, orgId, sessionId) as Promise<string>,
 		onStreamEvent: (streamId: string, listener: (event: CloudCpStreamEvent) => void) => {
 			const channel = `cloudCp:stream:${streamId}`;
 			const wrapped = (_event: Electron.IpcRendererEvent, event: CloudCpStreamEvent) => listener(event);

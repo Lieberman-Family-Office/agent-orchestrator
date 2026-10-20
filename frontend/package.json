@@ -1,7 +1,7 @@
 {
 	"name": "agent-orchestrator",
 	"productName": "Agent Orchestrator",
-	"version": "0.14.2",
+	"version": "0.14.3",
 	"private": true,
 	"description": "Electron + TypeScript frontend for the agent-orchestrator rewrite",
 	"author": "Agent Orchestrator",
@@ -18,8 +18,9 @@
 		"build:tmux": "node ./scripts/build-tmux.mjs",
 		"browser-runtime:prepare": "node ./scripts/prepare-agent-browser.mjs",
 		"build:daemon": "node ./scripts/build-daemon.mjs",
+		"build:wake-helper": "node ./scripts/build-wake-helper.mjs",
 		"build:host": "node ./scripts/build-host-bundle.mjs",
-		"predev": "npm run build:daemon -- --dev && node ./scripts/ensure-browser-runtime.mjs && npm run build:acp-runtime",
+		"predev": "npm run build:daemon -- --dev && node ./scripts/build-wake-helper.mjs --if-supported && node ./scripts/ensure-browser-runtime.mjs && npm run build:acp-runtime",
 		"dev": "electron-forge start",
 		"dev:web": "node ./scripts/dev-web.mjs",
 		"build": "npm run package",
@@ -43,8 +44,10 @@
 		"@electron-forge/maker-rpm": "^8.0.1",
 		"@electron-forge/maker-zip": "^8.0.1",
 		"@electron-forge/plugin-auto-unpack-natives": "^8.0.1",
+		"@electron-forge/plugin-fuses": "^8.0.1",
 		"@electron-forge/plugin-vite": "^8.0.1",
 		"@electron-forge/publisher-github": "^8.0.1",
+		"@electron/fuses": "^2.1.3",
 		"@electron/rebuild": "^4.0.4",
 		"@playwright/test": "^1.60.0",
 		"@tailwindcss/vite": "^4.3.0",
@@ -58,7 +61,7 @@
 		"@types/ws": "^8.18.1",
 		"@vitejs/plugin-react": "^6.0.2",
 		"app-builder-lib": "^26.15.3",
-		"electron": "^41.10.7",
+		"electron": "^44.7.0",
 		"jsdom": "^29.1.1",
 		"openapi-typescript": "^7.13.0",
 		"playwright": "^1.60.0",
@@ -116,8 +119,7 @@
 		"motion": "^12.43.0",
 		"openapi-fetch": "^0.17.0",
 		"posthog-js": "^1.390.2",
-		"qr-code-styling": "^1.9.2",
-		"qrcode.react": "^4.2.0",
+		"qrcode-generator": "^1.5.2",
 		"radix-ui": "^1.5.0",
 		"react": "^19.2.7",
 		"react-dom": "^19.2.7",
@@ -147,6 +149,6 @@
 		}
 	},
 	"allowScripts": {
-		"electron@41.10.7": true
+		"electron@44.7.0": true
 	}
 }

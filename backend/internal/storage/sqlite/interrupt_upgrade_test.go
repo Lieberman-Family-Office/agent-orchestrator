@@ -34,7 +34,7 @@ func TestCustom0134HistoryRepairRollsBackIncompleteSchema(t *testing.T) {
 }
 
 func TestOfficialAndFreshDatabasesOpenTwice(t *testing.T) {
-	for _, version := range []int64{0, 194, 195, 196, 197, 198, 199, 200} {
+	for _, version := range []int64{0, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 212} {
 		t.Run(fmt.Sprint(version), func(t *testing.T) {
 			dir := t.TempDir()
 			if version != 0 {
@@ -75,7 +75,7 @@ func TestOfficialAndFreshDatabasesOpenTwice(t *testing.T) {
 				t.Fatalf("harness defaults=%q error=%v", defaults, err)
 			}
 			var columns int
-			if err := db.QueryRow(`SELECT (SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name='revision')+(SELECT COUNT(*) FROM pragma_table_info('conversation_turns') WHERE name IN ('interrupt_target_provider_turn_id','interrupt_delivered'))+(SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name IN ('hibernated_at','branch_state','requested_output'))+(SELECT COUNT(*) FROM pragma_table_info('session_artifact_versions'))+(SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_conversation_provider_events_turn_completed')`).Scan(&columns); err != nil || columns != 15 {
+			if err := db.QueryRow(`SELECT (SELECT COUNT(*) FROM pragma_table_info('projects') WHERE name='revision')+(SELECT COUNT(*) FROM pragma_table_info('conversation_turns') WHERE name IN ('interrupt_target_provider_turn_id','interrupt_delivered'))+(SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name IN ('hibernated_at','branch_state','requested_output'))+(SELECT COUNT(*) FROM pragma_table_info('session_artifact_versions'))+(SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_conversation_provider_events_turn_completed')`).Scan(&columns); err != nil || columns != 18 {
 				t.Fatalf("columns=%d error=%v", columns, err)
 			}
 			if version >= 195 {
@@ -341,6 +341,26 @@ func TestUpstreamMigrationIdentityRepairRefusesPartialSchema(t *testing.T) {
 			var remapped int
 			if err := db.QueryRow(`SELECT COUNT(*) FROM goose_db_version WHERE version_id>=198`).Scan(&remapped); err != nil || remapped != 0 {
 				t.Fatalf("partial upstream repair changed history: remapped=%d error=%v", remapped, err)
+			}
+		})
+	}
+}
+
+func TestArtifactSourceHistoryRepairRejectsSchemaDrift(t *testing.T) {
+	for name, query := range map[string]string{
+		"missing column": `ALTER TABLE session_artifact_versions DROP COLUMN restored_from`,
+		"wrong default":  `ALTER TABLE session_artifact_versions DROP COLUMN restored_from; ALTER TABLE session_artifact_versions ADD COLUMN restored_from INTEGER NOT NULL DEFAULT 1`,
+		"missing check":  `PRAGMA writable_schema=ON; UPDATE sqlite_master SET sql=replace(sql, 'CHECK (source IN (''agent'', ''user''))', '') WHERE name='session_artifact_versions'; PRAGMA writable_schema=RESET`,
+		"false history":  `UPDATE goose_db_version SET is_applied=0 WHERE version_id=204`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			db := openMigratedDatabaseCopy(t, 204)
+			if err := repairCustom0134MigrationHistory(db); err != nil {
+				t.Fatal(err)
+			}
+			mustExec(t, db, query)
+			if err := repairCustom0134MigrationHistory(db); err == nil {
+				t.Fatal("artifact schema drift was accepted")
 			}
 		})
 	}

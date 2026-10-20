@@ -2,6 +2,7 @@ package chat_test
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -249,5 +250,88 @@ func TestPersistentTransportFailureRetainsWorkForReconnect(t *testing.T) {
 	}
 	if h.ctrl.State() != ports.ChatControllerStopped || provider.terminated.Load() {
 		t.Fatal("lost controller remained live or terminated its persistent provider")
+	}
+}
+
+func TestAwakeReconnectCandidatesRequireObservedTransportLoss(t *testing.T) {
+	for _, deliberate := range []bool{false, true} {
+		t.Run(map[bool]string{false: "lost attachment", true: "explicit close"}[deliberate], func(t *testing.T) {
+			provider := &terminatingConversation{fakeConversation: newFakeConversation()}
+			h := newHarnessWithConversation(t, provider)
+			if got := h.svc.InterruptedAwakeAgents(); len(got) != 0 {
+				t.Fatal("live controller offered as interrupted")
+			}
+			if deliberate {
+				if err := h.ctrl.Close(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				provider.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: ports.ChatControllerStopped, Err: ports.ErrChatRecoveryInconclusive})
+				_ = provider.Close()
+				h.ctrl.Wait()
+			}
+			deadline := time.Now().Add(time.Second)
+			for time.Now().Before(deadline) {
+				got := h.svc.InterruptedAwakeAgents()
+				if !deliberate && len(got) == 1 {
+					if got[0].SessionID != testSession || got[0].Owner.ControllerGeneration != h.ctrl.Generation() || got[0].Owner.ProviderConversationID != h.ctrl.ProviderConversationID() {
+						t.Fatalf("candidate lost provider identity: %+v", got)
+					}
+					return
+				}
+				if deliberate && len(got) > 0 {
+					t.Fatal("explicit close offered for automatic reconnect")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if !deliberate {
+				t.Fatal("observed loss did not retain a recovery candidate")
+			}
+		})
+	}
+}
+
+func TestAwakeReconnectProofIsInvalidatedByExplicitStop(t *testing.T) {
+	for _, shutdownFails := range []bool{false, true} {
+		t.Run(map[bool]string{false: "shutdown succeeds", true: "shutdown fails"}[shutdownFails], func(t *testing.T) {
+			provider := &terminatingConversation{fakeConversation: newFakeConversation()}
+			st := openStore(t)
+			shutdownErr := errors.New("host shutdown failed")
+			svc := chatsvc.New(chatsvc.Options{Store: st, Sessions: st, NewID: rand.Text, Drivers: fakeRegistry{driver: fakeDriver{conv: provider}}, StopProviderHost: func(context.Context, domain.SessionID) error {
+				if shutdownFails {
+					return shutdownErr
+				}
+				return nil
+			}})
+			ctrl, err := svc.Start(t.Context(), chatsvc.StartConfig{SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex, WorkspacePath: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			provider.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: ports.ChatControllerStopped, Err: ports.ErrChatRecoveryInconclusive})
+			_ = provider.Close()
+			ctrl.Wait()
+			var target domain.AwakeAgentTarget
+			deadline := time.Now().Add(time.Second)
+			for time.Now().Before(deadline) {
+				if list := svc.InterruptedAwakeAgents(); len(list) == 1 {
+					target = list[0]
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if target.SessionID == "" {
+				t.Fatal("missing interrupted proof")
+			}
+			if err := svc.Stop(t.Context(), testSession); (shutdownFails && !errors.Is(err, shutdownErr)) || (!shutdownFails && err != nil) {
+				t.Fatalf("shutdown fails=%v: %v", shutdownFails, err)
+			}
+			if len(svc.InterruptedAwakeAgents()) != 0 {
+				t.Fatal("explicit stop retained recovery proof")
+			}
+			_, err = svc.Start(t.Context(), chatsvc.StartConfig{SessionID: testSession, Harness: domain.HarnessCodex, ReconnectOnly: true, AwakeReconnectTarget: &target, ExpectedControllerOwner: target.Owner, ProviderConversationID: target.Owner.ProviderConversationID})
+			if !errors.Is(err, ports.ErrChatRecoveryInconclusive) {
+				t.Fatalf("stale proof reached provider startup: %v", err)
+			}
+		})
 	}
 }

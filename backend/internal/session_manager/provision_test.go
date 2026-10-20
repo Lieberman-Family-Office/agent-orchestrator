@@ -428,6 +428,52 @@ func TestResolveClaudeTUIAgentConfigRejectsUnsupportedEffort(t *testing.T) {
 	}
 }
 
+func TestResolveAgentConfigRejectsExplicitEffortForUnsupportedHarness(t *testing.T) {
+	m := &Manager{modelCatalog: tuningCatalog{catalog: ports.AgentModelCatalog{Models: []ports.AgentModelInfo{
+		{ID: "gemini-2.5-pro", IsDefault: true, Efforts: []string{"low", "high"}},
+	}}}}
+	for _, harness := range []domain.AgentHarness{domain.HarnessDroid, domain.HarnessAider, domain.HarnessAmp} {
+		// A flagged explicit effort override must fail loudly instead of being
+		// silently discarded: the caller asked for something the harness cannot
+		// honor.
+		_, err := m.resolveAgentConfig(context.Background(), ports.SpawnConfig{
+			ProjectID: "p", Kind: domain.KindWorker, Harness: harness,
+			AgentConfig: ports.AgentConfig{Model: "gemini-2.5-pro", Effort: "high"}, EffortOverride: true,
+		}, domain.ProjectConfig{})
+		if !errors.Is(err, ports.ErrUnsupportedEffort) {
+			t.Fatalf("harness %q override error = %v, want ErrUnsupportedEffort", harness, err)
+		}
+		if !strings.Contains(err.Error(), "only supported for codex, claude-code, and command-code") {
+			t.Fatalf("harness %q error = %v, want support hint", harness, err)
+		}
+		// Unflagged request-carried effort still clears silently, matching the
+		// long-standing contract for harnesses without effort support.
+		resolved, err := m.resolveAgentConfig(context.Background(), ports.SpawnConfig{
+			ProjectID: "p", Kind: domain.KindWorker, Harness: harness,
+			AgentConfig: ports.AgentConfig{Model: "gemini-2.5-pro", Effort: "high"},
+		}, domain.ProjectConfig{})
+		if err != nil {
+			t.Fatalf("harness %q unflagged error = %v, want silent clear", harness, err)
+		}
+		if resolved.Effort != "" {
+			t.Fatalf("harness %q unflagged effort = %q, want cleared", harness, resolved.Effort)
+		}
+	}
+
+	// Inherited project/role effort still clears silently: nothing explicit was
+	// requested, so there is nothing to reject.
+	resolved, err := m.resolveAgentConfig(context.Background(), ports.SpawnConfig{
+		ProjectID: "p", Kind: domain.KindWorker, Harness: domain.HarnessDroid,
+		AgentConfig: ports.AgentConfig{Model: "gemini-2.5-pro"},
+	}, domain.ProjectConfig{Worker: domain.RoleOverride{AgentConfig: domain.AgentConfig{Effort: "high"}}})
+	if err != nil {
+		t.Fatalf("inherited effort error = %v, want silent clear", err)
+	}
+	if resolved.Effort != "" {
+		t.Fatalf("inherited effort = %q, want provider default", resolved.Effort)
+	}
+}
+
 func TestResolveClaudeModelWithoutEffortStillRequiresCatalog(t *testing.T) {
 	m := &Manager{modelCatalog: tuningCatalog{err: errors.New("gateway does not list models")}}
 
@@ -1271,8 +1317,15 @@ func TestBackgroundHealthOverlapsRealPostCreate(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if err := m.ReconcileBackground(context.Background()); err != nil {
-		t.Fatal(err)
+	reconciled := make(chan error, 1)
+	go func() { reconciled <- m.ReconcileBackground(context.Background()) }()
+	select {
+	case err := <-reconciled:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("background health blocked on a live setup writer")
 	}
 	rec, ok, err := st.GetSession(context.Background(), "mer-1")
 	if err != nil || !ok || rec.Metadata.WorkspacePath != workspace || ws.destroyed != 0 || rt.created != 0 {

@@ -211,6 +211,14 @@ var shippedMigrations = map[int64]string{
 	// Upstream 198 follows the fork's already shipped 198–200.
 	201: "0201_harness_defaults.sql",
 	202: "0202_conversation_turn_lineage_indexes.sql",
+	// Upstream 199, 200, and 202 follow the fork's shipped 198–202.
+	203: "0203_conversation_message_continuation.sql",
+	204: "0204_session_artifact_version_source.sql",
+	205: "0205_allow_memcode_harness.sql",
+	206: "0206_awake.sql",
+	210: "0210_agent_accounts.sql",
+	211: "0211_account_transitions.sql",
+	212: "0212_session_runtime_released.sql",
 }
 
 // burnedVersion reports version numbers that must never be (re)used: they
