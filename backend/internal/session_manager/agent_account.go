@@ -49,6 +49,9 @@ func (m *Manager) StartAccountTransition(
 	if rec.IsTerminated {
 		return domain.SessionInterfaceTransition{}, ErrTerminated
 	}
+	if uncertainWorkspaceLaunch(rec) || unfinishedWorkspaceSetup(rec) {
+		return domain.SessionInterfaceTransition{}, fmt.Errorf("switch account %s: %w", id, ErrWorkspaceWriterStopUnproven)
+	}
 	if interfaceWorkspaceUnavailable(rec) {
 		return domain.SessionInterfaceTransition{}, fmt.Errorf("%w: session %s", ErrInterfaceWorkspaceUnavailable, id)
 	}

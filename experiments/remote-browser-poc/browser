@@ -8,6 +8,30 @@
 // RB_TOKEN is its token.
 const fs = require("node:fs"), path = require("node:path");
 const args = process.argv.slice(2), files = {};
+const baseDir = fs.realpathSync(process.cwd());
+const writeReturnedFile = (name, b64) => {
+	const target = path.resolve(baseDir, name), relative = path.relative(baseDir, target);
+	if (!name || path.isAbsolute(name) || !relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+		throw new Error("response file must stay inside the working directory");
+	}
+	if (typeof b64 !== "string" || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(b64)) {
+		throw new Error("response file must contain base64 data");
+	}
+	let parent = baseDir;
+	// ponytail: Remote responses are untrusted; concurrent local directory swaps require an openat-based writer.
+	for (const part of relative.split(path.sep).slice(0, -1)) {
+		parent = path.join(parent, part);
+		try { fs.mkdirSync(parent); } catch (error) { if (error.code !== "EEXIST") throw error; }
+		if (!fs.lstatSync(parent).isDirectory()) throw new Error("response file parent must be a real directory");
+	}
+	const fd = fs.openSync(target, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK, 0o600);
+	try {
+		const stat = fs.fstatSync(fd);
+		if (!stat.isFile() || stat.nlink !== 1) throw new Error("response destination must be a regular file with one link");
+		fs.ftruncateSync(fd);
+		fs.writeFileSync(fd, Buffer.from(b64, "base64"));
+	} finally { fs.closeSync(fd); }
+};
 // An argument no file can have (too long a name, a folder it may not look in) is just text.
 const isFile = (p) => { try { return fs.statSync(p).isFile(); } catch { return false; } };
 // Relative names go up for an upload only: a word typed into a page (README.md, .env) is no file to copy.
@@ -16,7 +40,7 @@ for (const a of args) if ((upload || path.isAbsolute(a)) && isFile(a)) files[a] 
 fetch(`${process.env.RB_URL || "http://127.0.0.1:8080"}/agent`, { method: "POST", headers: { Authorization: `Bearer ${process.env.RB_TOKEN}` }, body: JSON.stringify({ args, files }) })
 	.then((res) => res.json())
 	.then((body) => {
-		for (const [p, b64] of Object.entries(body.files ?? {})) { fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, Buffer.from(b64, "base64")); }
+		for (const [p, b64] of Object.entries(body.files ?? {})) writeReturnedFile(p, b64);
 		process.stdout.write(body.output ?? "");
 		if (body.error) { console.error(body.error); process.exit(1); }
 	})

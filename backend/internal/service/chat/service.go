@@ -1547,9 +1547,10 @@ func (s *Service) Stop(ctx context.Context, id domain.SessionID) error {
 	delete(s.viewLeases, id)
 	s.viewMu.Unlock()
 
-	s.mu.RLock()
+	s.mu.Lock()
 	controller, ok := s.controllers[id]
-	s.mu.RUnlock()
+	delete(s.awakeInterrupted, owner)
+	s.mu.Unlock()
 	if !ok {
 		if s.stopProviderHost == nil || s.sessions == nil {
 			return errors.New("retained provider shutdown or ownership is unavailable")

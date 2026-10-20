@@ -220,6 +220,26 @@ func TestAccountTransitionPreflightFailureLeavesTheAgentRunning(t *testing.T) {
 	}
 }
 
+func TestAccountTransitionRefusesUnprovenWorkspaceWritersBeforeClaiming(t *testing.T) {
+	for _, stage := range []domain.SessionProvisionStepID{domain.SessionProvisionStepSetup, domain.SessionProvisionStepAgent} {
+		t.Run(string(stage), func(t *testing.T) {
+			manager, store, _, _, accounts, log := newAccountTransitionManager(t, domain.SessionModeChat)
+			rec := store.sessions["session-1"]
+			rec.ProvisionSteps = []domain.SessionProvisionStep{{ID: stage, Status: domain.SessionProvisionStepRunning}}
+			if stage == domain.SessionProvisionStepAgent {
+				rec.Metadata = domain.SessionMetadata{WorkspacePath: "/ws/session-1", Branch: "ao/session-1"}
+			}
+			store.sessions[rec.ID] = rec
+			if _, err := manager.StartAccountTransition(t.Context(), rec.ID, "acct-b", domain.SessionInterfaceTransitionDrain); !errors.Is(err, ErrWorkspaceWriterStopUnproven) {
+				t.Fatalf("err = %v, want ErrWorkspaceWriterStopUnproven", err)
+			}
+			if len(store.transitions) != 0 || len(*log) != 0 || accounts.boundTo(rec.ID) != "device-claude" {
+				t.Fatal("refused account move changed the session")
+			}
+		})
+	}
+}
+
 func TestAccountTransitionRefusesAnUnusableOrUnchangedAccountBeforeClaiming(t *testing.T) {
 	manager, store, _, _, accounts, log := newAccountTransitionManager(t, domain.SessionModeTUI)
 
