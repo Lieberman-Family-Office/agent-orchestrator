@@ -4230,7 +4230,7 @@ export function Timeline({
 					)}
 				>
 					<div className="absolute inset-0 cursor-grab group-active/scroll:cursor-grabbing">
-						{minimapEnabled && !inspectorOpenRef.current
+						{minimapEnabled
 						? scrollbar.markers.map((marker, index) => {
 								const distance =
 									hoveredMarker === null
