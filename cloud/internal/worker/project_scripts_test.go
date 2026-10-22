@@ -83,6 +83,31 @@ func TestSetupStepTimeout(t *testing.T) {
 	}
 }
 
+func TestProjectScriptStepLogPreservesCommandResult(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, command, status, output string
+		exitCode                      int
+	}{
+		{"success", "printf logged", SetupSucceeded, "logged", 0},
+		{"failure", "printf logged; exit 7", SetupFailed, "logged", 7},
+		{"silent failure", "exit 7", SetupFailed, "", 7},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			logPath := filepath.Join(dir, "step.log")
+			event := runProjectScriptStep(context.Background(), tc.command, time.Minute, dir, nil, logPath, nil)
+			if event.Status != tc.status || event.ExitCode != tc.exitCode || event.Output != tc.output {
+				t.Fatalf("event = %+v, want status=%s exit=%d output=%q", event, tc.status, tc.exitCode, tc.output)
+			}
+			logged, err := os.ReadFile(logPath)
+			if err != nil || string(logged) != tc.output {
+				t.Fatalf("log = %q, err = %v; want %q", logged, err, tc.output)
+			}
+		})
+	}
+}
+
 func TestSetupPublishesNoOutputOnSuccess(t *testing.T) {
 	t.Parallel()
 	event, ran := SetupRunner{DataDir: t.TempDir(), FirstStart: true}.Run(context.Background(),

@@ -398,10 +398,12 @@ func runProjectScriptStep(
 	if live != nil {
 		sinks = append(sinks, live)
 	}
+	var logFile *os.File
 	if logPath != "" {
-		if file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600); err == nil {
-			defer file.Close()
-			sinks = append(sinks, &cappedFile{file: file, left: scriptLogLimit})
+		var openErr error
+		logFile, openErr = os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+		if openErr == nil {
+			sinks = append(sinks, &cappedFile{file: logFile, left: scriptLogLimit})
 		}
 	}
 	var sink io.Writer = output
@@ -423,6 +425,11 @@ func runProjectScriptStep(
 	err := process.Run()
 	if errors.Is(err, exec.ErrWaitDelay) && runCtx.Err() == nil {
 		err = nil
+	}
+	if logFile != nil {
+		if closeErr := logFile.Close(); err == nil {
+			err = closeErr
+		}
 	}
 	event := SetupEvent{Status: SetupSucceeded, Output: strings.TrimSpace(output.String())}
 	switch {
