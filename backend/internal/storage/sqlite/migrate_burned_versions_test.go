@@ -219,6 +219,15 @@ var shippedMigrations = map[int64]string{
 	210: "0210_agent_accounts.sql",
 	211: "0211_account_transitions.sql",
 	212: "0212_session_runtime_released.sql",
+	213: "0213_session_stale_binary.sql",
+	214: "0214_app_settings_version_refresh.sql",
+	215: "0215_session_harness_releases.sql",
+
+	20261019142324385: "20261019142324385_allow_hermes_harness.sql",
+	20261019220421171: "20261019220421171_usage_limit_auto_resume.sql",
+	20261019220421514: "20261019220421514_usage_limit_reset_cdc.sql",
+	20261020131539535: "20261020131539535_provider_switching.sql",
+	20261021230230412: "20261021230230412_provider_events_session_index.sql",
 }
 
 // burnedVersion reports version numbers that must never be (re)used: they
@@ -234,6 +243,8 @@ var shippedMigrations = map[int64]string{
 // Any such migration whose schema the generated queries depend on must add a
 // schemaRepairs entry in db.go.
 func burnedVersion(v int64) bool {
+	// Upstream reserved 203 for an unmerged Hermes candidate. This fork had
+	// already shipped 0203_conversation_message_continuation.sql at that ID.
 	return v == 22
 }
 

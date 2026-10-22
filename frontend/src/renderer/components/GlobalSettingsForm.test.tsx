@@ -9,6 +9,7 @@ import { useSoundNotificationsStore } from "../stores/sound-notifications-store"
 import { useTerminalShellStore } from "../stores/terminal-shell-store";
 import { useUiStore } from "../stores/ui-store";
 import { useTelemetryPolicyStore } from "../stores/telemetry-policy-store";
+import { useAnalyticsOptOutStore } from "../stores/analytics-opt-out-store";
 import { TooltipProvider } from "./ui/tooltip";
 
 const { harnessSettingsSectionMock } = vi.hoisted(() => ({ harnessSettingsSectionMock: vi.fn() }));
@@ -51,6 +52,8 @@ const {
 	getTelemetryPolicy,
 	setTelemetryEvents,
 	onTelemetryPolicy,
+	getAnalyticsOptOut,
+	setAnalyticsOptOut,
 	isMacPlatform,
 	isWindowsPlatform,
 } = vi.hoisted(() => ({
@@ -75,12 +78,13 @@ const {
 	setKeybindings: vi.fn(),
 	setKeybindingRecording: vi.fn(),
 	setMacDifferentialUpdates: vi.fn().mockResolvedValue(undefined),
-	// agent-switch visibility initializes at module load, before beforeEach can
 	// install the per-test policy response. Preserve the bridge's Promise
 	// contract for that initial read as well.
 	getTelemetryPolicy: vi.fn().mockResolvedValue(undefined),
 	setTelemetryEvents: vi.fn(),
 	onTelemetryPolicy: vi.fn(),
+	getAnalyticsOptOut: vi.fn(),
+	setAnalyticsOptOut: vi.fn(),
 	isMacPlatform: vi.fn(() => false),
 	isWindowsPlatform: vi.fn(() => true),
 }));
@@ -130,7 +134,7 @@ vi.mock("../lib/bridge", () => ({
 			onStatus: updOnStatus,
 		},
 		featureBuilds: { list: featListBuilds, getActive: featGetActive },
-		telemetry: { getPolicy: getTelemetryPolicy, setEventsEnabled: setTelemetryEvents, onPolicy: onTelemetryPolicy, getBootstrap: vi.fn(), capture: vi.fn() },
+		telemetry: { getPolicy: getTelemetryPolicy, setEventsEnabled: setTelemetryEvents, onPolicy: onTelemetryPolicy, getBootstrap: vi.fn(), capture: vi.fn(), getAnalyticsOptOut, setAnalyticsOptOut },
 	},
 }));
 
@@ -177,6 +181,8 @@ beforeEach(async () => {
 		getTelemetryPolicy,
 		setTelemetryEvents,
 		onTelemetryPolicy,
+		getAnalyticsOptOut,
+		setAnalyticsOptOut,
 		isMacPlatform,
 		isWindowsPlatform,
 	]) {
@@ -211,6 +217,8 @@ beforeEach(async () => {
 	getTelemetryPolicy.mockResolvedValue({ eventsEnabled: false, consentGeneration: "generation-off", updatedAt: "2026-08-28T10:15:30.000Z", acknowledged: true, consentRenewalRequired: false, state: "applied", environmentVeto: false, durabilitySupported: true });
 	setTelemetryEvents.mockResolvedValue({ eventsEnabled: true, consentGeneration: "generation-on", updatedAt: "2026-08-28T10:15:31.000Z", acknowledged: true, consentRenewalRequired: false, state: "applied", environmentVeto: false, durabilitySupported: true });
 	onTelemetryPolicy.mockReturnValue(() => undefined);
+	getAnalyticsOptOut.mockResolvedValue(false);
+	setAnalyticsOptOut.mockImplementation(async (optedOut: boolean) => optedOut);
 	// Locale defaults to English so existing copy assertions stay green.
 	await appI18n.changeLanguage("en");
 	useLocaleStore.setState({ locale: "en", loaded: false, saving: false, saveError: false });
@@ -223,6 +231,7 @@ beforeEach(async () => {
 	});
 	useUiStore.setState({ developerMode: false, remoteHosts: false, diagnostics: false, sideChats: false, windowTranslucency: false });
 	useTelemetryPolicyStore.setState({ view: { eventsEnabled: false, consentGeneration: "generation-off", updatedAt: "2026-08-28T10:15:30.000Z", acknowledged: true, consentRenewalRequired: false, state: "applied", environmentVeto: false, durabilitySupported: true }, loaded: true, saving: false, saveError: false });
+	useAnalyticsOptOutStore.setState({ optedOut: false, loaded: false, saving: false, loadError: false, saveError: false });
 	document.documentElement.lang = "en";
 });
 
@@ -390,11 +399,34 @@ describe("GlobalSettingsForm", () => {
 	});
 
 	it("shows pending daemon cleanup without claiming opt-out completed", async () => {
-		setTelemetryEvents.mockResolvedValue({ eventsEnabled: false, consentGeneration: "generation-off-2", updatedAt: "2026-08-28T10:15:31.000Z", acknowledged: false, consentRenewalRequired: false, state: "cleanup_pending", environmentVeto: false, durabilitySupported: true, reason: "daemon_cleanup_pending" });
+		setTelemetryEvents.mockResolvedValue({ eventsEnabled: false, consentGeneration: "generation-off-2", updatedAt: "2026-08-28T10:15:31.000Z", acknowledged: false, consentRenewalRequired: false, state: "cleanup_pending", environmentVeto: false, durabilitySupported: true, reason: "cleanup_failed" });
 		useTelemetryPolicyStore.setState({ view: { eventsEnabled: true, consentGeneration: "generation-on", updatedAt: "2026-08-28T10:15:30.000Z", acknowledged: true, consentRenewalRequired: false, state: "applied", environmentVeto: false, durabilitySupported: true }, loaded: true });
 		const user = userEvent.setup(); renderForm();
 		await user.click(await screen.findByRole("switch", { name: "Share error events" }));
 		expect(await screen.findByText("Telemetry is off locally. Daemon cleanup is still pending.")).toBeInTheDocument();
+	});
+
+	it("opts out of PostHog usage analytics from the Privacy section, independent of error events", async () => {
+		const user = userEvent.setup();
+		renderForm();
+		const toggle = await screen.findByRole("switch", { name: "Share usage analytics" });
+		await waitFor(() => expect(toggle).toBeEnabled());
+		expect(toggle).toBeChecked();
+		expect(screen.getByText(/your email is used only as a person property/)).toBeInTheDocument();
+
+		await user.click(toggle);
+
+		await waitFor(() => expect(setAnalyticsOptOut).toHaveBeenCalledWith(true));
+		await waitFor(() => expect(toggle).not.toBeChecked());
+		// The error-event policy is a separate control and was not touched.
+		expect(setTelemetryEvents).not.toHaveBeenCalled();
+	});
+
+	it("labels an analytics preference load failure as a load failure", async () => {
+		getAnalyticsOptOut.mockRejectedValueOnce(new Error("unavailable"));
+		renderForm();
+		expect(await screen.findByText("Could not load the analytics preference.")).toHaveAttribute("role", "alert");
+		expect(screen.queryByText("Could not save the analytics preference.")).not.toBeInTheDocument();
 	});
 
 	it("names the platform restriction instead of claiming cleanup keeps retrying", async () => {
@@ -470,7 +502,7 @@ describe("GlobalSettingsForm", () => {
 		await user.click(screen.getByLabelText("Language"));
 		await user.click(await screen.findByRole("menuitem", { name: "Simplified Chinese" }));
 
-		expect(await screen.findByRole("alert")).toHaveTextContent("Could not save the language preference.");
+		expect(await screen.findByText("Could not save the language preference.")).toHaveAttribute("role", "alert");
 		expect(useLocaleStore.getState().locale).toBe("en");
 		expect(screen.getByText("Appearance")).toBeInTheDocument();
 	});
@@ -573,32 +605,37 @@ describe("GlobalSettingsForm", () => {
 		expect(await screen.findByText("1.4.0-nightly.202608271030")).toBeInTheDocument();
 	});
 
-	it("shows a repeated timeout once and keeps manual retry available", async () => {
+	it("shows a repeated check timeout as one neutral notice and keeps retry available", async () => {
 		const message = "Update check timed out. Check your connection and try again.";
-		updGetStatus.mockResolvedValue({ state: "error", message, checkError: message });
+		updGetStatus.mockResolvedValue({ state: "error", checkFailed: true, message, checkError: message });
 		renderForm("updates");
-		await screen.findByText(message);
-		expect(screen.getAllByText(message)).toHaveLength(1);
+		const notice = "Update check unavailable. You can try again later.";
+		await screen.findByText(notice);
+		expect(screen.getAllByText(notice)).toHaveLength(1);
+		expect(screen.queryByText(message)).not.toBeInTheDocument();
+		expect(screen.getByTestId("update-status-line")).not.toHaveClass("text-error", "text-warning");
 		const retry = screen.getByRole("button", { name: "Check for updates" });
 		expect(retry).toBeEnabled();
 		await userEvent.click(retry);
 		expect(updCheck).toHaveBeenCalledTimes(1);
 	});
 
-	it("preserves a check failure beside a staged update", async () => {
+	it("shows a neutral check notice beside a staged update", async () => {
 		const message = "Update check timed out. Check your connection and try again.";
 		updGetStatus.mockResolvedValue({ state: "downloaded", version: "2.0.0", checkError: message });
 		renderForm("updates");
-		expect(await screen.findByText(message)).toBeVisible();
-		expect(screen.getAllByText(message)).toHaveLength(1);
+		const notice = await screen.findByText("Update check unavailable. You can try again later.");
+		expect(notice).toHaveClass("text-settings-muted");
+		expect(screen.queryByText(message)).not.toBeInTheDocument();
 		expect(screen.getByRole("button", { name: "Restart & install" })).toBeEnabled();
 	});
 
-	it("preserves a different check failure beside an install error", async () => {
+	it("keeps install errors actionable while check failures stay neutral", async () => {
 		updGetStatus.mockResolvedValue({ state: "error", message: "Installation failed", checkError: "Update check timed out" });
 		renderForm("updates");
 		expect(await screen.findByText("Installation failed")).toBeVisible();
-		expect(screen.getByText("Update check timed out")).toBeVisible();
+		expect(screen.getByText("Update check unavailable. You can try again later.")).toHaveClass("text-settings-muted");
+		expect(screen.queryByText("Update check timed out")).not.toBeInTheDocument();
 	});
 
 	it("shows an explicit idle update state and triggers a manual check", async () => {
@@ -749,14 +786,12 @@ describe("GlobalSettingsForm", () => {
 		expect(useUiStore.getState().updateInstallPromptOpen).toBe(true);
 	});
 
-	it("shows a non-error restart nudge when automatic checks keep failing on the network", async () => {
+	it("shows neutral text when automatic checks keep failing on the network", async () => {
 		updGetStatus.mockResolvedValue({ state: "not-available", staleCheckNudge: true });
 		renderForm();
-		const nudge = await screen.findByText(
-			"Updates haven't been able to check for a while — restarting the app usually fixes this.",
-		);
-		expect(nudge).toBeInTheDocument();
-		// The nudge is a warning, not an error, and the normal status still shows.
+		const notice = await screen.findByText("Update check unavailable. You can try again later.");
+		expect(notice).toHaveClass("text-settings-muted");
+		expect(notice).not.toHaveClass("text-error", "text-warning");
 		expect(screen.getByText("You're on the latest version.")).toBeInTheDocument();
 	});
 

@@ -258,7 +258,7 @@ export function UpdatesSection({ titleHidden }: { titleHidden?: boolean } = {}) 
 		<>
 			<SettingsSection title={t("settings.updates.versionSection")} sectionId="updates" titleHidden={titleHidden} grouped>
 				<UpdateActions
-					status={manualCheckFailure ? { ...status, state: "error", message: manualCheckFailure } : status}
+					status={manualCheckFailure ? { ...status, state: "error", checkFailed: true, message: manualCheckFailure } : status}
 					manualCheckRequestId={manualCheckRequestId}
 					startManualCheck={startManualCheck}
 					finishManualCheck={finishManualCheck}
@@ -525,15 +525,9 @@ function UpdateActions({
 								</p>
 							) : null}
 						</div>
-						{/* The primary error already explains the failed check. Keep a separate
-						    notice only when it adds information (for example beside a staged build). */}
-						{status.checkError && !(displayState === "error" && status.message === status.checkError) && (
-							<UpdateNotice tone="error" text={status.checkError} />
+						{!(displayState === "error" && status.checkFailed) && (status.checkError || status.checksFailing || status.staleCheckNudge) && (
+							<p className="text-settings-muted">{t("settings.updates.checkUnavailable")}</p>
 						)}
-						{!status.checkError && !status.staleCheckNudge && status.checksFailing && (
-							<UpdateNotice tone="warning" text={t("settings.updates.checksFailing")} />
-						)}
-						{status.staleCheckNudge && <UpdateNotice tone="warning" text={t("settings.updates.networkStale")} />}
 					</div>
 				}
 			>
@@ -611,16 +605,6 @@ function UpdateActions({
 	);
 }
 
-/** Inline caution/failure note under the status line: tone and icon, no box. */
-function UpdateNotice({ tone, text }: { tone: "warning" | "error"; text: string }) {
-	return (
-		<p className={cn("flex items-start gap-1.5 text-xs leading-4", tone === "warning" ? "text-warning" : "text-error")}>
-			<AlertTriangle className="mt-px size-icon-sm shrink-0" aria-hidden="true" />
-			<span className="min-w-0">{text}</span>
-		</p>
-	);
-}
-
 function DownloadProgressIcon({ percent }: { percent: number }) {
 	const clamped = Math.min(100, Math.max(0, percent));
 	return (
@@ -691,6 +675,11 @@ function UpdateStatusLine({
 			label = status.message ?? t("settings.updates.needInstalledApp");
 			break;
 		case "error":
+			if (status.checkFailed) {
+				icon = <Info className="size-icon-sm shrink-0" aria-hidden="true" />;
+				label = t("settings.updates.checkUnavailable");
+				break;
+			}
 			className = "text-error";
 			icon = <AlertTriangle className="size-icon-sm shrink-0" aria-hidden="true" />;
 			label = status.netError

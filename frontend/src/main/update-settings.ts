@@ -80,6 +80,8 @@ export interface UpdateStatus {
 	// rendering nothing at all.
 	checksFailing?: boolean;
 	checkError?: string;
+	/** Distinguishes failed checks from actionable download or install failures. */
+	checkFailed?: boolean;
 	// Present only when state === "error" and the failure is a Chromium
 	// network-stack error (net::ERR_*). The renderer localizes restart guidance
 	// from this flag instead of receiving pre-built English prose (#3526).

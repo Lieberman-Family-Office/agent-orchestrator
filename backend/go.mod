@@ -1,6 +1,6 @@
 module github.com/aoagents/agent-orchestrator/backend
 
-go 1.27.1
+go 1.27.3
 
 require (
 	github.com/Microsoft/go-winio v0.6.2
