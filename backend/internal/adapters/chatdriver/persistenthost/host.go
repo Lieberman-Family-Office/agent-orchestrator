@@ -685,7 +685,8 @@ func Run(ctx context.Context, cfg Config) error {
 			grace = providerQuickGrace
 		}
 		select {
-		case <-providerDone:
+		case err := <-providerDone:
+			_ = err
 			// Wrapper adapters may exit before their provider child. The hosted
 			// process tree is the ownership boundary, so explicit shutdown reaps
 			// any descendant that did not follow stdin closure.
@@ -703,7 +704,8 @@ func Run(ctx context.Context, cfg Config) error {
 	wait:
 		for {
 			select {
-			case <-providerDone:
+			case err := <-providerDone:
+				_ = err
 				break wait
 			case <-deadline:
 				break wait

@@ -5,7 +5,6 @@ package devin
 import (
 	"context"
 	"errors"
-	"fmt"
 	"path/filepath"
 	"strings"
 	"time"
@@ -84,11 +83,7 @@ func initialMessage(inv ports.ReviewInvocation) (string, error) {
 	if strings.TrimSpace(inv.SystemPromptFile) == "" {
 		return "", errors.New("devin reviewer: system prompt file is required")
 	}
-	return fmt.Sprintf(
-		"Read and follow the AO reviewer role in `%s`, then %s",
-		filepath.ToSlash(inv.SystemPromptFile),
-		strings.TrimSpace(inv.Prompt),
-	), nil
+	return "Read and follow the AO reviewer role in `" + filepath.ToSlash(inv.SystemPromptFile) + "`, then " + strings.TrimSpace(inv.Prompt), nil
 }
 
 // ReviewMessage reuses the same Devin TUI for subsequent review passes.

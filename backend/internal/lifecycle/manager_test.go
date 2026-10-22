@@ -2592,8 +2592,8 @@ func TestPRObservation_MergeConflictReArmsAfterConflictClears(t *testing.T) {
 	// Every state that definitively rules a conflict out must re-arm; `blocked`
 	// is deliberately excluded because the observer synthesizes it from
 	// draft/CI/review facts even while provider mergeability is unknown.
-	for _, clear := range []domain.Mergeability{domain.MergeMergeable, domain.MergeUnstable} {
-		t.Run(string(clear), func(t *testing.T) {
+	for _, clearState := range []domain.Mergeability{domain.MergeMergeable, domain.MergeUnstable} {
+		t.Run(string(clearState), func(t *testing.T) {
 			m, st, msg := newManager()
 			st.sessions["mer-1"] = working("mer-1")
 			apply := func(state domain.Mergeability) {
@@ -2603,15 +2603,15 @@ func TestPRObservation_MergeConflictReArmsAfterConflictClears(t *testing.T) {
 				}
 			}
 
-			apply(clear)
+			apply(clearState)
 			apply(domain.MergeConflicting)
 			if len(msg.msgs) != 1 {
 				t.Fatalf("first conflict should nudge once, got %v", msg.msgs)
 			}
-			apply(clear)
+			apply(clearState)
 			apply(domain.MergeConflicting)
 			if len(msg.msgs) != 2 {
-				t.Fatalf("conflict returning after %s should nudge again, got %d nudges: %v", clear, len(msg.msgs), msg.msgs)
+				t.Fatalf("conflict returning after %s should nudge again, got %d nudges: %v", clearState, len(msg.msgs), msg.msgs)
 			}
 		})
 	}

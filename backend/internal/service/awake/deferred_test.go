@@ -104,11 +104,11 @@ func TestDeferredCapabilitiesNeverAdvertiseAvailability(t *testing.T) {
 	s, _, h, b, _ := fixture(t)
 	s.host = &deferredCapableHost{h}
 	b.recovery = true
-	for _, cap := range s.Status().Capabilities {
-		switch cap.ID {
+	for _, capability := range s.Status().Capabilities {
+		switch capability.ID {
 		case "audio", "keyboard", "display_restore", "pause_apps", "hotspot", "agent_reconnect", "browser_actions":
-			if cap.Available || !strings.Contains(cap.Reason, "deferred") {
-				t.Fatalf("deferred capability advertised: %+v", cap)
+			if capability.Available || !strings.Contains(capability.Reason, "deferred") {
+				t.Fatalf("deferred capability advertised: %+v", capability)
 			}
 		}
 	}

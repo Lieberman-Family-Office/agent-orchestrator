@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MachOParseError } from "./makers/macho-archs";
@@ -86,6 +86,27 @@ afterEach(() => {
 });
 
 describe("native runtime resources", () => {
+	it.skipIf(process.platform === "win32").each(["darwin", "linux", "win32"] as const)("copies ACP links inside the %s bundle before signing", async (platform) => {
+		const source = join(fixtureDir, "resources", "acp-runtime");
+		mkdirSync(join(source, "node_modules", ".bin"), { recursive: true });
+		writeFileSync(join(source, "node_modules", "adapter.js"), "adapter");
+		symlinkSync("../adapter.js", join(source, "node_modules", ".bin", "adapter"));
+		const cwd = vi.spyOn(process, "cwd").mockReturnValue(fixtureDir);
+		try {
+			const hooks = config.packagerConfig?.afterCopyExtraResources;
+			expect(hooks?.length).toBeGreaterThan(0);
+			const buildPath = join(fixtureDir, "package");
+			for (const hook of hooks ?? []) await hook({ buildPath, platform, arch: "arm64", electronVersion: "44.7.0" });
+			const resources = platform === "darwin" ? join(buildPath, "Agent Orchestrator.app", "Contents", "Resources") : join(buildPath, "resources");
+			const link = join(resources, "acp-runtime", "node_modules", ".bin", "adapter");
+			expect(readlinkSync(link)).toBe("../adapter.js");
+			expect(readFileSync(link, "utf8")).toBe("adapter");
+			expect(extraResourcesForPlatform(platform)).not.toContain("resources/acp-runtime");
+		} finally {
+			cwd.mockRestore();
+		}
+	});
+
 	it("fails packaging when the macOS helper was not copied into Resources", async () => {
 		mkdirSync(join(fixtureDir, "AO.app", "Contents", "Resources"), { recursive: true });
 		const hook = config.hooks?.postPackage;

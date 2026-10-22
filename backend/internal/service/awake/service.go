@@ -256,9 +256,9 @@ func (s *Service) Start(ctx context.Context, req domain.StartAwakeRequest) error
 		return invalid("too many active awake sessions; end some first")
 	}
 	nativeGuard := false
-	for _, cap := range s.host.Capabilities() {
-		if cap.ID == "native_guard" {
-			nativeGuard = cap.Available
+	for _, capability := range s.host.Capabilities() {
+		if capability.ID == "native_guard" {
+			nativeGuard = capability.Available
 		}
 	}
 	if req.LidClosed {
@@ -531,9 +531,9 @@ func (s *Service) UpdateRules(ctx context.Context, rules []domain.AwakeRule) err
 			return err
 		}
 		guard := false
-		for _, cap := range s.host.Capabilities() {
-			if cap.ID == "native_guard" {
-				guard = cap.Available
+		for _, capability := range s.host.Capabilities() {
+			if capability.ID == "native_guard" {
+				guard = capability.Available
 			}
 		}
 		if r.Enabled && (r.LidClosed || guard) {

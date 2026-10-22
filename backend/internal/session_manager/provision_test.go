@@ -1084,13 +1084,13 @@ func TestChatGenerationReservationPreservesUnpublishedWorkspace(t *testing.T) {
 				if err := recovered.checkSessionHealth(ctx, rec); (!async && !errors.Is(err, ErrWorkspaceWriterStopUnproven)) || (async && err != nil) {
 					t.Fatalf("reserved-generation startup health = %v", err)
 				}
-				for _, recover := range []func() error{
+				for _, recoverSession := range []func() error{
 					func() error { _, err := recovered.ResumeAgentWithMode(ctx, id); return err },
 					func() error { _, err := recovered.Kill(ctx, id); return err },
 					func() error { return recovered.RetireForReplacement(ctx, id) },
 					func() error { return recovered.saveAndTeardownOne(ctx, rec) },
 				} {
-					if err := recover(); !errors.Is(err, ErrWorkspaceWriterStopUnproven) {
+					if err := recoverSession(); !errors.Is(err, ErrWorkspaceWriterStopUnproven) {
 						t.Fatalf("unpublished reserved generation was accepted: %v", err)
 					}
 				}
@@ -1200,7 +1200,7 @@ func TestEarlyPublishedLaunchPreservesUncertainWorkspace(t *testing.T) {
 					rec.ProvisionSteps = []domain.SessionProvisionStep{{ID: domain.SessionProvisionStepSetup, Status: setup}}
 				}
 				st.sessions[rec.ID] = rec
-				for _, recover := range []func() error{
+				for _, recoverSession := range []func() error{
 					func() error { return m.checkSessionHealth(context.Background(), rec) },
 					func() error { return m.reconcileLive(context.Background(), rec) },
 					func() error { _, err := m.ResumeAgentWithMode(context.Background(), rec.ID); return err },
@@ -1212,7 +1212,7 @@ func TestEarlyPublishedLaunchPreservesUncertainWorkspace(t *testing.T) {
 					func() error { return m.saveAndTeardownOne(context.Background(), rec) },
 					func() error { return m.RetireForReplacement(context.Background(), rec.ID) },
 				} {
-					if err := recover(); err == nil || !strings.Contains(err.Error(), "writer stop is unproven") {
+					if err := recoverSession(); err == nil || !strings.Contains(err.Error(), "writer stop is unproven") {
 						t.Fatalf("uncertain launch was not refused with missing evidence: %v", err)
 					}
 				}
@@ -1476,9 +1476,9 @@ func TestResolveClaudeFamilyAliasUsesNewestModelEfforts(t *testing.T) {
 // A Setup step runs with the time limit its first line sets, which never
 // reaches the shell, and a step over it fails saying so.
 func TestRunPostCreateUsesEachStepsTimeLimit(t *testing.T) {
-	previous := scriptStepMinute
-	scriptStepMinute = 100 * time.Millisecond
-	t.Cleanup(func() { scriptStepMinute = previous })
+	previous := scriptStepTimeUnit
+	scriptStepTimeUnit = 100 * time.Millisecond
+	t.Cleanup(func() { scriptStepTimeUnit = previous })
 	workspace := t.TempDir()
 	write := "echo \"$AO_SESSION_ID\" > out.txt"
 	slow := "sleep 2"

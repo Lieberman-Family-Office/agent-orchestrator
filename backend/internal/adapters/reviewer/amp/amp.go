@@ -52,7 +52,7 @@ func (r *Reviewer) ReviewCommand(ctx context.Context, inv ports.ReviewInvocation
 	}
 	message := inv.Prompt
 	if inv.SystemPromptFile != "" {
-		message = fmt.Sprintf("First read and follow the reviewer role in `%s`. Then %s", filepath.ToSlash(inv.SystemPromptFile), inv.Prompt)
+		message = "First read and follow the reviewer role in `" + filepath.ToSlash(inv.SystemPromptFile) + "`. Then " + inv.Prompt
 	}
 	return ports.ReviewCommandSpec{
 		Argv:           append([]string{binary, "--settings-file", settingsPath}, modeArgs...),

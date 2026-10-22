@@ -9,7 +9,7 @@ import MakerNSIS from "./makers/maker-nsis";
 import MakerDMG, { isSigningConfigured, sealDmg, verifyDmg, verifyMacArtifact } from "./makers/maker-dmg";
 import { machoHasX86_64Slice } from "./makers/macho-archs";
 import MakerAppImage from "./makers/maker-appimage";
-import { existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -66,7 +66,6 @@ export function extraResourcesForPlatform(platform: NodeJS.Platform): string[] {
 	return [
 		"daemon",
 		"agent-browser",
-		"resources/acp-runtime",
 		...(platform === "darwin" ? ["update-helper", "wake-helper", "cloudflared"] : []),
 		...(platform === "darwin" || platform === "linux" ? ["tmux"] : []),
 		"assets/icon.png",
@@ -135,6 +134,16 @@ const config: ForgeConfig = {
 		// deb/rpm makers below, and the runtime window icon from src/main.ts.
 		icon: "assets/icon",
 		extraResource: extraResourcesForPlatform(process.platform),
+		// ponytail: Packager 20.3 rewrites ACP links outside the bundle; remove when its resource copy preserves them.
+		afterCopyExtraResources: [({ buildPath, platform }) => {
+			const resources = platform === "darwin" || platform === "mas"
+				? path.join(buildPath, "Agent Orchestrator.app", "Contents", "Resources")
+				: path.join(buildPath, "resources");
+			cpSync(path.join(process.cwd(), "resources", "acp-runtime"), path.join(resources, "acp-runtime"), {
+				recursive: true,
+				verbatimSymlinks: true,
+			});
+		}],
 		// Notarization. Two paths:
 		//  - CI: an App Store Connect API key. APPLE_API_KEY is a PATH to the .p8
 		//    (the workflow decodes APPLE_API_KEY_BASE64 to a temp file), plus the

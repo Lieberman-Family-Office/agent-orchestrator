@@ -190,8 +190,10 @@ func TestSetupStepEventsLiveUpdates(t *testing.T) {
 // each saying how long ago it last wrote a byte, so it never reads as silent.
 func TestSetupStepEventsHeartbeatWhileOutputKeepsArriving(t *testing.T) {
 	t.Parallel()
+	// Leave the progress line unfinished; a final newline could be published
+	// before the process exits and legitimately appear in a running update.
 	_, events := runSetupWithSteps(t, SetupRunner{UpdateInterval: 10 * time.Millisecond, LiveHeartbeat: 100 * time.Millisecond},
-		[]string{"echo start; i=0; while [ $i -lt 12 ]; do printf 'progress %s\\r' $i; sleep 0.05; i=$((i+1)); done; echo"})
+		[]string{"echo start; i=0; while [ $i -lt 12 ]; do printf 'progress %s\\r' $i; sleep 0.05; i=$((i+1)); done"})
 	heartbeats := 0
 	for _, event := range events {
 		if event.Status != ScriptStepRunning || event.OutputAgeMS == nil {
@@ -207,6 +209,9 @@ func TestSetupStepEventsHeartbeatWhileOutputKeepsArriving(t *testing.T) {
 	}
 	if heartbeats < 2 {
 		t.Fatalf("live updates with an output age = %d, want several while the step kept writing: %+v", heartbeats, events)
+	}
+	if final := events[len(events)-1]; final.Status != SetupSucceeded || final.Output != "start\nprogress 11" {
+		t.Fatalf("last event = %+v, want the unfinished line published after success", final)
 	}
 }
 

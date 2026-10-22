@@ -93,7 +93,8 @@ func spawnAgent(launch Launch, workdir string) (*process, error) {
 				case <-time.After(3 * time.Second):
 					stopErr = killProcessTree(cmd)
 					select {
-					case <-done:
+					case err := <-done:
+						_ = err
 					case <-time.After(2 * time.Second):
 						if stopErr == nil {
 							stopErr = errors.New("ACP process did not exit after kill")
