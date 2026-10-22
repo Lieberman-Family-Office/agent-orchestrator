@@ -90,6 +90,23 @@ it("shows manual-update guidance without offering managed update controls", asyn
 	expect(screen.queryByText(/update check failed/i)).toBeNull();
 });
 
+it.each<UpdateStatus>([
+	{ state: "error", checkFailed: true, message: "Cannot parse releases feed: HTTP 404", netError: true },
+	{ state: "idle", checksFailing: true },
+	{ state: "idle", staleCheckNudge: true },
+	{ state: "downloaded", version: "9.9.9", checkError: "Cannot parse releases feed: HTTP 404" },
+])("keeps failed update checks neutral ($state)", async (status) => {
+	updGetStatus.mockResolvedValue(status);
+	renderUpdates();
+
+	expect(await screen.findByText("Update check unavailable. You can try again later.")).toBeVisible();
+	expect(screen.queryByText(/Cannot parse releases feed/)).toBeNull();
+	expect(document.querySelector(".text-error, .text-warning")).toBeNull();
+	expect(screen.queryByText("You’re up to date")).toBeNull();
+	expect(screen.getByRole("button", { name: "Check for updates" })).toBeEnabled();
+	if (status.state === "downloaded") expect(screen.getByRole("button", { name: "Restart & install" })).toBeEnabled();
+});
+
 it("renders the installed nightly build time as the device-local instant", async () => {
 	// The stamp 202609070300 encodes 03:00 UTC. The expected string is derived
 	// from that absolute instant, so the assertion holds in every timezone —

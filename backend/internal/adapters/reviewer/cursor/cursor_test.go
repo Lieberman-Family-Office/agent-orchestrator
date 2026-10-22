@@ -105,6 +105,17 @@ func TestReviewCommandBuildsPersistentInteractiveInvocation(t *testing.T) {
 	}
 }
 
+func TestCursorPromptPreservesLiteralPath(t *testing.T) {
+	got := cursorPrompt(ports.ReviewInvocation{
+		SystemPromptFile: "/ao/role`%s\nfile.md",
+		Prompt:           "  Read task `%s`.\n",
+	})
+	want := "Read and follow the AO reviewer role in `/ao/role`%s\nfile.md`, then Read task `%s`."
+	if got != want {
+		t.Fatalf("prompt = %q, want %q", got, want)
+	}
+}
+
 func TestReviewCommandOmitsAddDirWhenPromptRootIsEmpty(t *testing.T) {
 	agent := &captureAgent{}
 	got, err := (&Reviewer{agent: agent}).ReviewCommand(context.Background(), ports.ReviewInvocation{

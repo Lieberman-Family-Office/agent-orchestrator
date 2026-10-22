@@ -70,7 +70,14 @@ test("automation visibility is reversible and persistent without suppressing war
 		}
 	});
 
-	await page.goto(`/#/projects/${projectId}/sessions/${sessions[0]}`);
+	// The document load event precedes lazy session startup, including on reload.
+	const waitForConversation = (sessionId: string) => page.waitForResponse((response) =>
+		new URL(response.url()).pathname === `/api/v1/sessions/${sessionId}/conversation`
+		&& response.request().method() === "GET" && response.ok());
+	await Promise.all([
+		waitForConversation(sessions[0]),
+		page.goto(`/#/projects/${projectId}/sessions/${sessions[0]}`),
+	]);
 	const toggle = page.getByRole("button", { name: "Hide automation messages" });
 	await expect(toggle).toHaveAttribute("aria-pressed", "false");
 	await expect(toggle.locator("svg")).toHaveClass(/lucide-eye(?:\s|$)/);
@@ -106,10 +113,13 @@ test("automation visibility is reversible and persistent without suppressing war
 	expect(writes.slice(beforeToggleWrites)).toEqual([]);
 	expect(messages.filter((item) => item.origin === "automation")).toHaveLength(15);
 
-	await page.goto(`/#/projects/${projectId}/sessions/${sessions[1]}`);
+	await Promise.all([
+		waitForConversation(sessions[1]),
+		page.goto(`/#/projects/${projectId}/sessions/${sessions[1]}`),
+	]);
 	await expect(toggle).toHaveAttribute("aria-pressed", "true");
 	await expect(page.getByText("14 automation messages hidden", { exact: true })).toBeVisible();
-	await page.reload();
+	await Promise.all([waitForConversation(sessions[1]), page.reload()]);
 	await expect(toggle).toHaveAttribute("aria-pressed", "true");
 	await expect(page.getByText(/^Routine automation report /)).toHaveCount(0);
 	const show = page.getByRole("button", { name: "Show", exact: true });
@@ -134,7 +144,7 @@ test("automation visibility is reversible and persistent without suppressing war
 	await expect(page.getByRole("log", { name: "Conversation" })).toBeFocused();
 	expect(await page.evaluate(() => localStorage.getItem("ao.chat.hideAutomationMessages"))).toBe("false");
 	showApprovals = false;
-	await page.reload();
+	await Promise.all([waitForConversation(sessions[1]), page.reload()]);
 	const typed = "  Only my typed words\n\n  Preserve this spacing.\n\n";
 	const composer = page.getByRole("combobox", { name: "Message the agent" });
 	await composer.fill(typed);

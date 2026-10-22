@@ -3,7 +3,6 @@ package cursor
 
 import (
 	"context"
-	"fmt"
 	"path/filepath"
 	"strings"
 
@@ -30,6 +29,14 @@ type agent interface {
 // Harness identifies this reviewer in the reviewer registry.
 func (r *Reviewer) Harness() domain.ReviewerHarness {
 	return domain.ReviewerCursor
+}
+
+// InvalidateBinaryResolution forgets the worker plugin's cached executable, so
+// the next review runs the release an install just switched to.
+func (r *Reviewer) InvalidateBinaryResolution() {
+	if invalidator, ok := r.agent.(ports.AgentBinaryResolutionInvalidator); ok {
+		invalidator.InvalidateBinaryResolution()
+	}
 }
 
 var _ ports.Reviewer = (*Reviewer)(nil)
@@ -89,11 +96,7 @@ func (r *Reviewer) ReviewRestoreCommand(ctx context.Context, inv ports.ReviewInv
 
 func cursorPrompt(inv ports.ReviewInvocation) string {
 	if inv.SystemPromptFile != "" {
-		return fmt.Sprintf(
-			"Read and follow the AO reviewer role in `%s`, then %s",
-			filepath.ToSlash(inv.SystemPromptFile),
-			strings.TrimSpace(inv.Prompt),
-		)
+		return "Read and follow the AO reviewer role in `" + filepath.ToSlash(inv.SystemPromptFile) + "`, then " + strings.TrimSpace(inv.Prompt)
 	}
 	return strings.TrimSpace(inv.Prompt)
 }

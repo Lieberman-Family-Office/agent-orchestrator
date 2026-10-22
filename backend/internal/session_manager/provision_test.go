@@ -443,7 +443,7 @@ func TestResolveAgentConfigRejectsExplicitEffortForUnsupportedHarness(t *testing
 		if !errors.Is(err, ports.ErrUnsupportedEffort) {
 			t.Fatalf("harness %q override error = %v, want ErrUnsupportedEffort", harness, err)
 		}
-		if !strings.Contains(err.Error(), "only supported for codex, claude-code, and command-code") {
+		if !strings.Contains(err.Error(), "only supported for codex, claude-code, command-code, and hermes") {
 			t.Fatalf("harness %q error = %v, want support hint", harness, err)
 		}
 		// Unflagged request-carried effort still clears silently, matching the
@@ -553,6 +553,22 @@ func TestResolveCodexTUIAgentConfigFallsBackWhenCatalogLookupTimesOut(t *testing
 	m.modelCatalog = tuningCatalog{err: context.Canceled}
 	if _, err := m.resolveTUIAgentConfig(ctx, cfg, domain.ProjectConfig{}, cfg.AgentConfig); err == nil {
 		t.Fatal("cancelled spawn launched")
+	}
+}
+
+func TestResolveHermesAgentConfigPassesReasoningThrough(t *testing.T) {
+	// Hermes takes effort as native --reasoning for any model, including typed
+	// IDs its configuration catalog does not list, so the level is forwarded.
+	m := &Manager{modelCatalog: tuningCatalog{err: errors.New("discovery failed")}}
+	resolved, err := m.resolveAgentConfig(context.Background(), ports.SpawnConfig{
+		ProjectID: "p", Kind: domain.KindWorker, Harness: domain.HarnessHermes,
+		AgentConfig: ports.AgentConfig{Model: "MiniMax-M2", Effort: "high"}, EffortOverride: true,
+	}, domain.ProjectConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Model != "MiniMax-M2" || resolved.Effort != "high" {
+		t.Fatalf("resolved = %#v, want model MiniMax-M2 effort high", resolved)
 	}
 }
 
@@ -1068,13 +1084,13 @@ func TestChatGenerationReservationPreservesUnpublishedWorkspace(t *testing.T) {
 				if err := recovered.checkSessionHealth(ctx, rec); (!async && !errors.Is(err, ErrWorkspaceWriterStopUnproven)) || (async && err != nil) {
 					t.Fatalf("reserved-generation startup health = %v", err)
 				}
-				for _, recover := range []func() error{
+				for _, recoverSession := range []func() error{
 					func() error { _, err := recovered.ResumeAgentWithMode(ctx, id); return err },
 					func() error { _, err := recovered.Kill(ctx, id); return err },
 					func() error { return recovered.RetireForReplacement(ctx, id) },
 					func() error { return recovered.saveAndTeardownOne(ctx, rec) },
 				} {
-					if err := recover(); !errors.Is(err, ErrWorkspaceWriterStopUnproven) {
+					if err := recoverSession(); !errors.Is(err, ErrWorkspaceWriterStopUnproven) {
 						t.Fatalf("unpublished reserved generation was accepted: %v", err)
 					}
 				}
@@ -1088,6 +1104,20 @@ func TestChatGenerationReservationPreservesUnpublishedWorkspace(t *testing.T) {
 		}
 	}
 }
+
+type provisionRuntimeEffectError struct {
+	err     error
+	effect  ports.RuntimeEffectOutcome
+	cleanup ports.RuntimeCleanupOutcome
+}
+
+func (e provisionRuntimeEffectError) Error() string { return e.err.Error() }
+func (e provisionRuntimeEffectError) Unwrap() error { return e.err }
+func (e provisionRuntimeEffectError) PossibleHandle() ports.RuntimeHandle {
+	return ports.RuntimeHandle{}
+}
+func (e provisionRuntimeEffectError) EffectOutcome() ports.RuntimeEffectOutcome   { return e.effect }
+func (e provisionRuntimeEffectError) CleanupOutcome() ports.RuntimeCleanupOutcome { return e.cleanup }
 
 func TestKnownSynchronousFailureCanRetryWorkspaceCleanup(t *testing.T) {
 	for _, tc := range []struct {
@@ -1116,7 +1146,7 @@ func TestKnownSynchronousFailureCanRetryWorkspaceCleanup(t *testing.T) {
 				t.Fatal(err)
 			}
 			m.store, m.lcm = st, lifecycle.New(st, nil)
-			rt.createErr = switchRuntimeEffectError{err: errors.New("runtime create failed before controller"), effect: tc.effect, cleanup: ports.RuntimeCleanupNotAttempted}
+			rt.createErr = provisionRuntimeEffectError{err: errors.New("runtime create failed before controller"), effect: tc.effect, cleanup: ports.RuntimeCleanupNotAttempted}
 			ws.destroyErr = tc.refusal
 			_, _, _, err = m.Spawn(context.Background(), ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker,
 				Harness: domain.HarnessCodex, RequestedMode: domain.SessionModeTUI, ClientRequestID: "known-failure", ClientRequestHash: "known-failure-hash"})
@@ -1170,7 +1200,7 @@ func TestEarlyPublishedLaunchPreservesUncertainWorkspace(t *testing.T) {
 					rec.ProvisionSteps = []domain.SessionProvisionStep{{ID: domain.SessionProvisionStepSetup, Status: setup}}
 				}
 				st.sessions[rec.ID] = rec
-				for _, recover := range []func() error{
+				for _, recoverSession := range []func() error{
 					func() error { return m.checkSessionHealth(context.Background(), rec) },
 					func() error { return m.reconcileLive(context.Background(), rec) },
 					func() error { _, err := m.ResumeAgentWithMode(context.Background(), rec.ID); return err },
@@ -1182,7 +1212,7 @@ func TestEarlyPublishedLaunchPreservesUncertainWorkspace(t *testing.T) {
 					func() error { return m.saveAndTeardownOne(context.Background(), rec) },
 					func() error { return m.RetireForReplacement(context.Background(), rec.ID) },
 				} {
-					if err := recover(); err == nil || !strings.Contains(err.Error(), "writer stop is unproven") {
+					if err := recoverSession(); err == nil || !strings.Contains(err.Error(), "writer stop is unproven") {
 						t.Fatalf("uncertain launch was not refused with missing evidence: %v", err)
 					}
 				}
@@ -1366,6 +1396,18 @@ func TestSpawnPermissionPrecedence(t *testing.T) {
 	}
 }
 
+func TestRunPostCreateFailureSaysWhatFailedAndWhereToFixIt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh-only step")
+	}
+	err := runPostCreate(t.Context(), t.TempDir(), t.TempDir(), []string{"true", "echo could not reach registry; exit 3"}, nil, nil)
+	want := "The project's Setup script failed at step 2 (exit status 3), so the agent did not start. " +
+		"Fix the script in Project settings > Scripts, then try again. Output: could not reach registry"
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v\nwant    %s", err, want)
+	}
+}
+
 func TestRunPostCreateStopsLaterStepsAfterCancellation(t *testing.T) {
 	workspace := t.TempDir()
 	command := "while :; do :; done"
@@ -1375,7 +1417,8 @@ func TestRunPostCreateStopsLaterStepsAfterCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
 	defer cancel()
 	err := runPostCreate(ctx, workspace, t.TempDir(), []string{"", command, "echo unexpected > later.txt"}, nil, nil)
-	if err == nil || !strings.Contains(err.Error(), "setup step 2 failed") {
+	var setupErr *SetupStepError
+	if !errors.As(err, &setupErr) || setupErr.Step != 2 || setupErr.TimedOut {
 		t.Fatalf("cancellation error = %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(workspace, "later.txt")); !errors.Is(err, os.ErrNotExist) {
@@ -1427,5 +1470,115 @@ func TestResolveClaudeFamilyAliasUsesNewestModelEfforts(t *testing.T) {
 				t.Errorf("model %q effort %q: error = %v, want ErrUnsupportedEffort", model, effort, err)
 			}
 		}
+	}
+}
+
+// A Setup step runs with the time limit its first line sets, which never
+// reaches the shell, and a step over it fails saying so.
+func TestRunPostCreateUsesEachStepsTimeLimit(t *testing.T) {
+	previous := scriptStepTimeUnit
+	scriptStepTimeUnit = 100 * time.Millisecond
+	t.Cleanup(func() { scriptStepTimeUnit = previous })
+	workspace := t.TempDir()
+	write := "echo \"$AO_SESSION_ID\" > out.txt"
+	slow := "sleep 2"
+	if runtime.GOOS == "windows" {
+		write = "echo %AO_SESSION_ID%> out.txt"
+		slow = "ping -n 3 127.0.0.1 > NUL"
+	}
+	if err := runPostCreate(context.Background(), workspace, t.TempDir(), []string{"# ao-timeout: 30m\n" + write}, map[string]string{EnvSessionID: "project-spoof"}, map[string]string{EnvSessionID: "session-1"}); err != nil {
+		t.Fatalf("a timed step failed: %v", err)
+	}
+	if output, err := os.ReadFile(filepath.Join(workspace, "out.txt")); err != nil || strings.TrimSpace(string(output)) != "session-1" {
+		t.Fatalf("the timed step did not run: %q %v", output, err)
+	}
+	// One "minute" is 100ms here: the step stops at its own limit.
+	started := time.Now()
+	err := runPostCreate(context.Background(), workspace, t.TempDir(), []string{"# ao-timeout: 1m\n" + slow}, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "The project's Setup script stopped at step 1 after 1 minute, so the agent did not start.") || time.Since(started) > 1500*time.Millisecond {
+		t.Fatalf("err = %v after %s, want the step stopped at its limit", err, time.Since(started))
+	}
+	// A long limit leaves the step running past the default one.
+	if err := runPostCreate(context.Background(), workspace, t.TempDir(), []string{"# ao-timeout: 30m\n" + slow}, nil, nil); err != nil {
+		t.Fatalf("a step under its own limit failed: %v", err)
+	}
+}
+
+// A start that runs Setup also gets its steps' time limits.
+func TestPostCreateBudgetCoversTheSetupSteps(t *testing.T) {
+	if got := postCreateBudget(10*time.Minute, nil); got != 10*time.Minute {
+		t.Fatalf("no setup = %s", got)
+	}
+	// A step without its own limit adds Setup's 30-minute default.
+	if got := postCreateBudget(10*time.Minute, []string{"npm ci", " ", "# ao-timeout: 90m\nmake"}); got != 130*time.Minute {
+		t.Fatalf("setup budget = %s", got)
+	}
+	// A typed limit, shorter than the default too, is the step's own.
+	if got := postCreateBudget(10*time.Minute, []string{"# ao-timeout: 5m\nnpm ci", "make"}); got != 45*time.Minute {
+		t.Fatalf("setup budget with a short step = %s", got)
+	}
+}
+
+type deadlineProbeWorkspace struct {
+	ports.Workspace
+	budget time.Duration
+}
+
+func (w *deadlineProbeWorkspace) Create(ctx context.Context, cfg ports.WorkspaceConfig) (ports.WorkspaceInfo, error) {
+	if deadline, ok := ctx.Deadline(); ok {
+		w.budget = time.Until(deadline)
+	}
+	return w.Workspace.Create(ctx, cfg)
+}
+
+// A REST spawn is not cut at the request's flat deadline: it runs under its
+// budget plus its project's Setup step limits.
+func TestRESTSpawnBudgetCoversItsSetupSteps(t *testing.T) {
+	m, st, _, _ := newManager()
+	probe := &deadlineProbeWorkspace{Workspace: m.workspace}
+	m.workspace = probe
+	project := st.projects["mer"]
+	project.Config.PostCreate = []string{"# ao-timeout: 90m\nmake", "npm ci"}
+	st.projects["mer"] = project
+	var extended time.Duration
+	ctx := ports.WithSpawnRequestBudget(context.Background(), time.Minute, func(total time.Duration) { extended = total })
+	_, _, _, _ = m.Spawn(ctx, ports.SpawnConfig{ProjectID: "mer", Kind: domain.KindWorker})
+	if want := 121 * time.Minute; probe.budget < want-time.Minute || probe.budget > want {
+		t.Fatalf("spawn budget = %s, want about %s (1m + 90m + 30m)", probe.budget, want)
+	}
+	if extended != 121*time.Minute+time.Second {
+		t.Fatalf("request deadline extended to %s, want just past the spawn's own", extended)
+	}
+}
+
+// A restore extends the request's budget by its Setup only when it recreates
+// the worktree and so runs Setup; an ordinary restore that hangs keeps the
+// request's ordinary budget.
+func TestRESTRestoreExtendsItsBudgetOnlyWhenItRunsSetup(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		recreated bool
+		want      time.Duration
+	}{
+		{"worktree kept", false, 0},
+		{"worktree recreated", true, 91*time.Minute + time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, st, _, _ := newManager()
+			project := st.projects["mer"]
+			project.Config.PostCreate = []string{"# ao-timeout: 90m\ntrue"}
+			st.projects["mer"] = project
+			workspace := t.TempDir()
+			if tc.recreated {
+				workspace = filepath.Join(workspace, "reclaimed")
+			}
+			seedTerminal(st, "mer-1", domain.SessionMetadata{WorkspacePath: workspace, Branch: "ao/mer-1", AgentSessionID: "agent-x"})
+			var extended time.Duration
+			ctx := ports.WithSpawnRequestBudget(context.Background(), time.Minute, func(total time.Duration) { extended = total })
+			_, _ = m.RestoreWithMode(ctx, "mer-1")
+			if extended != tc.want {
+				t.Fatalf("request budget extended to %s, want %s", extended, tc.want)
+			}
+		})
 	}
 }

@@ -1772,6 +1772,7 @@ describe("startAutoUpdates", () => {
     expect(rendererSend).toHaveBeenCalledWith("updates:status", expect.anything());
     expect(module.getUpdateStatus()).toEqual({
       state: "error",
+      checkFailed: true,
       message: "manual feed failed",
       checkedAt: expect.any(Number),
     });
@@ -1789,6 +1790,7 @@ describe("startAutoUpdates", () => {
 
     expect(module.getUpdateStatus()).toEqual({
       state: "error",
+      checkFailed: true,
       message:
         "Couldn't check for updates — the update information was not found on the server.",
       checkedAt: expect.any(Number),
@@ -1826,6 +1828,7 @@ describe("startAutoUpdates", () => {
 
     expect(module.getUpdateStatus()).toEqual({
       state: "error",
+      checkFailed: true,
       message:
         "Couldn't check for updates — the update information was not found on the server.",
     });
@@ -1933,6 +1936,7 @@ describe("startAutoUpdates", () => {
 
     expect(module.getUpdateStatus()).toEqual({
       state: "error",
+      checkFailed: true,
       message: err.message,
       checkedAt: expect.any(Number),
     });
@@ -1946,6 +1950,7 @@ describe("startAutoUpdates", () => {
 
     expect(module.getUpdateStatus()).toEqual({
       state: "error",
+      checkFailed: true,
       message: "net::ERR_FAILED",
       netError: true,
     });
@@ -1959,6 +1964,7 @@ describe("startAutoUpdates", () => {
 
     expect(module.getUpdateStatus()).toEqual({
       state: "error",
+      checkFailed: true,
       message: "net::ERR_FAILED",
       netError: true,
       checkedAt: expect.any(Number),
@@ -1991,6 +1997,7 @@ describe("startAutoUpdates", () => {
 
     expect(module.getUpdateStatus()).toEqual({
       state: "error",
+      checkFailed: true,
       message: "boom",
     });
   });

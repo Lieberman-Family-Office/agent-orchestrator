@@ -16,7 +16,6 @@ import {
 import { SortableContext, sortableKeyboardCoordinates, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import {
-	AlertTriangle,
 	Archive,
 	CalendarClock,
 	ChevronRight,
@@ -44,7 +43,6 @@ import {
 import {
 	useCallback,
 	useEffect,
-	useId,
 	useLayoutEffect,
 	memo,
 	useMemo,
@@ -75,7 +73,6 @@ import {
 	STANDALONE_WORKSPACE_ID,
 } from "../types/workspace";
 import { getSessionStatusDotView } from "../lib/session-presentation";
-import { deriveSessionAgentSwitchPresentation } from "../lib/agent-switch-presentation";
 import { aoBridge } from "../lib/bridge";
 import { hasTrustedApiBaseUrl } from "../lib/api-client";
 import { useCommandPaletteEnabled } from "../hooks/useCommandPaletteEnabled";
@@ -130,6 +127,7 @@ import { OrchestratorIcon } from "./icons";
 import { Badge } from "./ui/badge";
 import { cn } from "../lib/utils";
 import { recordManualWorkerOpen } from "../lib/session-management-telemetry";
+import { AwakeControl } from "./AwakeControl";
 import { SettingsSaveStatus, useSettingsPage } from "./SettingsDialog";
 import { useUiStore } from "../stores/ui-store";
 import { useSidebarOrderStore } from "../stores/sidebar-order-store";
@@ -1288,19 +1286,22 @@ export function Sidebar({
 							<span className="tracking-tight">{t("settings.connectMobile")}</span>
 						</span>
 					</button>
-					<button
-						aria-label={t("shell.settings")}
-						className={FOOTER_NAV_BUTTON_CLASS}
-						onClick={() => selection.goGlobalSettings()}
-						tabIndex={isCollapsed ? -1 : 0}
-						type="button"
-					>
-						<NavRowHighlight />
-						<span className="relative z-[1] flex min-w-0 flex-1 items-center gap-2.5 [&_svg]:size-icon-md [&_svg]:shrink-0">
-							<Settings aria-hidden="true" />
-							<span className="tracking-tight">{t("shell.settings")}</span>
-						</span>
-					</button>
+					<div className="flex w-full items-center gap-1">
+						<button
+							aria-label={t("shell.settings")}
+							className={cn(FOOTER_NAV_BUTTON_CLASS, "min-w-0 flex-1")}
+							onClick={() => selection.goGlobalSettings()}
+							tabIndex={isCollapsed ? -1 : 0}
+							type="button"
+						>
+							<NavRowHighlight />
+							<span className="relative z-[1] flex min-w-0 flex-1 items-center gap-2.5 [&_svg]:size-icon-md [&_svg]:shrink-0">
+								<Settings aria-hidden="true" />
+								<span className="tracking-tight">{t("shell.settings")}</span>
+							</span>
+						</button>
+						<AwakeControl tabIndex={isCollapsed ? -1 : 0} />
+					</div>
 				</div>
 				<div
 					aria-hidden={!isCollapsed || undefined}
@@ -2355,12 +2356,6 @@ const SessionRow = memo(function SessionRow({
 	const { t } = useTranslation();
 	const prefersReducedMotion = useReducedMotion();
 	useGrabbingCursor(Boolean(reorder?.isDragging));
-	const switchPresentation = deriveSessionAgentSwitchPresentation(session);
-	const switchLabel = switchPresentation
-		? t(switchPresentation.compactLabelKey, switchPresentation.values)
-		: undefined;
-	const switchStatusId = useId();
-	const describedBy = switchLabel ? switchStatusId : undefined;
 	const queryClient = useQueryClient();
 	const refreshWorkspaces = useCallback(
 		() => queryClient.invalidateQueries({ queryKey: workspaceQueryKeyForHost(session.hostId) }),
@@ -2462,7 +2457,6 @@ const SessionRow = memo(function SessionRow({
 						<button
 							aria-current={active ? "page" : undefined}
 							data-testid={session.hostId ? "remote-session-row" : undefined}
-							aria-describedby={describedBy}
 							aria-keyshortcuts="F2"
 							aria-label={t("shell.openSession", { title: hostLabel ? `${session.title} · ${hostLabel}` : session.title })}
 							className={cn(
@@ -2527,11 +2521,6 @@ const SessionRow = memo(function SessionRow({
 									{session.title}
 								</span>
 								{hostLabel ? <Badge variant="outline" className="h-4 shrink-0 px-1.5 text-2xs">{hostLabel}</Badge> : null}
-								{switchLabel ? (
-									<span id={switchStatusId} className="max-w-28 shrink-0 truncate text-2xs text-muted-foreground">
-										{switchLabel}
-									</span>
-								) : null}
 							</span>
 						</button>
 					</div>
@@ -2872,7 +2861,6 @@ type SidebarUpdateAction =
 	| { kind: "downloading"; percent: number }
 	| { kind: "download"; version?: string }
 	| { kind: "install"; version?: string; escalated: boolean }
-	| { kind: "retry" }
 	| null;
 
 function sidebarUpdateAction(status: UpdateStatus, availableDismissed: boolean): SidebarUpdateAction {
@@ -2898,11 +2886,7 @@ function sidebarUpdateAction(status: UpdateStatus, availableDismissed: boolean):
 		return { kind: "download", version: status.version };
 	}
 	if (staged) return { kind: "install", version: staged.version, escalated: staged.escalated };
-	// Ranked below a staged build on purpose: an update ready to install is more
-	// actionable than "checks are failing". Only when there is nothing better to
-	// show does the failure take the row — it used to render nothing at all,
-	// which reads as "up to date" rather than "checks are not getting through".
-	if (status.checksFailing === true) return { kind: "retry" };
+	// Check failures stay in Settings; the sidebar only shows actionable updates.
 	return null;
 }
 
@@ -3011,24 +2995,7 @@ function UpdateStatusRow({
 		);
 	}
 
-	return (
-		<button
-			aria-label={t("shell.retryUpdateCheck")}
-			className="flex w-full items-center gap-2.5 rounded-lg border border-warning/35 bg-warning/12 p-2.5 text-left text-control font-medium text-warning hover:bg-warning/18 [&_svg]:text-warning"
-			data-testid="sidebar-update-failed"
-			onClick={() => void aoBridge.updates.check()}
-			tabIndex={tabIndex}
-			type="button"
-		>
-			<AlertTriangle aria-hidden="true" className="size-icon-lg shrink-0" />
-			<span className="min-w-0 flex-1">
-				<span className="block truncate tracking-tight">{t("shell.updateCheckFailed")}</span>
-				<span className="block truncate text-caption font-normal text-warning">
-					{t("shell.retryUpdateCheck")}
-				</span>
-			</span>
-		</button>
-	);
+	return null;
 }
 
 /**
@@ -3141,27 +3108,6 @@ function UpdateStatusRail({
 					</span>
 				</TooltipTrigger>
 				<TooltipContent side="right">{label}</TooltipContent>
-			</Tooltip>
-		);
-	}
-
-	if (action.kind === "retry") {
-		return (
-			<Tooltip>
-				<TooltipTrigger asChild>
-					<button
-						aria-label={t("shell.retryUpdateCheck")}
-						className="grid size-9 place-items-center rounded-lg bg-warning/12 text-warning hover:bg-warning/18 [&_svg]:size-4"
-						onClick={() => void aoBridge.updates.check()}
-						tabIndex={tabIndex}
-						type="button"
-					>
-						<AlertTriangle aria-hidden="true" />
-					</button>
-				</TooltipTrigger>
-				<TooltipContent side="right">
-					{t("shell.updateCheckFailed")} · {t("shell.retryUpdateCheck")}
-				</TooltipContent>
 			</Tooltip>
 		);
 	}

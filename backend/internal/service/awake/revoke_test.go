@@ -131,12 +131,12 @@ func TestInterruptedRevocationDoesNotAdvertisePowerAuthorization(t *testing.T) {
 	s, _, h, _, _ := fixture(t)
 	s.host = &pendingPowerHost{&deferredCapableHost{h}}
 	found := map[string]bool{}
-	for _, cap := range s.Status().Capabilities {
-		found[cap.ID] = true
-		if (cap.ID == "low_power" || cap.ID == "low_power_authorization") && cap.Available {
+	for _, capability := range s.Status().Capabilities {
+		found[capability.ID] = true
+		if (capability.ID == "low_power" || capability.ID == "low_power_authorization") && capability.Available {
 			t.Fatal("interrupted revocation advertised an available power operation")
 		}
-		if cap.ID == "low_power_revocation" && !cap.Available {
+		if capability.ID == "low_power_revocation" && !capability.Available {
 			t.Fatal("interrupted revocation disabled its own retry")
 		}
 	}

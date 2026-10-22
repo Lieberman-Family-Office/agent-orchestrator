@@ -1195,7 +1195,7 @@ async function checkForUpdatesWithDeadline(): Promise<UpdateCheckOutcome> {
     // nudge path. Manual and return-home checks are user-initiated, so they still
     // get the error immediately at the deadline.
     if (activeUpdaterOperation !== "automatic-check") {
-      broadcast(withActiveRequest({ state: "error", message: UPDATE_CHECK_TIMEOUT_MESSAGE }));
+      broadcast(withActiveRequest({ state: "error", checkFailed: true, message: UPDATE_CHECK_TIMEOUT_MESSAGE }));
     }
     // Cancellation aborts the request AND rejects its promise. Do not race the
     // check: electron-updater must clear its cached promise before AO retries.
@@ -2086,6 +2086,7 @@ function wireUpdaterEvents(): void {
       } else {
         broadcastCompletedCheck({
           state: "error",
+          checkFailed: true,
           message:
             "Couldn't check for updates — the update information was not found on the server.",
         });
@@ -2097,6 +2098,7 @@ function wireUpdaterEvents(): void {
     // localize restart guidance instead of showing the raw net:: string (#3526).
     const status: UpdateStatus = {
       state: "error",
+      ...(activeUpdaterPhase === "check" ? { checkFailed: true } : {}),
       message: errorMessage(err),
       ...(isNetError(err) ? { netError: true } : {}),
     };
@@ -2465,6 +2467,7 @@ export async function checkForUpdatesNow(
       console.info(`manual update ${failed.phase} failed:`, err);
       broadcastCompletedCheck({
         state: "error",
+        ...(failed.phase === "check" ? { checkFailed: true } : {}),
         message:
           failed.phase === "download"
             ? "Download failed — the update file was not found on the server."
@@ -2478,6 +2481,7 @@ export async function checkForUpdatesNow(
     } else {
       broadcastCompletedCheck({
         state: "error",
+        ...(failed.phase === "check" ? { checkFailed: true } : {}),
         message: errorMessage(err),
         ...(isNetError(err) ? { netError: true } : {}),
         ...(options.requestId === undefined ? {} : { requestId: options.requestId }),
@@ -2550,6 +2554,7 @@ export async function returnToHome(
     }
     broadcast({
       state: "error",
+      ...(failed.phase === "check" ? { checkFailed: true } : {}),
       message:
         (err as Error)?.message ??
         (failed.phase === "download" ? "Download failed" : "Return failed"),

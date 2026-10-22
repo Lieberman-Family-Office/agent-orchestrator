@@ -134,6 +134,17 @@ npm run lint
 
 ### Code generation
 
+Create new SQLite migrations from the repository root:
+
+```bash
+npm run migration:create -- add_reports
+```
+
+The command creates a Goose SQL template with a UTC `YYYYMMDDHHMMSSsss` ID.
+Fill in its SQL and append the generated ID and filename to `shippedMigrations`
+in `backend/internal/storage/sqlite/migrate_burned_versions_test.go`.
+Keep existing migration IDs, filenames, and SQL unchanged.
+
 ```bash
 # Regenerate sqlc code after editing queries or schema
 npm run sqlc
@@ -255,7 +266,7 @@ go run ./cmd/ao --help
 | `go: go.mod requires go >= 1.27`     | Wrong Go version                           | `go version`; install Go 1.27.1+ from [go.dev](https://go.dev/dl/)                                                                                                                                                                                                                                    |
 | `sqlc generate` produces errors      | Query SQL syntax or schema migration issue | Check `backend/internal/storage/sqlite/queries/` for SQL syntax, placeholder counts, and referenced columns/tables; if you changed the schema, add a new migration in `backend/internal/storage/sqlite/migrations/` instead of editing an existing one, then rerun `npm run sqlc` |
 | `openapi.yaml` is stale              | Changed DTOs without regenerating          | Run `npm run api` from repo root                                                                                                                                                                                                                                                  |
-| `golangci-lint` failures             | Linter version mismatch                    | Install v2.13.2 or use `npm run lint` from root                                                                                                                                                                                                                                   |
+| `golangci-lint` failures             | Linter version mismatch                    | Install v2.15.0 or use `npm run lint` from root                                                                                                                                                                                                                                   |
 | Tests fail with "connection refused" | Test tries real daemon                     | Tests should use `httptest`; check for `go test ./...` without a live daemon                                                                                                                                                                                                      |
 
 ### Frontend build / test failures
@@ -281,8 +292,7 @@ The diff check should pass after committing the regenerated files. Do not edit
 `gen/` by hand or use a different sqlc version; the version in `package.json` is
 authoritative. Review any unexpected query or generated type changes before
 committing. The storage tests also check that the config is valid YAML and keeps
-the boolean overrides for `agent_switch_failure_policy.enabled` and
-`app_settings.cloud_offering`.
+the boolean override for `app_settings.cloud_offering`.
 
 If CI fails on the `api-drift` check, the OpenAPI-generated files are out of sync with source. Regenerate them locally and commit the updated files:
 

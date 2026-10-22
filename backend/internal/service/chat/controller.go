@@ -58,6 +58,8 @@ type Store interface {
 	ClaimChatControllerGeneration(ctx context.Context, session domain.SessionID, generation string) error
 	ClaimReviewChatController(ctx context.Context, reviewID, providerID, generation string, now time.Time) (bool, error)
 	ConversationBranch(ctx context.Context, conversationID, branchID string) (domain.ConversationBranch, error)
+	CommitProviderSwitch(ctx context.Context, rec domain.SessionRecord, branch domain.ConversationBranch, generation string, settings domain.ConversationSettings, activity domain.ConversationActivity) error
+	ListTerminalTurns(ctx context.Context, id domain.SessionID) ([]domain.HandoffTurn, error)
 	ConversationEditAnchor(ctx context.Context, conversationID, replacedTurnID string) (domain.ConversationEditAnchor, error)
 	RepairIncompleteConversationEdit(ctx context.Context, sessionID domain.SessionID, conversationID string, now time.Time) (domain.ConversationBranch, bool, error)
 	CreateAndActivateConversationBranch(ctx context.Context, sessionID domain.SessionID, branch domain.ConversationBranch, generation string, now time.Time) error
@@ -793,7 +795,7 @@ func (p nativeHistoryCheckpoint) mismatches(
 			if completedTurns[turnID] && boundary.UserMessageID != "" &&
 				text.user.NativeUserMessageID == boundary.UserMessageID &&
 				nativeHistoryTextMatches(boundary.UserText, text.user.Text) &&
-				nativeHistoryTextMatches(boundary.AssistantText, text.assistant.Text) {
+				(boundary.Interrupted || nativeHistoryTextMatches(boundary.AssistantText, text.assistant.Text)) {
 				matched = true
 				break
 			}
@@ -1694,6 +1696,10 @@ func (c *Controller) sendLocked(
 func (c *Controller) RetryTurn(ctx context.Context, turnID string) (domain.ConversationTurn, error) {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
+	return c.retryTurnLocked(ctx, turnID, false)
+}
+
+func (c *Controller) retryTurnLocked(ctx context.Context, turnID string, autoResume bool) (domain.ConversationTurn, error) {
 	if c.handoffActive() {
 		return domain.ConversationTurn{}, ErrControllerHandoff
 	}
@@ -1710,8 +1716,11 @@ func (c *Controller) RetryTurn(ctx context.Context, turnID string) (domain.Conve
 	}
 
 	prompt, err := c.store.RetryPrompt(ctx, c.conversation.ID, turnID)
-	if err != nil {
+	if errors.Is(err, domain.ErrNoConversationTurn) {
 		return domain.ConversationTurn{}, fmt.Errorf("%w: %s", ErrTurnNotRetryable, turnID)
+	}
+	if err != nil {
+		return domain.ConversationTurn{}, fmt.Errorf("read retry prompt %s: %w", turnID, err)
 	}
 	if !prompt.ActiveLineage {
 		return domain.ConversationTurn{}, fmt.Errorf("%w: %s", ErrRetryStaleBranch, turnID)
@@ -1761,7 +1770,13 @@ func (c *Controller) RetryTurn(ctx context.Context, turnID string) (domain.Conve
 		Continuation:        prompt.Continuation,
 	}
 	var created bool
-	if c.reviewID == "" {
+	if autoResume {
+		store, ok := c.store.(usageLimitStore)
+		if !ok {
+			return domain.ConversationTurn{}, ErrUsageLimitAutoResumeInvalid
+		}
+		created, err = store.AppendAutoResumeRetryUserMessage(ctx, c.conversation.ID, c.sessionID, c.generation, retryMessage, newTurnID, turnID, now)
+	} else if c.reviewID == "" {
 		created, err = c.store.AppendRetryUserMessage(ctx, c.conversation.ID, c.sessionID, c.generation, retryMessage, newTurnID, turnID, now)
 	} else {
 		created, err = c.store.AppendReviewRetryUserMessage(ctx, c.conversation.ID, c.sessionID, c.reviewID, c.generation, retryMessage, newTurnID, turnID, now)
@@ -1869,6 +1884,8 @@ func (c *Controller) turnSettings() ports.ChatTurnSettings {
 		Model:    current.Model,
 		Effort:   current.ReasoningEffort,
 		Approval: current.ApprovalMode,
+		Fast:     current.FastMode,
+		Plan:     current.PlanMode,
 	}
 }
 
@@ -3220,6 +3237,7 @@ func (c *Controller) projectEvent(ctx context.Context, event ports.ChatEvent) (b
 		}
 	}
 	record["diff"] = event.Diff
+	dropEmptyArchiveFields(record)
 	if event.Input != nil {
 		record["input"] = event.Input
 	}
