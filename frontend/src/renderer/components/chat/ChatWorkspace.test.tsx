@@ -2459,8 +2459,9 @@ describe("ChatWorkspace timeline", () => {
 		fireEvent.scroll(log);
 
 		expect(scrollbar).toHaveAttribute("aria-hidden", "true");
-		expect(scrollbar).toHaveClass("pointer-events-none");
-		expect(scrollbar.querySelectorAll("[data-chat-scroll-marker]")).toHaveLength(0);
+		expect(scrollbar).toHaveClass("pointer-events-none", "opacity-0");
+		expect(scrollbar).toHaveAttribute("tabindex", "-1");
+		expect(scrollbar.querySelectorAll("[data-chat-scroll-marker]")).toHaveLength(8);
 
 		fireEvent.wheel(scrollbar, { deltaY: 200 });
 		expect(log.scrollTop).toBe(1000);
