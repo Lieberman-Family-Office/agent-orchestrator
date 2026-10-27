@@ -664,8 +664,8 @@ export function SessionView({ sessionId, cloudOrgId, projectId, hostId }: Sessio
 	// Set by a restore and cleared only by the session's terminal pane once the
 	// fresh worker's terminal exists, so it means anything only while that pane
 	// can mount: a Chat-mode session never mounts one, and would otherwise keep
-	// the "Connecting your terminal" loader up for good. Cloud Chat presents
-	// startup progress inside its conversation instead of this terminal overlay.
+	// the "Connecting your terminal" loader up for good. Its own lifecycle stage
+	// still raises the loader while the restored workspace comes up.
 	const cloudReconnectRequested = useTerminalResetStore((state) => Boolean(state.reconnecting[sessionId]));
 	const [terminalAttachment, setTerminalAttachment] = useState({ sessionId: "", attached: false });
 	const terminalAttached = terminalAttachment.sessionId === sessionId && terminalAttachment.attached;
@@ -705,7 +705,7 @@ export function SessionView({ sessionId, cloudOrgId, projectId, hostId }: Sessio
 	// relay drop mid-turn). A terminal re-mint (cloudReconnecting, covers a blank
 	// flash) and a genuine workspace restart still raise the loader.
 	const cloudSessionResolving = cloudLookupEnabled && cloudRouteSession.isLoading;
-	const showLifecycleLoader = expectsTerminal && !startupFailure && ((!session && cloudSessionResolving) || (hasConnectedOnce
+	const showLifecycleLoader = !startupFailure && ((!session && cloudSessionResolving) || (hasConnectedOnce
 		? (cloudReconnecting || workspaceRestarting)
 		: (cloudReconnecting || (cloudStage != null && !isCloudPausedStage(cloudStage) && !sessionReady))));
 	const loaderVisibleLongEnoughRef = useRef("");
@@ -717,7 +717,7 @@ export function SessionView({ sessionId, cloudOrgId, projectId, hostId }: Sessio
 		const timer = window.setTimeout(() => { loaderVisibleLongEnoughRef.current = sessionId; }, 200);
 		return () => window.clearTimeout(timer);
 	}, [sessionId, showLifecycleLoader]);
-	const showCompletedLoader = expectsTerminal && !showLifecycleLoader && sessionReady && loaderVisibleLongEnoughRef.current === sessionId && !completionDismissed;
+	const showCompletedLoader = !showLifecycleLoader && sessionReady && loaderVisibleLongEnoughRef.current === sessionId && !completionDismissed;
 	useEffect(() => {
 		if (!showCompletedLoader) return;
 		const timer = window.setTimeout(() => setCompletionDismissed(true), 360);
