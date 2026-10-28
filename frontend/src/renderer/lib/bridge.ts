@@ -24,6 +24,8 @@ export const aoBridge: AoBridge =
 			onOpenFolderPath: () => () => undefined,
 			onNewSessionShortcut: () => () => undefined,
 			onKeyboardShortcutsHelp: () => () => undefined,
+			onQuitConfirmRequest: () => () => undefined,
+			resolveQuitConfirm: () => undefined,
 			onNewShellTerminalShortcut: () => () => undefined,
 			onCloseShellTerminalShortcut: () => () => undefined,
 			setCloseShellTerminalShortcutEnabled: () => undefined,
@@ -34,6 +36,7 @@ export const aoBridge: AoBridge =
 			onPreviousTabShortcut: () => () => undefined,
 			onNextTabShortcut: () => () => undefined,
 			onShortcut: () => () => undefined,
+			onScrollPhase: () => () => undefined,
 		},
 		terminal: {
 			saveDroppedFile: async () => "",
@@ -373,6 +376,8 @@ export const aoBridge: AoBridge =
 				throw new Error("AO Cloud sign-in requires the desktop app.");
 			},
 			onSessionChanged: () => () => undefined,
+			onOpenShareLink: () => () => undefined,
+			takePendingShareLink: async () => null,
 		},
 		cloudCp: {
 			request: async () => {

@@ -389,6 +389,10 @@ func run(logger *slog.Logger) error {
 				// install it ships refuses current models.
 				workerexec.AwaitClaudeCodeUpgrade(buildCtx)
 			}
+			if launch.Harness == "codex" {
+				// A fresh workspace is still installing the pinned Codex.
+				workerexec.AwaitCodexInstall(buildCtx)
+			}
 			command, err := b.BuildInteractive(launch, credential, workspace)
 			credential.Secret = ""
 			if err != nil {
@@ -424,6 +428,11 @@ func run(logger *slog.Logger) error {
 		// not ship it, so start installing it now rather than on first chat.
 		workerexec.WarmClaudeACPAdapter()
 		workerexec.WarmClaudeCode()
+	}
+	if bootstrap.Launch.Harness == "codex" {
+		// A bring-your-own template ships its own Codex release (or none yet);
+		// start installing the pinned one now.
+		workerexec.WarmCodex()
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -514,6 +523,9 @@ func run(logger *slog.Logger) error {
 		}
 		if launch.Harness == "claude-code" {
 			workerexec.AwaitClaudeCodeUpgrade(ctx)
+		}
+		if launch.Harness == "codex" {
+			workerexec.AwaitCodexInstall(ctx)
 		}
 		command, err := (workerexec.HarnessBuilder{
 			DataDir: dataDir, ConfigRoot: filepath.Join(dataDir, "reviews", input.ReviewRunID),
@@ -1664,6 +1676,11 @@ func verifyHarnessAvailable(harness string) error {
 	if !ok {
 		return fmt.Errorf("unsupported coding-agent harness %q", harness)
 	}
+	if workerexec.PinnedHarnessReady(harness) {
+		// The worker's own install (Claude Code, Codex) counts: a template need
+		// not ship the harness at all.
+		return nil
+	}
 	if _, err := exec.LookPath(binary); err != nil {
 		return fmt.Errorf("%s harness binary %q is unavailable: %w", harness, binary, err)
 	}
@@ -1756,7 +1773,10 @@ func (c *client) DialTerminalStream(
 	ctx context.Context,
 	terminalID string,
 ) (*websocket.Conn, error) {
-	streamURL := c.baseURL + "/worker/terminals/" + url.PathEscape(terminalID) + "/stream"
+	// The feature query tells the control plane this worker handles resize and
+	// repaint frames on the stream; an older control plane ignores it.
+	streamURL := c.baseURL + "/worker/terminals/" + url.PathEscape(terminalID) + "/stream?features=" +
+		url.QueryEscape(worker.TerminalStreamControlFeature)
 	if strings.HasPrefix(streamURL, "http") {
 		streamURL = "ws" + strings.TrimPrefix(streamURL, "http")
 	}

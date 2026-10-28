@@ -90,6 +90,8 @@ export async function installFakeBridge(page: Page, opts: FakeBridgeOptions = {}
 					onOpenFolderPath: () => () => undefined,
 					onNewSessionShortcut: unsubscribe,
 					onKeyboardShortcutsHelp: unsubscribe,
+					onQuitConfirmRequest: unsubscribe,
+					resolveQuitConfirm: () => undefined,
 					onNewShellTerminalShortcut: unsubscribe,
 					onCloseShellTerminalShortcut: unsubscribe,
 					setCloseShellTerminalShortcutEnabled: () => undefined,
@@ -100,6 +102,7 @@ export async function installFakeBridge(page: Page, opts: FakeBridgeOptions = {}
 					onPreviousTabShortcut: unsubscribe,
 					onNextTabShortcut: unsubscribe,
 					onShortcut: unsubscribe,
+					onScrollPhase: unsubscribe,
 				},
 				terminal: {
 					saveDroppedFile: async () => "",
@@ -375,6 +378,8 @@ export async function installFakeBridge(page: Page, opts: FakeBridgeOptions = {}
 					cancelProviderAuth: async () => undefined,
 					connectProviderAuth: async () => undefined,
 					localAuthAvailable: async () => false,
+					onOpenShareLink: () => () => undefined,
+					takePendingShareLink: async () => null,
 					localRegister: async () => {
 						throw new Error("local auth is unavailable in e2e");
 					},
@@ -986,6 +991,8 @@ export async function installFakeAgent(page: Page, opts: FakeAgentOptions = {}):
 					onOpenFolderPath: () => () => undefined,
 					onNewSessionShortcut: unsubscribe,
 					onKeyboardShortcutsHelp: unsubscribe,
+					onQuitConfirmRequest: unsubscribe,
+					resolveQuitConfirm: () => undefined,
 					onNewShellTerminalShortcut: unsubscribe,
 					onCloseShellTerminalShortcut: unsubscribe,
 					setCloseShellTerminalShortcutEnabled: () => undefined,
@@ -996,6 +1003,7 @@ export async function installFakeAgent(page: Page, opts: FakeAgentOptions = {}):
 					onPreviousTabShortcut: unsubscribe,
 					onNextTabShortcut: unsubscribe,
 					onShortcut: unsubscribe,
+					onScrollPhase: unsubscribe,
 				},
 				terminal: {
 					saveDroppedFile: async () => "",
@@ -1259,6 +1267,8 @@ export async function installFakeAgent(page: Page, opts: FakeAgentOptions = {}):
 					cancelProviderAuth: async () => undefined,
 					connectProviderAuth: async () => undefined,
 					localAuthAvailable: async () => false,
+					onOpenShareLink: () => () => undefined,
+					takePendingShareLink: async () => null,
 					localRegister: async () => {
 						throw new Error("local auth is unavailable in e2e");
 					},

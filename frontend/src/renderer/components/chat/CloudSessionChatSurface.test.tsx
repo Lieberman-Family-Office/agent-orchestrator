@@ -239,6 +239,67 @@ describe("CloudSessionChatSurface", () => {
 		expect(cloudMocks.sendSessionMessage).toHaveBeenLastCalledWith("org-1", session.id, expect.objectContaining({ model: "claude-opus-5" }), { idempotencyKey: "model-1" });
 	});
 
+	it("offers only the approval modes the selected model runs, and shows and sends the mode that runs after a model switch", async () => {
+		cloudMocks.listChatEvents.mockResolvedValue({ events: [], hasMore: false, nextAfter: 0 });
+		cloudMocks.listChatModels.mockResolvedValue({ model: "opus", models: [
+			{ id: "opus", displayName: "Opus", default: true, approvalModes: ["default", "accept-edits", "auto", "bypass-permissions"] },
+			{ id: "haiku", displayName: "Haiku", default: false, approvalModes: ["default", "accept-edits", "bypass-permissions"] },
+		] });
+		cloudMocks.sendSessionMessage.mockResolvedValue({ event: {} });
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+		render(
+			<QueryClientProvider client={queryClient}>
+				<CloudSessionChatSurface session={{ ...session, provider: "claude-code", cloud: { orgId: "org-1", permissionMode: "trusted" } }} />
+			</QueryClientProvider>,
+		);
+		const props = () => cloudMocks.chatProps.mock.lastCall?.[0];
+		await waitFor(() => expect(props().configOptions?.find((option: { id: string }) => option.id === "model")?.currentValue).toBe("opus"));
+		act(() => props().onChooseSettings({ approvalMode: "auto" }, "approvalMode"));
+		expect(props().approvalModes).toEqual(["default", "accept-edits", "auto", "bypass-permissions"]);
+		expect(props().snapshot.settings.approvalMode).toBe("auto");
+		expect(props().approvalModeLimits).toBeUndefined();
+
+		// Haiku cannot run Auto-approve: it is not offered, and the composer
+		// shows the mode the turn runs instead, never a more permissive one.
+		act(() => props().onChooseConfigOption("model", { value: "haiku" }));
+		expect(props().approvalModes).toEqual(["default", "accept-edits", "bypass-permissions"]);
+		expect(props().snapshot.settings.approvalMode).toBe("accept-edits");
+		expect(props().approvalModeLimits).toEqual({ model: "Haiku", unavailable: ["auto"], requested: "auto" });
+		await props().onSend("haiku turn", [], "haiku-1");
+		expect(cloudMocks.sendSessionMessage).toHaveBeenLastCalledWith("org-1", session.id, {
+			text: "haiku turn", model: "haiku", mode: "trusted", approvalMode: "accept-edits",
+		}, { idempotencyKey: "haiku-1" });
+
+		// The pick is kept, so a model that runs it runs it again.
+		act(() => props().onChooseConfigOption("model", { value: "opus" }));
+		expect(props().snapshot.settings.approvalMode).toBe("auto");
+		expect(props().approvalModeLimits).toBeUndefined();
+		await props().onSend("opus turn", [], "opus-1");
+		expect(cloudMocks.sendSessionMessage).toHaveBeenLastCalledWith("org-1", session.id, {
+			text: "opus turn", model: "opus", mode: "trusted", approvalMode: "auto",
+		}, { idempotencyKey: "opus-1" });
+	});
+
+	it("shows the worker's notice of an approval mode the turn's model does not offer", () => {
+		const turnId = "11111111-1111-4111-8111-111111111111";
+		const activity = (sequence: number, value: Record<string, unknown>): CloudCpClientEvent => ({
+			sessionId: session.id, sequence, type: "chat.activity", payload: { turnId, attempt: 1, activity: value }, createdAt: "2026-10-01T00:00:00Z",
+		});
+		const items = toSnapshot({ ...session, provider: "claude-code" }, [
+			{ sessionId: session.id, sequence: 1, type: "chat.turn_started", payload: { turnId, attempt: 1 }, createdAt: "2026-10-01T00:00:00Z" },
+			activity(2, { id: "approval-mode-substituted", kind: "system", status: "completed",
+				summary: "Auto-approve isn't available for Haiku; using Accept edits.",
+				detail: { event: "approval_mode.substituted", requestedApprovalMode: "auto", approvalMode: "accept-edits" } }),
+			// Any other worker system row is not shown: it could name a page to open.
+			activity(3, { id: "page", kind: "system", status: "completed", summary: "page", detail: { event: "render", render: { id: "x" } } }),
+		]).items;
+		expect(items).toHaveLength(1);
+		expect(items[0]).toMatchObject({
+			kind: "activity", turnId, activityKind: "system", status: "completed",
+			summary: "Auto-approve isn't available for Haiku; using Accept edits.", detail: { event: "approval_mode.substituted" },
+		});
+	});
+
 	it("shows a failed Setup the way a failed local Chat start does, and Retry asks the worker again", async () => {
 		cloudMocks.listChatEvents.mockResolvedValue({ events: [], hasMore: false, nextAfter: 0 });
 		cloudMocks.listChatModels.mockResolvedValue({ models: [] });
@@ -617,23 +678,82 @@ describe("CloudSessionChatSurface", () => {
 		}
 	});
 
+	it("asks again when a just-connected worker fails its first catalog reads", async () => {
+		vi.useFakeTimers({ shouldAdvanceTime: true });
+		try {
+			cloudMocks.listChatEvents.mockResolvedValue({ events: [], hasMore: false, nextAfter: 0 });
+			const failed = () => new CloudCpError("The worker could not complete the operation.", { status: 422, code: "WORKER_OPERATION_FAILED" });
+			cloudMocks.listChatModels.mockReset()
+				.mockRejectedValueOnce(failed())
+				.mockRejectedValueOnce(failed())
+				.mockResolvedValue({ models: [{ id: "opus", displayName: "Opus", default: true }] });
+			render(
+				<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+					<CloudSessionChatSurface session={{ ...session, cloud: { orgId: "org-1" } }} />
+				</QueryClientProvider>,
+			);
+			await waitFor(() => expect(cloudMocks.listChatModels).toHaveBeenCalledTimes(1));
+			expect(cloudMocks.chatProps.mock.lastCall?.[0].commandError).toBeUndefined();
+			await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+			await waitFor(() => expect(cloudMocks.chatProps.mock.lastCall?.[0].models).toHaveLength(1));
+			expect(cloudMocks.listChatModels).toHaveBeenCalledTimes(3);
+			expect(cloudMocks.chatProps.mock.lastCall?.[0].commandError).toBeUndefined();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("keeps asking quietly while the worker is still setting up the coding agent", async () => {
+		vi.useFakeTimers({ shouldAdvanceTime: true });
+		try {
+			cloudMocks.listChatEvents.mockResolvedValue({ events: [], hasMore: false, nextAfter: 0 });
+			cloudMocks.listChatModels.mockReset()
+				.mockRejectedValueOnce(new CloudCpError("Setting up the coding agent on this workspace. Try again in a minute.", { status: 422, code: "CHAT_AGENT_INSTALLING" }))
+				.mockRejectedValueOnce(new CloudCpError("Setting up Chat UI on this workspace. Try again in a minute.", { status: 422, code: "CHAT_ADAPTER_INSTALLING" }))
+				.mockResolvedValue({ models: [{ id: "codex-test", displayName: "Codex Test", default: true }] });
+			render(
+				<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+					<CloudSessionChatSurface session={{ ...session, cloud: { orgId: "org-1" } }} />
+				</QueryClientProvider>,
+			);
+			await waitFor(() => expect(cloudMocks.listChatModels).toHaveBeenCalledTimes(1));
+			expect(cloudMocks.chatProps.mock.lastCall?.[0].commandError).toBeUndefined();
+			await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+			expect(cloudMocks.chatProps.mock.lastCall?.[0].commandError).toBeUndefined();
+			await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+			await waitFor(() => expect(cloudMocks.chatProps.mock.lastCall?.[0].models).toHaveLength(1));
+			expect(cloudMocks.listChatModels).toHaveBeenCalledTimes(3);
+			expect(cloudMocks.chatProps.mock.lastCall?.[0].commandError).toBeUndefined();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
 	it("does not show a model error kept from a worker that is gone", async () => {
-		cloudMocks.listChatEvents.mockResolvedValue({ events: [], hasMore: false, nextAfter: 0 });
-		cloudMocks.listChatModels.mockReset().mockRejectedValue(new CloudCpError("The worker could not complete the operation.", { status: 422, code: "WORKER_OPERATION_FAILED" }));
-		cloudMocks.resumeSession.mockReset().mockResolvedValue({});
-		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-		const view = render(
-			<QueryClientProvider client={queryClient}>
-				<CloudSessionChatSurface session={{ ...session, cloud: { orgId: "org-1" } }} />
-			</QueryClientProvider>,
-		);
-		await waitFor(() => expect(cloudMocks.chatProps.mock.lastCall?.[0].commandError).toMatch(/^Model choices unavailable/));
-		view.rerender(
-			<QueryClientProvider client={queryClient}>
-				<CloudSessionChatSurface session={{ ...session, runtimeConnected: false, cloud: { orgId: "org-1" } }} />
-			</QueryClientProvider>,
-		);
-		await waitFor(() => expect(cloudMocks.chatProps.mock.lastCall?.[0].commandError).toBeUndefined());
+		vi.useFakeTimers({ shouldAdvanceTime: true });
+		try {
+			cloudMocks.listChatEvents.mockResolvedValue({ events: [], hasMore: false, nextAfter: 0 });
+			cloudMocks.listChatModels.mockReset().mockRejectedValue(new CloudCpError("The worker could not complete the operation.", { status: 422, code: "WORKER_OPERATION_FAILED" }));
+			cloudMocks.resumeSession.mockReset().mockResolvedValue({});
+			const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+			const view = render(
+				<QueryClientProvider client={queryClient}>
+					<CloudSessionChatSurface session={{ ...session, cloud: { orgId: "org-1" } }} />
+				</QueryClientProvider>,
+			);
+			// The failure shows once its retries (about a minute) run out.
+			await act(async () => { await vi.advanceTimersByTimeAsync(120_000); });
+			await waitFor(() => expect(cloudMocks.chatProps.mock.lastCall?.[0].commandError).toMatch(/^Model choices unavailable/));
+			expect(cloudMocks.listChatModels).toHaveBeenCalledTimes(7);
+			view.rerender(
+				<QueryClientProvider client={queryClient}>
+					<CloudSessionChatSurface session={{ ...session, runtimeConnected: false, cloud: { orgId: "org-1" } }} />
+				</QueryClientProvider>,
+			);
+			await waitFor(() => expect(cloudMocks.chatProps.mock.lastCall?.[0].commandError).toBeUndefined());
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 
 	it("does not ask a deleted session for models and loads them once its restored worker connects", async () => {
