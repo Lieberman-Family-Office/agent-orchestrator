@@ -85,6 +85,21 @@ var remoteCommandTokens = map[string]struct{}{
 }
 
 var remotePayloadAllowlist = map[string]map[string]struct{}{
+	"ao.usage.messages_sent": {
+		"project_telemetry_id": {},
+		"session_telemetry_id": {},
+		"count":                {},
+	},
+	"ao.usage.worker_pr_associated": {
+		"project_telemetry_id": {},
+		"count":                {},
+		"historical":           {},
+	},
+	"ao.usage.worker_pr_merged": {
+		"project_telemetry_id": {},
+		"count":                {},
+		"historical":           {},
+	},
 	// Reported by the LAN listener on the first authenticated request per
 	// transport per day (httpd/mobile_connect_telemetry.go). "transport" is a
 	// closed vocabulary — lan / tailscale / loopback / other — never an address.
@@ -114,6 +129,7 @@ var remotePayloadAllowlist = map[string]map[string]struct{}{
 		// existing - the true occurrence count of a burst - is silently
 		// stripped before it ever reaches PostHog.
 		"count":        {},
+		"day":          {},
 		"window_start": {},
 		"window_end":   {},
 	},
@@ -165,8 +181,8 @@ var remotePayloadAllowlist = map[string]map[string]struct{}{
 		"created_runs": {},
 		"harness":      {},
 		"rerun":        {},
-		"reused":       {},
-		"trigger":      {},
+
+		"trigger": {},
 	},
 	"ao.review.trigger_failed": {
 		"error_kind": {},
@@ -199,6 +215,16 @@ var remotePayloadAllowlist = map[string]map[string]struct{}{
 		"harness":     {},
 		"kind":        {},
 		"operation":   {},
+	},
+	"ao.session.relaunch_failed": {
+		"cause_type":  {},
+		"component":   {},
+		"error_code":  {},
+		"fingerprint": {},
+		"harness":     {},
+		"kind":        {},
+		"operation":   {},
+		"step":        {},
 	},
 	"ao.session.spawned": {
 		"duration_ms":  {},
@@ -316,7 +342,7 @@ func (s *PostHogSink) suppressed() bool { return s.ident != nil && s.ident.Expor
 
 // Emit enqueues an event for best-effort export. An opted-out install exports
 // nothing, so the stream stops the moment the user flips the switch.
-func (s *PostHogSink) Emit(_ context.Context, ev ports.TelemetryEvent) {
+func (s *PostHogSink) Emit(ctx context.Context, ev ports.TelemetryEvent) {
 	if s.suppressed() {
 		return
 	}
@@ -326,13 +352,26 @@ func (s *PostHogSink) Emit(_ context.Context, ev ports.TelemetryEvent) {
 		return
 	}
 	queued := false
-	select {
-	case s.ch <- ev:
-		queued = true
-	default:
+	if strings.HasPrefix(ev.Name, "ao.usage.") {
+		// Usage summaries have already been reserved in SQLite. Wait for queue
+		// capacity so a burst cannot discard them behind the caller's back.
+		select {
+		case s.ch <- ev:
+			queued = true
+		case <-ctx.Done():
+		}
+	} else {
+		select {
+		case s.ch <- ev:
+			queued = true
+		default:
+		}
 	}
 	s.queueMu.RUnlock()
 	if !queued {
+		if ctx.Err() != nil {
+			return
+		}
 		s.log.Warn("telemetry posthog sink buffer full; dropping event", "name", ev.Name, "source", ev.Source)
 	}
 }
@@ -400,6 +439,7 @@ func (s *PostHogSink) send(ctx context.Context, ev ports.TelemetryEvent) {
 	identity := ports.TelemetryIdentity{CloudUserID: cloudUserID}
 	if s.ident != nil {
 		identity.InstallID = s.ident.InstallID()
+		identity.AnonymousID = s.ident.AnonymousID()
 	}
 	distinctID := identity.DistinctID()
 	body := map[string]any{
@@ -531,6 +571,9 @@ func (s *PostHogSink) properties(ev ports.TelemetryEvent) map[string]any {
 		props[k] = v
 	}
 	s.stampIdentity(props)
+	if s.ident != nil {
+		props["install_id"] = s.ident.InstallID()
+	}
 	return props
 }
 
@@ -552,8 +595,8 @@ func (s *PostHogSink) stampIdentity(props map[string]any) {
 	actor, _ := props["github_actor"].(string)
 	if uid != "" {
 		props["ao_cloud_user_id"] = uid
-		// Linked to the person that the desktop identify() merged this install
-		// into; without it the daemon's events would not join that profile.
+		// Linked to the person the desktop identify() selected; the stable
+		// installation ID remains an event property.
 		props["$process_person_profile"] = true
 	}
 	if actor == "" && uid == "" {
@@ -624,6 +667,9 @@ func isAllowedCommandValue(key, value string) bool {
 		_, ok := remoteCommandTokens[value]
 		return ok
 	}
+	if key == "command_path" && value == "other" {
+		return true
+	}
 	if key != "command_path" || tokens[0] != "ao" {
 		return false
 	}
@@ -646,6 +692,12 @@ func sanitizeRemoteValue(key string, v any) (any, bool) {
 	case string:
 		value = strings.TrimSpace(value)
 		if value == "" {
+			return nil, false
+		}
+		if key == "project_telemetry_id" && !uuidPattern.MatchString(value) {
+			return nil, false
+		}
+		if key == "session_telemetry_id" && !sessionTelemetryIDPattern.MatchString(value) {
 			return nil, false
 		}
 		if (key == "command" || key == "command_path") && !isAllowedCommandValue(key, value) {
@@ -689,6 +741,9 @@ func sanitizeRemoteValue(key string, v any) (any, bool) {
 	}
 }
 
+var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+var sessionTelemetryIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
 // agentSlugPattern is the shape of a real adapter id (claude-code, codex, ...).
 // AO_AGENT is free text and cfg.Agent is only validated against the registry
 // when the daemon builds its resolver, which happens after ao.daemon.started is
@@ -716,18 +771,86 @@ func versionChannel(appVersion string) string {
 
 func loadOrCreateInstallID(dataDir string) (string, error) {
 	path := filepath.Join(dataDir, installIDFile)
-	if b, err := os.ReadFile(path); err == nil {
+	for range 5 {
+		b, err := os.ReadFile(path)
+		if err == nil {
+			if id := strings.TrimSpace(string(b)); id != "" {
+				return id, nil
+			}
+			return recoverEmptyInstallID(dataDir, path)
+		} else if !os.IsNotExist(err) {
+			return "", fmt.Errorf("read telemetry install id: %w", err)
+		}
+
+		id := "ins_" + uuid.NewString()
+		tmp, err := os.CreateTemp(dataDir, ".telemetry_install_id_*")
+		if err != nil {
+			return "", fmt.Errorf("create telemetry install id: %w", err)
+		}
+		if _, err := tmp.WriteString(id + "\n"); err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmp.Name())
+			return "", fmt.Errorf("write telemetry install id: %w", err)
+		}
+		if err := tmp.Close(); err != nil {
+			_ = os.Remove(tmp.Name())
+			return "", fmt.Errorf("close telemetry install id: %w", err)
+		}
+		err = os.Link(tmp.Name(), path)
+		_ = os.Remove(tmp.Name())
+		if err == nil {
+			return id, nil
+		}
+		if !os.IsExist(err) {
+			return "", fmt.Errorf("publish telemetry install id: %w", err)
+		}
+	}
+	return "", fmt.Errorf("telemetry install id creation did not settle")
+}
+
+// recoverEmptyInstallID serializes repair of a legacy empty file with the
+// renderer. A second process must re-read after taking the lock, or it could
+// delete an ID that the first process just published.
+func recoverEmptyInstallID(dataDir, path string) (string, error) {
+	lockPath := path + ".recovery"
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		err := os.Mkdir(lockPath, 0o700)
+		if err == nil {
+			break
+		}
+		if !os.IsExist(err) {
+			return "", fmt.Errorf("lock telemetry install id recovery: %w", err)
+		}
+		info, err := os.Stat(lockPath)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return "", fmt.Errorf("inspect telemetry install id recovery: %w", err)
+		}
+		if time.Since(info.ModTime()) > 10*time.Second {
+			_ = os.Remove(lockPath)
+			continue
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("timed out waiting for telemetry install id recovery")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	defer func() { _ = os.Remove(lockPath) }()
+	b, err := os.ReadFile(path)
+	if err == nil {
 		if id := strings.TrimSpace(string(b)); id != "" {
 			return id, nil
 		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return "", fmt.Errorf("remove empty telemetry install id: %w", err)
+		}
 	} else if !os.IsNotExist(err) {
-		return "", fmt.Errorf("read telemetry install id: %w", err)
+		return "", fmt.Errorf("read telemetry install id during recovery: %w", err)
 	}
-	id := "ins_" + uuid.NewString()
-	if err := os.WriteFile(path, []byte(id+"\n"), 0o600); err != nil {
-		return "", fmt.Errorf("write telemetry install id: %w", err)
-	}
-	return id, nil
+	return loadOrCreateInstallID(dataDir)
 }
 
 // writeFileAtomic swaps data in through a temp file in the same directory, so a

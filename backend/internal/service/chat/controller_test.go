@@ -1022,6 +1022,9 @@ func TestOrdinaryResumeRejectsProviderHandleOutsideActiveBranch(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "does not match session handle") {
 		t.Fatalf("ordinary resume error = %v, want active-branch handle mismatch", err)
 	}
+	if !errors.Is(err, ports.ErrChatResumeFailed) {
+		t.Fatalf("mismatch error = %v, want ErrChatResumeFailed so the API answers 409", err)
+	}
 	if resumeCalls != 0 {
 		t.Fatalf("driver resume calls = %d, want mismatch rejected before provider launch", resumeCalls)
 	}
@@ -6222,7 +6225,7 @@ func TestServiceLiveReconnectKeepsDurableRunningTurnBusy(t *testing.T) {
 }
 
 func TestAdapterRecoveryDetachPreservesRunningTurnForAdoption(t *testing.T) {
-	for _, stoppedEvent := range []string{"explicit", "unmarked", "omitted"} {
+	for _, stoppedEvent := range []string{"explicit", "event-only", "unmarked", "omitted"} {
 		t.Run(stoppedEvent, func(t *testing.T) { testAdapterRecoveryDetachPreservesRunningTurnForAdoption(t, stoppedEvent) })
 	}
 }
@@ -6244,9 +6247,9 @@ func testAdapterRecoveryDetachPreservesRunningTurnForAdoption(t *testing.T, stop
 		t.Fatalf("queue: %+v %v", queued, err)
 	}
 	// A receipt failure makes the adapter detach itself, not Controller.Close.
-	provider.retained.Store(true)
+	provider.retained.Store(stoppedEvent != "event-only")
 	if stoppedEvent != "omitted" {
-		provider.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: ports.ChatControllerStopped, ProviderRetained: stoppedEvent == "explicit"})
+		provider.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: ports.ChatControllerStopped, ProviderRetained: stoppedEvent == "explicit" || stoppedEvent == "event-only"})
 	}
 	if err := provider.Close(); err != nil {
 		t.Fatal(err)
@@ -6855,6 +6858,11 @@ func TestSuccessiveInterruptBatchesRunNewestTargetFirst(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				// An idle Send may drain the queue but return its queued intake receipt.
+				turn, err = h.st.TurnByID(ctx, turn.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
 				return turn
 			}
 			if failedHead {
@@ -7215,6 +7223,10 @@ func TestInterruptAndSendDoesNotDrainAfterTargetFails(t *testing.T) {
 	later, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "later ordinary turn", ClientMessageID: "later", Origin: domain.MessageOriginHuman})
 	if err != nil {
 		t.Fatal(err)
+	}
+	later, err = h.st.TurnByID(ctx, later.ID)
+	if err != nil || later.ProviderTurnID == "" {
+		t.Fatalf("ordinary queued turn was not dispatched: %+v, %v", later, err)
 	}
 	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: later.ProviderTurnID, TurnState: domain.TurnStateCompleted})
 	snapshot = h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -55,7 +54,6 @@ func TestSetConfigSnapshotCASPreservesConcurrentEdits(t *testing.T) {
 			if err := store.UpsertProject(ctx, seed); err != nil {
 				t.Fatal(err)
 			}
-			var calls atomic.Int64
 			mgr := project.NewWithDeps(project.Deps{Store: snapshotProjectStore{Store: store, afterRead: func(row domain.ProjectRecord) {
 				switch change {
 				case "unrelated":
@@ -77,12 +75,9 @@ func TestSetConfigSnapshotCASPreservesConcurrentEdits(t *testing.T) {
 						}
 					}
 				}
-			}}, OnModelScopeChanged: func(string) { calls.Add(1) }})
+			}}})
 			_, err := mgr.SetConfig(ctx, "cas", project.SetConfigInput{Config: domain.ProjectConfig{DefaultBranch: "develop"}})
 			requireRevisionConflict(t, err)
-			if calls.Load() != 0 {
-				t.Fatalf("conflict invalidated model scope %d times", calls.Load())
-			}
 			row, _, err := store.GetProject(ctx, "cas")
 			if err != nil || !row.Config.IsZero() {
 				t.Fatalf("conflict wrote config: row=%#v err=%v", row, err)
@@ -134,11 +129,10 @@ func TestSetConfigEqualRevisionConcurrentWriters(t *testing.T) {
 			}
 			arrivals := make(chan struct{}, 2)
 			release := make(chan struct{})
-			var calls atomic.Int64
 			mgr := project.NewWithDeps(project.Deps{Store: snapshotProjectStore{Store: store, afterRead: func(domain.ProjectRecord) {
 				arrivals <- struct{}{}
 				<-release
-			}}, OnModelScopeChanged: func(string) { calls.Add(1) }})
+			}}})
 			type result struct {
 				p   project.Project
 				err error
@@ -168,8 +162,8 @@ func TestSetConfigEqualRevisionConcurrentWriters(t *testing.T) {
 					requireRevisionConflict(t, got.err)
 				}
 			}
-			if winners != 1 || calls.Load() != 1 {
-				t.Fatalf("winners=%d invalidations=%d, want exactly one each", winners, calls.Load())
+			if winners != 1 {
+				t.Fatalf("winners=%d, want exactly one", winners)
 			}
 			row, _, err := store.GetProject(ctx, "cas")
 			if err != nil || winner.Config == nil || winner.Config.DefaultBranch != row.Config.DefaultBranch || winner.Revision != row.Revision || row.Revision != 1 {
@@ -205,16 +199,12 @@ func TestSetConfigStalePreconditionDoesNotWrite(t *testing.T) {
 	if err := store.UpsertProject(ctx, domain.ProjectRecord{ID: "cas", Path: t.TempDir(), RegisteredAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
-	var calls atomic.Int64
-	mgr := project.NewWithDeps(project.Deps{Store: store, OnModelScopeChanged: func(string) { calls.Add(1) }})
+	mgr := project.New(store)
 	if _, err := mgr.SetConfig(ctx, "cas", project.SetConfigInput{}); err != nil {
 		t.Fatal(err)
 	}
 	_, err := mgr.SetConfig(ctx, "cas", configAtRevision(t, 0, "stale"))
 	requireRevisionConflict(t, err)
-	if calls.Load() != 1 {
-		t.Fatalf("stale precondition invalidated: calls=%d", calls.Load())
-	}
 	row, _, err := store.GetProject(ctx, "cas")
 	if err != nil || !row.Config.IsZero() || row.Revision != 1 {
 		t.Fatalf("stale precondition changed row: %#v %v", row, err)

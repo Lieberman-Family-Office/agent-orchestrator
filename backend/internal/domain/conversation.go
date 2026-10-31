@@ -154,6 +154,10 @@ const (
 	// the person to answer. It is not an approval: accepting a tool and supplying
 	// form data have different response contracts and different UI.
 	ActivityKindUserInput ActivityKind = "user_input"
+	// ActivityKindAOAction is a daemon-confirmed product mutation. The neutral
+	// action name lives in detail, not in a new kind per operation, so Chat can
+	// label the outcome without reading command text or tool prose.
+	ActivityKindAOAction ActivityKind = "ao_action"
 )
 
 // ActivityStatus is the lifecycle of one activity. A provider may omit an item's
@@ -487,6 +491,10 @@ type ConversationPlan struct {
 	// Explanation is the agent's note about the plan as a whole, when it gives one.
 	Explanation string                 `json:"explanation,omitempty"`
 	Steps       []ConversationPlanStep `json:"steps"`
+	// SpansTurns marks a list the agent keeps across turns, such as Claude's task
+	// list, rather than one plan per turn. A turn ending says nothing about its
+	// steps, and the copy each later turn receives is the same list, not a new plan.
+	SpansTurns bool `json:"spansTurns,omitempty"`
 }
 
 // ConversationPlanStep is one step of a plan.
@@ -543,6 +551,9 @@ type ConversationTurn struct {
 	// InterruptTargetProviderTurnID binds a priority prompt to its original interrupted turn.
 	InterruptTargetProviderTurnID string `json:"-"`
 	InterruptDelivered            bool   `json:"-"`
+	// ProviderInputText identifies a combined native prompt during history replay.
+	// The public transcript continues to use the individual message rows.
+	ProviderInputText string `json:"-"`
 	// RetryOfTurnID is the failed source whose durable prompt created this turn.
 	// It remains present after rollback so the source cannot offer a dead action.
 	RetryOfTurnID string `json:"retryOfTurnId,omitempty"`
@@ -626,8 +637,11 @@ type QueuedTurn struct {
 	InterruptTargetProviderTurnID string
 	// ClientMessageID is carried through to the provider so a dispatch retried
 	// after a crash cannot produce a second provider turn.
-	ClientMessageID string
-	Origin          MessageOrigin
+	ClientMessageID   string
+	Origin            MessageOrigin
+	SenderSessionID   string
+	SenderProjectID   string
+	SenderDisplayName string
 	// DeliveryContentJSON carries provider-neutral native prompt blocks through
 	// the durable queue. It is not rendered and never contains provider DTOs.
 	DeliveryContentJSON string
@@ -639,6 +653,7 @@ type QueuedTurn struct {
 type RetryPrompt struct {
 	Continuation        bool
 	Text                string
+	ProviderInputText   string
 	Origin              MessageOrigin
 	DeliveryContentJSON string
 	ActiveLineage       bool
@@ -667,7 +682,8 @@ type ConversationMessage struct {
 	// AuthoredByUser is an intake-only fact used to project user activity when
 	// AO delivered the message as automation. It is not part of the persisted
 	// delivery origin or the conversation API representation.
-	AuthoredByUser bool `json:"-"`
+	AuthoredByUser     bool `json:"-"`
+	SpawnOpeningPrompt bool `json:"-"`
 	// Streaming is true while more deltas are expected.
 	Streaming bool `json:"streaming"`
 	// ProviderItemID deduplicates provider observations of the same message.

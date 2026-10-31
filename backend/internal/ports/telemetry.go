@@ -50,6 +50,7 @@ type EventSink interface {
 // empty once the user has opted out.
 type TelemetryIdentity struct {
 	InstallID   string
+	AnonymousID string
 	CloudUserID string
 	GitHubLogin string
 	// OptedOut is true when export must stop: the user opted out, or the identity
@@ -62,6 +63,9 @@ func (i TelemetryIdentity) DistinctID() string {
 	if i.CloudUserID != "" {
 		return i.CloudUserID
 	}
+	if i.AnonymousID != "" {
+		return i.AnonymousID
+	}
 	return i.InstallID
 }
 
@@ -71,6 +75,8 @@ var ErrInvalidCloudUserID = errors.New("invalid cloud user id")
 // TelemetryIdentityStore holds the live telemetry identity for the daemon.
 type TelemetryIdentityStore interface {
 	Snapshot() TelemetryIdentity
+	OptedOut() bool
+	ExportSuppressed() bool
 	// SetCloudUserID records the signed-in AO Cloud user ("" on sign-out). It
 	// returns ErrInvalidCloudUserID when the id is not a plausible AO Cloud user id,
 	// and another error when the identity state could not be made durable, in

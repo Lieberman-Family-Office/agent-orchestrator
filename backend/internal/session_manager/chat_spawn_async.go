@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -116,13 +115,34 @@ const asyncChatSpawnBudget = 10 * time.Minute
 func (m *Manager) completeAsyncChatSpawn(ctx context.Context, in asyncChatSpawn) {
 	id := in.record.ID
 	totalStarted := time.Now()
-	taskName, cancelNaming := m.startTaskNaming(ctx, in.cfg, in.record, in.project.Config)
-	defer cancelNaming()
+	// The naming call is its own provider process. It starts once this
+	// session's provider is up and has its prompt, so it does not compete with
+	// that start for CPU; the branch is kept private from here until it settles.
+	var taskName func() generatedTaskName
+	cancelNaming := context.CancelFunc(func() {})
+	if taskNamingApplies(in.cfg) {
+		m.setBranchNaming(id, true)
+		// Until naming starts, a failed start settles the flag itself.
+		cancelNaming = func() { m.setBranchNaming(id, false) }
+	}
+	namingHandedOff := false
+	defer func() {
+		if !namingHandedOff {
+			cancelNaming()
+		}
+	}()
 	stageStarted := totalStarted
 	var ws ports.WorkspaceInfo
 	var workspaceProject *ports.WorkspaceProjectInfo
 	var err error
 	reusePublishedWorkspace := in.retry && in.record.Metadata.WorkspacePath != ""
+	if reusePublishedWorkspace {
+		if missing, _ := workspacePathMissing(in.record.Metadata.WorkspacePath); missing {
+			// A saved worktree that no longer exists (removed by hand, or left
+			// mid-move by an older build) is created again, with every step shown.
+			reusePublishedWorkspace, in.record.ProvisionSteps = false, nil
+		}
+	}
 	setupCompleted := reusePublishedWorkspace && !unfinishedWorkspaceSetup(in.record) && slices.ContainsFunc(in.record.ProvisionSteps, func(step domain.SessionProvisionStep) bool {
 		return step.ID == domain.SessionProvisionStepSetup && step.Status == domain.SessionProvisionStepDone ||
 			step.ID == domain.SessionProvisionStepAgent && (step.Status == domain.SessionProvisionStepRunning || step.Status == domain.SessionProvisionStepDone)
@@ -158,20 +178,6 @@ func (m *Manager) completeAsyncChatSpawn(ctx context.Context, in asyncChatSpawn)
 	releaseWorkspaceGate := sync.OnceFunc(m.acquireWorkspaceGate(in.cfg.ProjectID))
 	ctx = context.WithValue(ctx, spawnWorkspaceGateKey{}, releaseWorkspaceGate)
 	defer releaseWorkspaceGate()
-	if in.retry {
-		info, recovered, recoveryErr := m.recoverTaskNaming(ctx, in.record)
-		if recoveryErr != nil {
-			m.failAsyncChatSpawn(ctx, id, recoveryErr)
-			return
-		}
-		if recovered {
-			ws = info.Root
-			reusePublishedWorkspace = true
-			if in.projectKind == domain.ProjectKindWorkspace {
-				workspaceProject = &info
-			}
-		}
-	}
 	if ws.Path == "" {
 		baseRefs := m.refreshDefaultBranchesBestEffort(ctx, in.project)
 		m.logAsyncChatSpawnStage(id, "default_branch_refresh", stageStarted)
@@ -194,47 +200,7 @@ func (m *Manager) completeAsyncChatSpawn(ctx context.Context, in asyncChatSpawn)
 		m.failAsyncChatSpawn(ctx, id, err)
 		return
 	}
-	if reusePublishedWorkspace && ws.Branch != "" && slices.Contains(plan, domain.SessionProvisionStepWorktree) {
-		namer, ok := m.workspace.(ports.WorkspaceTaskNamer)
-		if !ok {
-			m.failAsyncChatSpawn(ctx, id, errors.New("workspace cannot repair interrupted task naming"))
-			return
-		}
-		info := ports.WorkspaceProjectInfo{Root: ws}
-		if workspaceProject != nil {
-			info = *workspaceProject
-			for i := range info.Worktrees {
-				info.Worktrees[i].Path = filepath.Join(ws.Path, filepath.FromSlash(info.Worktrees[i].RelativePath))
-			}
-		}
-		info, repairErr := namer.RepairTaskWorkspace(ctx, info)
-		persistErr := m.persistTaskWorkspace(ctx, id, info, in.record.Metadata.WorkspacePath)
-		ws = info.Root
-		if workspaceProject != nil {
-			workspaceProject = &info
-		}
-		if err := errors.Join(repairErr, persistErr); err != nil {
-			m.failAsyncChatSpawn(ctx, id, wrapSpawnStage(id, ErrWorkspaceCreate, err))
-			return
-		}
-	}
 	m.logAsyncChatSpawnStage(id, "workspace_create", stageStarted)
-	if taskName != nil && !reusePublishedWorkspace {
-		// A saved recovery path is not proof setup finished. Require its checkpoint
-		// before naming publishes that path so retry can resume unfinished stages.
-		if err := m.store.SetSessionProvisionSteps(ctx, id, progress.steps, m.clock()); err != nil {
-			m.cleanupAsyncChatWorkspace(ctx, id, ws, workspaceProject)
-			m.failAsyncChatSpawn(ctx, id, err)
-			return
-		}
-		stageStarted = time.Now()
-		ws, workspaceProject, err = m.nameTaskWorkspace(ctx, in.record, ws, workspaceProject, taskName())
-		if err != nil {
-			m.failAsyncChatSpawn(ctx, id, wrapSpawnStage(id, ErrWorkspaceCreate, err))
-			return
-		}
-		m.logAsyncChatSpawnStage(id, "workspace_name", stageStarted)
-	}
 	progress.complete(ctx, domain.SessionProvisionStepWorktree)
 	stageStarted = time.Now()
 	if err := m.publishSpawnWorkspace(ctx, id, ws); err != nil {
@@ -306,6 +272,8 @@ func (m *Manager) completeAsyncChatSpawn(ctx context.Context, in asyncChatSpawn)
 		m.failAsyncChatSpawn(ctx, id, err)
 		return
 	}
+	// The agent owns the checkout now; nothing below touches the workspace.
+	releaseWorkspaceGate()
 	m.logAsyncChatSpawnStage(id, "controller_start", stageStarted)
 	stageStarted = time.Now()
 	if err := m.chat.DrainChatQueue(ctx, id); err != nil {
@@ -313,6 +281,7 @@ func (m *Manager) completeAsyncChatSpawn(ctx context.Context, in asyncChatSpawn)
 		return
 	}
 	m.logAsyncChatSpawnStage(id, "queue_drain", stageStarted)
+	taskName, cancelNaming = m.startTaskNaming(in.cfg, in.record, in.project.Config)
 	stageStarted = time.Now()
 	if _, err := m.setProvisionState(ctx, id, domain.SessionProvisionReady, ""); err != nil {
 		m.failAsyncChatSpawn(ctx, id, err)
@@ -320,6 +289,9 @@ func (m *Manager) completeAsyncChatSpawn(ctx context.Context, in asyncChatSpawn)
 	}
 	m.logAsyncChatSpawnStage(id, "mark_ready", stageStarted)
 	progress.complete(ctx, domain.SessionProvisionStepAgent)
+	// Only a start that succeeded gets a generated branch name.
+	namingHandedOff = true
+	m.nameTaskBranchLater(ctx, record, ws, workspaceProject, taskName, cancelNaming)
 	m.logAsyncChatSpawnStage(id, "total", totalStarted)
 }
 
@@ -327,7 +299,6 @@ func (m *Manager) completeAsyncChatSpawn(ctx context.Context, in asyncChatSpawn)
 // starting the next is a single write, so the checklist never shows a gap
 // between them. Setup uses this durable checkpoint for retry and recovery;
 // its writes must succeed before setup or controller launch can proceed.
-// Naming also requires this checkpoint before publishing a moved workspace.
 // Other progress writes remain best effort.
 type provisionProgress struct {
 	m     *Manager
@@ -398,7 +369,7 @@ func provisionPlan(in asyncChatSpawn, reusePublishedWorkspace, setupCompleted bo
 			}
 		}
 	}
-	if !setupCompleted && !slices.Contains(plan, domain.SessionProvisionStepSetup) && (in.cfg.NameFromPrompt || len(in.project.Config.Symlinks) > 0 || slices.ContainsFunc(in.project.Config.PostCreate, func(command string) bool {
+	if !setupCompleted && !slices.Contains(plan, domain.SessionProvisionStepSetup) && (len(in.project.Config.Symlinks) > 0 || slices.ContainsFunc(in.project.Config.PostCreate, func(command string) bool {
 		return strings.TrimSpace(command) != ""
 	})) {
 		plan = append(plan, domain.SessionProvisionStepSetup)
@@ -519,16 +490,25 @@ func (m *Manager) retryFailedChatSpawn(ctx context.Context, rec domain.SessionRe
 		return RestoreResult{}, false, wrapSpawnStage(rec.ID, ErrSpawnSystemPrompt, err)
 	}
 	config := restoredAgentConfig(rec, project.Config)
-	if rec.Metadata.Model != "" {
-		config.Model = rec.Metadata.Model
-	}
-	if rec.Metadata.Permissions != "" {
-		config.Permissions = rec.Metadata.Permissions
-	}
 	cfg := ports.SpawnConfig{
 		ProjectID: rec.ProjectID, IssueID: rec.IssueID, Kind: rec.Kind,
 		Harness: rec.Harness, RequestedMode: domain.SessionModeChat,
 		AgentConfig: config, AgentConfigResolved: true, Async: true,
+	}
+	if rec.Harness == domain.HarnessCodex {
+		// ChatUI can change the saved model independently of effort, and provider
+		// capabilities can change between attempts. Validate the actual pair
+		// without merging today's project defaults back into the saved choices.
+		cfg.EffortOverride = true
+		resolved, err := m.resolveAgentConfig(ctx, cfg, domain.ProjectConfig{})
+		if errors.Is(err, ports.ErrUnsupportedEffort) {
+			cfg.AgentConfig.Effort = "" // use this model's provider default
+			resolved, err = m.resolveAgentConfig(ctx, cfg, domain.ProjectConfig{})
+		}
+		if err != nil {
+			return RestoreResult{}, false, err
+		}
+		cfg.AgentConfig = resolved
 	}
 	projectKind := projectKindForSession(project, rec.ProjectID)
 	branch := rec.Metadata.Branch
