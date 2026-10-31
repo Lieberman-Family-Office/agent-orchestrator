@@ -25,6 +25,8 @@ export const aoBridge: AoBridge =
 			onOpenFolderPath: () => () => undefined,
 			onNewSessionShortcut: () => () => undefined,
 			onKeyboardShortcutsHelp: () => () => undefined,
+			onQuitConfirmRequest: () => () => undefined,
+			resolveQuitConfirm: () => undefined,
 			onNewShellTerminalShortcut: () => () => undefined,
 			onCloseShellTerminalShortcut: () => () => undefined,
 			setCloseShellTerminalShortcutEnabled: () => undefined,
@@ -35,6 +37,7 @@ export const aoBridge: AoBridge =
 			onPreviousTabShortcut: () => () => undefined,
 			onNextTabShortcut: () => () => undefined,
 			onShortcut: () => () => undefined,
+			onScrollPhase: () => () => undefined,
 		},
 		terminal: {
 			saveDroppedFile: async () => "",
@@ -87,6 +90,14 @@ export const aoBridge: AoBridge =
 				return true;
 			},
 		},
+		cloudArtifact: {
+			fetch: async (url: string) => {
+				const response = await fetch(url);
+				if (!response.ok) throw new Error(`Artifact request failed (${response.status})`);
+				return new Uint8Array(await response.arrayBuffer());
+			},
+			onFrameNavigated: () => () => undefined,
+		},
 		daemon: {
 			getStatus: async () => ({
 				state: "stopped",
@@ -97,7 +108,7 @@ export const aoBridge: AoBridge =
 			restart: async () => ({ state: "starting" }),
 			onStatus: () => () => undefined,
 		},
-		sideChats: { capture: async () => undefined },
+		sideChats: { capture: async () => undefined, confirmClose: async () => undefined, getPendingCloses: async () => [], onPendingClosesChanged: () => () => {} },
 		editorHandoff: {
 			getState: async () => ({
 				targets: [],
@@ -105,6 +116,10 @@ export const aoBridge: AoBridge =
 				workspaceAvailable: false,
 				unavailableReason: "Desktop app is required to open a workspace.",
 			}),
+			getEditors: async () => ({ editors: [], preferredEditorId: "cursor" }),
+			setPreferredEditor: async () => {
+				throw new Error("Desktop app is required to choose an editor.");
+			},
 			open: async () => {
 				throw new Error("Desktop app is required to open a workspace.");
 			},
@@ -273,7 +288,8 @@ export const aoBridge: AoBridge =
 				return { id, name, createdAt: now, updatedAt: now };
 			},
 			clear: async () => undefined,
-			delete: async () => undefined,
+			usage: async () => ({ sessions: [] }),
+			delete: async () => ({}),
 			setDefault: async () => undefined,
 			discoverImportSources: async () => ({ sources: [] }),
 			import: async () => ({ sourceName: "", entries: [] }),
@@ -365,6 +381,8 @@ export const aoBridge: AoBridge =
 				throw new Error("AO Cloud sign-in requires the desktop app.");
 			},
 			onSessionChanged: () => () => undefined,
+			onOpenShareLink: () => () => undefined,
+			takePendingShareLink: async () => null,
 		},
 		cloudCp: {
 			request: async () => {

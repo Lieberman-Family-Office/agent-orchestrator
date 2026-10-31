@@ -35,11 +35,15 @@ var migrationsFS embed.FS
 
 // pragmas are applied on every connection open. WAL + NORMAL lets readers run
 // concurrently with the writer; busy_timeout absorbs brief writer contention;
-// foreign_keys enforces the cascades and the CDC triggers' lookups.
+// foreign_keys enforces the cascades and the CDC triggers' lookups;
+// journal_size_limit (32 MiB, per connection) makes the writer cut the -wal file
+// back to that size when it resets the log, instead of leaving it at its
+// high-water mark until the last connection closes.
 const pragmas = "?_pragma=journal_mode(WAL)" +
 	"&_pragma=busy_timeout(5000)" +
 	"&_pragma=foreign_keys(ON)" +
-	"&_pragma=synchronous(NORMAL)"
+	"&_pragma=synchronous(NORMAL)" +
+	"&_pragma=journal_size_limit(33554432)"
 
 const readOnlyPragmas = "?mode=ro" +
 	"&_pragma=busy_timeout(5000)" +
@@ -323,6 +327,9 @@ func migrate(db *sql.DB) error {
 	if err := repairRenumberedUsageCostMigrationHistory(db); err != nil {
 		return fmt.Errorf("repair renumbered usage-cost migration history: %w", err)
 	}
+	if err := repairRenumberedComputerUseMigrationHistory(db); err != nil {
+		return fmt.Errorf("repair renumbered computer-use migration history: %w", err)
+	}
 	if err := prepareCancelledConversationTurnsMigration(db); err != nil {
 		return fmt.Errorf("prepare cancelled conversation-turn migration: %w", err)
 	}
@@ -372,6 +379,11 @@ func migrate(db *sql.DB) error {
 	return reconcileSchema(db)
 }
 
+const (
+	providerCompletionIndexBridgeVersion   int64 = 20261022144835404
+	providerCompletionIndexUpstreamVersion int64 = 20261022144835405
+)
+
 // repairCustom0134MigrationHistory moves custom 190/191 and fork 195–197 to
 // 198–200, preserving their SQL bodies and upstream's distinct identities.
 // Schema and history must agree. All identity changes commit together; partial
@@ -386,8 +398,8 @@ func repairCustom0134MigrationHistory(db *sql.DB) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	applied := make(map[int]int)
-	for _, version := range []int{190, 191, 195, 196, 197, 198, 199, 200, 204} {
+	applied := make(map[int64]int)
+	for _, version := range []int64{190, 191, 195, 196, 197, 198, 199, 200, 204, providerCompletionIndexBridgeVersion, providerCompletionIndexUpstreamVersion} {
 		var state int
 		if err := tx.QueryRow(`SELECT COALESCE((SELECT is_applied FROM goose_db_version WHERE version_id=? ORDER BY id DESC LIMIT 1),0)`, version).Scan(&state); err != nil {
 			return err
@@ -455,7 +467,8 @@ func repairCustom0134MigrationHistory(db *sql.DB) error {
 		applied[198] = 0
 	}
 	for _, migration := range []struct {
-		legacy, old, next, want, upstream     int
+		legacy, old, next                     int64
+		want, upstream                        int
 		file, presence, valid, legacyUpstream string
 	}{
 		{190, 195, 198, 1, requestedOutput, "0198_project_revision.sql",
@@ -478,7 +491,7 @@ func repairCustom0134MigrationHistory(db *sql.DB) error {
 		if err := tx.QueryRow(migration.legacyUpstream).Scan(&legacyUpstream); err != nil {
 			return err
 		}
-		old := 0
+		old := int64(0)
 		if applied[migration.legacy] == 1 && legacyUpstream == 0 {
 			old = migration.legacy
 		}
@@ -495,7 +508,18 @@ func repairCustom0134MigrationHistory(db *sql.DB) error {
 				(migration.upstream == 0 && (applied[195] != 1 || applied[196] != 1))) {
 			return errors.New("migration 197 identity is ambiguous")
 		}
+		if migration.next == 200 && applied[providerCompletionIndexUpstreamVersion] == 1 && applied[providerCompletionIndexBridgeVersion] != 1 {
+			return errors.New("upstream provider completion index has no applied bridge")
+		}
 		if present == 0 {
+			if migration.next == 200 && applied[providerCompletionIndexBridgeVersion] == 1 {
+				// A crash between the bridge and upstream leaves no index.
+				// The bridge does not substitute for the fork's identity.
+				if old == 0 && applied[200] == 1 && applied[providerCompletionIndexUpstreamVersion] == 0 {
+					continue
+				}
+				return errors.New("provider completion index history has no matching schema or fork identity")
+			}
 			if migration.old == 195 {
 				var triggers int
 				if err := tx.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name IN ('projects_revision_guard','projects_revision_update')`).Scan(&triggers); err != nil {
@@ -531,6 +555,9 @@ func repairCustom0134MigrationHistory(db *sql.DB) error {
 			}
 		}
 		if migration.old == 197 {
+			if applied[providerCompletionIndexUpstreamVersion] == 1 {
+				migration.file = "20261022144835405_provider_events_turn_completed_index.sql"
+			}
 			if err := validateMigrationObject(tx, migration.file, "index", "idx_conversation_provider_events_turn_completed"); err != nil {
 				return err
 			}
@@ -605,6 +632,37 @@ func validateMigrationObject(tx *sql.Tx, file, kind, name string, updates ...str
 		return fmt.Errorf("migration %s %s is incompatible", kind, name)
 	}
 	return nil
+}
+
+const (
+	computerUseBranchMigrationVersion int64 = 20261021135126673
+	computerUseMigrationVersion       int64 = 20261023123504180
+)
+
+// repairRenumberedComputerUseMigrationHistory keeps development databases that
+// ran this branch before its app_settings.computer_use migration moved from
+// 20261021135126673 to 20261023123504180, after main's migrations. Such a
+// database has the column and a receipt under the old number; the receipt
+// moves to the new number so goose does not add the column twice.
+func repairRenumberedComputerUseMigrationHistory(db *sql.DB) error {
+	var gooseTable int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'goose_db_version'`).Scan(&gooseTable); err != nil {
+		return err
+	}
+	if gooseTable == 0 {
+		return nil
+	}
+	var column int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('app_settings') WHERE name = 'computer_use'`).Scan(&column); err != nil {
+		return err
+	}
+	if column == 0 {
+		return nil
+	}
+	_, err := db.Exec(`UPDATE goose_db_version SET version_id = ?
+WHERE version_id = ? AND NOT EXISTS (SELECT 1 FROM goose_db_version WHERE version_id = ?)`,
+		computerUseMigrationVersion, computerUseBranchMigrationVersion, computerUseMigrationVersion)
+	return err
 }
 
 const (

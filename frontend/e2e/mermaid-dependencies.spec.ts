@@ -9,7 +9,7 @@ test("KaTeX rejects inherited trust settings @T0", () => {
 });
 
 // Exercise the real Mermaid/KaTeX/DOMPurify stack; unit tests mock SVG layout.
-// ponytail: Remove the KaTeX override when Mermaid 11 accepts a patched version.
+// ponytail: Remove the KaTeX override when all consumers accept the patched version.
 test("patched diagram dependencies preserve math and sanitize labels @T0", async ({ page }) => {
 	await installFakeAgent(page);
 	await page.route("http://127.0.0.1:8080/api/v1/**", (route) => route.fulfill({ json: { agents: [] } }));

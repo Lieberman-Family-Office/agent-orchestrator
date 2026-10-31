@@ -34,7 +34,8 @@ func TestCustom0134HistoryRepairRollsBackIncompleteSchema(t *testing.T) {
 }
 
 func TestOfficialAndFreshDatabasesOpenTwice(t *testing.T) {
-	for _, version := range []int64{0, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 212} {
+	// These are fork migration snapshots, not official release database fixtures.
+	for _, version := range []int64{0, 194, 195, 196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 212, 20261022144835404, 20261022144835405} {
 		t.Run(fmt.Sprint(version), func(t *testing.T) {
 			dir := t.TempDir()
 			if version != 0 {
@@ -51,6 +52,14 @@ func TestOfficialAndFreshDatabasesOpenTwice(t *testing.T) {
 					if _, err := db.Exec(`INSERT INTO session_artifact_versions(session_id,path,version,sha256,size,content_type,mtime,created_at) VALUES('official-1','retained.txt',1,'original-sha',7,'text/plain',0,CURRENT_TIMESTAMP)`); err != nil {
 						t.Fatal(err)
 					}
+				}
+				if version >= 200 {
+					mustExec(t, db, `INSERT INTO conversations(id,scope,project_id,session_id,current_session_id,active_branch_id,created_at,updated_at) VALUES('retained','session','official','official-1','official-1','retained:root',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)`)
+					mustExec(t, db, `INSERT INTO conversation_branches(id,conversation_id,session_id,created_at) VALUES('retained:root','retained','official-1',CURRENT_TIMESTAMP)`)
+					mustExec(t, db, `INSERT INTO conversation_provider_events(id,conversation_id,session_id,provider_event_id,method,payload_json,branch_id,received_at) VALUES(42,'retained','official-1','retained-event','turn.completed','{"providerTurnId":"retained-turn","turnState":"completed"}','retained:root','2026-10-20 12:00:00')`)
+				}
+				if version == 20261022144835404 {
+					assertTurnCompletedIndexColumns(t, db, "")
 				}
 				if err := db.Close(); err != nil {
 					t.Fatal(err)
@@ -89,6 +98,29 @@ func TestOfficialAndFreshDatabasesOpenTwice(t *testing.T) {
 				if err := db.QueryRow(`SELECT sha256 FROM session_artifact_versions WHERE session_id='official-1' AND path='retained.txt' AND version=1`).Scan(&hash); err != nil || hash != "original-sha" {
 					t.Fatalf("artifact hash=%q error=%v", hash, err)
 				}
+			}
+			assertTurnCompletedIndexColumns(t, db, "branch_id,id")
+			var receipts int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM goose_db_version WHERE version_id IN (20261022144835404,20261022144835405) AND is_applied=1`).Scan(&receipts); err != nil || receipts != 2 {
+				t.Fatalf("index migration receipts=%d error=%v", receipts, err)
+			}
+			if version >= 200 {
+				var retained int
+				if err := db.QueryRow(`SELECT COUNT(*) FROM conversation_provider_events WHERE id=42 AND conversation_id='retained' AND session_id='official-1' AND provider_event_id='retained-event' AND method='turn.completed' AND payload_json='{"providerTurnId":"retained-turn","turnState":"completed"}' AND branch_id='retained:root' AND received_at='2026-10-20 12:00:00'`).Scan(&retained); err != nil || retained != 1 {
+					t.Fatalf("retained archive rows=%d error=%v", retained, err)
+				}
+			}
+			var integrity string
+			if err := db.QueryRow(`PRAGMA integrity_check`).Scan(&integrity); err != nil || integrity != "ok" {
+				t.Fatalf("integrity=%q error=%v", integrity, err)
+			}
+			rows, err := db.Query(`PRAGMA foreign_key_check`)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rows.Close()
+			if rows.Next() || rows.Err() != nil {
+				t.Fatal("foreign key validation failed")
 			}
 			if version != 0 {
 				var config string
