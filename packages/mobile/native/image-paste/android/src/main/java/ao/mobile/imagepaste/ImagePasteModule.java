@@ -142,8 +142,14 @@ public final class ImagePasteModule extends ReactContextBaseJavaModule {
   }
 
   // NativeEventEmitter's contract; iOS counts listeners, Android always delivers.
-  @ReactMethod public void addListener(String eventName) {}
-  @ReactMethod public void removeListeners(double count) {}
+  @ReactMethod public void addListener(String eventName) {
+    if (eventName == null) throw new IllegalArgumentException("eventName must not be null");
+  }
+  @ReactMethod public void removeListeners(double count) {
+    if (!Double.isFinite(count) || count < 0 || count != Math.floor(count)) {
+      throw new IllegalArgumentException("count must be a finite non-negative integer");
+    }
+  }
 
   @ReactMethod public void detach(int tag) {
     UiThreadUtil.runOnUiThread(() -> detachNow(tag));

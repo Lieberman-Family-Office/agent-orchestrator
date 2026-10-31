@@ -160,6 +160,7 @@ def main():
             if saved.get("repo") == REPO and as_of - timedelta(days=30) <= pinned <= as_of:
                 as_of = pinned
         except (OSError, ValueError, KeyError, TypeError):
+            # Invalid resume metadata leaves the current time as the extraction bound.
             pass
     start = as_of - timedelta(days=HISTORY_DAYS)
     output = ROOT / "research/ownership-raw.json"

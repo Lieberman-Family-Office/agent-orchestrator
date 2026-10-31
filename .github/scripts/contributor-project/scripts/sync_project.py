@@ -639,6 +639,7 @@ def _api_request(arguments: list[str], request: str | None = None) -> Any:
                     try:
                         delay = (parsedate_to_datetime(retry[1]) - datetime.now(timezone.utc)).total_seconds()
                     except (TypeError, ValueError):
+                        # Invalid HTTP dates retain the default 60-second delay.
                         pass
             elif re.search(r"(?im)^x-ratelimit-remaining:[ \t]*0[ \t]*$", headers):
                 reset = re.search(r"(?im)^x-ratelimit-reset:[ \t]*(\d+)", headers)
