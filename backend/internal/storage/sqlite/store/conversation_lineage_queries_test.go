@@ -17,12 +17,11 @@ import (
 )
 
 // Four statements keep a turn only when the active lineage holds one of its
-// messages or activities at or before the fork point. That EXISTS is
-// correlated on turn_id, which no index covers. Without a conversation_id
-// bound it scans the whole message and activity tables, and once
-// sqlite_stat1 exists the planner skip-scans (branch_id, sequence) across
-// every branch in the database instead. Bound by conversation_id, it
-// range-seeks the (conversation_id, sequence) index.
+// messages or activities at or before the fork point. The fork's indexes let
+// that EXISTS seek by globally unique turn_id and sequence. Without those
+// indexes, the conversation_id bound lets it seek the conversation's range.
+// Neither path may scan unrelated turns or conversations. The SQL must retain
+// both conversation_id bounds regardless of the index chosen.
 const (
 	lineageMessageBound  = "lineage_message.conversation_id = conversation_turns.conversation_id"
 	lineageActivityBound = "lineage_activity.conversation_id = conversation_turns.conversation_id"
@@ -210,12 +209,20 @@ func TestLineageTurnQueriesAreBoundByConversation(t *testing.T) {
 		return &lineageProbe{db: db}
 	}
 
-	// The same four statements, before and after the database has statistics.
-	for _, stage := range []string{"no statistics", "after ANALYZE"} {
-		if stage == "after ANALYZE" {
+	// Exercise statistics and the fallback when the fork's turn indexes are absent.
+	for _, stage := range []string{"no statistics", "after ANALYZE", "without turn indexes"} {
+		if stage != "no statistics" {
 			writer, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
 			if err != nil {
 				t.Fatalf("open analyze connection: %v", err)
+			}
+			t.Cleanup(func() { _ = writer.Close() })
+			if stage == "without turn indexes" {
+				for _, table := range []string{"messages", "activities"} {
+					if _, err := writer.Exec("DROP INDEX idx_conversation_" + table + "_turn_sequence"); err != nil {
+						t.Fatalf("drop test database turn index: %v", err)
+					}
+				}
 			}
 			if _, err := writer.Exec("ANALYZE"); err != nil {
 				t.Fatalf("ANALYZE: %v", err)
@@ -250,7 +257,7 @@ func TestLineageTurnQueriesAreBoundByConversation(t *testing.T) {
 					t.Fatalf("%s: %v", name, err)
 				}
 
-				// Plan: the lineage lookups seek the conversation's own range.
+				// Plan: seek this conversation or a globally unique turn, never scan.
 				plan := probe.plan(t)
 				for _, table := range []string{"lineage_message", "lineage_activity"} {
 					found := false
@@ -259,8 +266,10 @@ func TestLineageTurnQueriesAreBoundByConversation(t *testing.T) {
 							continue
 						}
 						found = true
-						if !strings.Contains(line, "conversation_id=?") || strings.Contains(line, "ANY(") || strings.HasPrefix(strings.TrimSpace(line), "SCAN") {
-							t.Errorf("%s does not seek by conversation_id: %q\nfull plan:\n%s", table, line, plan)
+						conversationSeek := strings.Contains(line, "(conversation_id=?")
+						turnSeek := strings.Contains(line, "(turn_id=? AND sequence<?)")
+						if !strings.HasPrefix(line, "SEARCH "+table+" ") || (!conversationSeek && !turnSeek) || strings.Contains(line, "ANY(") {
+							t.Errorf("%s does not seek by conversation or turn: %q\nfull plan:\n%s", table, line, plan)
 						}
 					}
 					if !found {
