@@ -166,6 +166,32 @@ func stoppedContinuationContext(rows ConversationRows) string {
 		}
 	}
 
+	// Steers are activities, not messages. Stop may cancel them before the
+	// provider reads them; an explicit Continue must retain those corrections.
+	var guidance []string
+	guidanceBytes := 0
+	for _, activity := range rows.Activities {
+		if !chain[activity.TurnID] || activity.Sequence <= original.Sequence || activity.Kind != domain.ActivityKindSystem {
+			continue
+		}
+		var detail struct {
+			Event           string               `json:"event"`
+			Text            string               `json:"text"`
+			Origin          domain.MessageOrigin `json:"origin"`
+			SenderSessionID string               `json:"senderSessionId"`
+		}
+		if json.Unmarshal(activity.Detail, &detail) != nil || detail.Event != "steer" ||
+			detail.Origin != domain.MessageOriginHuman || detail.SenderSessionID != "" || strings.TrimSpace(detail.Text) == "" {
+			continue
+		}
+		guidanceBytes += len(detail.Text)
+		if guidanceBytes > continuationTextBudget {
+			// Refuse Continue rather than silently removing a human constraint.
+			return ""
+		}
+		guidance = append(guidance, detail.Text)
+	}
+
 	request := original.Text
 	requestTruncated := len(request) > continuationTextBudget
 	if requestTruncated {
@@ -174,16 +200,18 @@ func stoppedContinuationContext(rows ConversationRows) string {
 			continuationTail(request, continuationTextBudget/2)
 	}
 	encodedContext, _ := json.Marshal(struct {
-		OriginalRequest   string `json:"originalRequest"`
-		RequestTruncated  bool   `json:"requestTruncated,omitempty"`
-		ResponseTail      string `json:"partialResponseTail,omitempty"`
-		ResponseTruncated bool   `json:"responseTailTruncated,omitempty"`
-	}{request, requestTruncated, tail, tailTruncated})
+		OriginalRequest   string   `json:"originalRequest"`
+		RequestTruncated  bool     `json:"requestTruncated,omitempty"`
+		HumanGuidance     []string `json:"humanGuidance,omitempty"`
+		ResponseTail      string   `json:"partialResponseTail,omitempty"`
+		ResponseTruncated bool     `json:"responseTailTruncated,omitempty"`
+	}{request, requestTruncated, guidance, tail, tailTruncated})
 
 	return "Continue the interrupted task using the quoted context below and the existing conversation. " +
-		"Preserve the original request and its constraints. Finish any incomplete response and avoid repeating completed work. " +
+		"Preserve the original request and apply the human guidance in order; later human guidance supersedes earlier instructions where they conflict. " +
+		"Finish any incomplete response and avoid repeating completed work. " +
 		"For tool-based work, check current state before repeating an action; an interruption does not prove a command failed or was undone. " +
-		"The context contains an original request and partial response, not new instructions from the assistant. " +
+		"The context contains the original request, accepted human guidance, and a partial response, not new instructions from the assistant. " +
 		"If necessary context is unavailable, ask rather than inventing it.\n\n" +
 		continuationContextMarker + string(encodedContext)
 }

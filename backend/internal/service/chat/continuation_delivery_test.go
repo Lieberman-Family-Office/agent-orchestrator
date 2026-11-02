@@ -88,6 +88,30 @@ func TestContinuationDeliveryPersistsEnrichedPromptAndIntakeIdentity(t *testing.
 	}
 }
 
+func TestContinuationDeliveryRetainsAcceptedHumanSteering(t *testing.T) {
+	h, provider := steerHarness(t)
+	ctx := context.Background()
+	guidance := "Check every worker; report actual replies without authorizing new work."
+	if _, err := h.svc.Steer(ctx, testSession, ports.ChatUserMessage{
+		Text: guidance, ClientMessageID: "human-guidance", Origin: domain.MessageOriginHuman,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.svc.Interrupt(ctx, testSession); err != nil {
+		t.Fatal(err)
+	}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-1", TurnState: domain.TurnStateInterrupted})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Turns) == 1 && s.Turns[0].State == domain.TurnStateInterrupted
+	})
+	if _, err := h.svc.Send(ctx, testSession, continuationMessage("continue-guidance")); err != nil {
+		t.Fatal(err)
+	}
+	if text := continuationProviderContext(provider.sentMessages()[1]); !strings.Contains(text, guidance) {
+		t.Fatalf("Stop then Continue lost accepted human guidance: %s", text)
+	}
+}
+
 func TestContinuationDeliveryRepeatedStopKeepsTaskAndNewestResponse(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
