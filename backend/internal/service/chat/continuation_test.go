@@ -67,6 +67,63 @@ func TestStoppedContinuationContextRepeatedStopsKeepOriginalRequest(t *testing.T
 	}
 }
 
+func TestStoppedContinuationContextRetainsHumanSteeringAcrossStops(t *testing.T) {
+	rows := continuationRows()
+	rows.Turns = append(rows.Turns, domain.ConversationTurn{ID: "continued", State: domain.TurnStateInterrupted, ProviderTurnID: "p-continued"})
+	rows.Messages = append(rows.Messages, domain.ConversationMessage{
+		ID: "continue-user", TurnID: "continued", Sequence: 7, Role: domain.MessageRoleUser, Text: "Continue", Continuation: true,
+	})
+	rows.Activities = []domain.ConversationActivity{
+		{TurnID: "old", Sequence: 2, Kind: domain.ActivityKindSystem, Detail: []byte(`{"event":"steer","text":"OLD_GUIDANCE","origin":"human"}`)},
+		{TurnID: "task", Sequence: 5, Kind: domain.ActivityKindSystem, Detail: []byte(`{"event":"steer","text":"Check every worker; do not authorize new work.","origin":"human"}`)},
+		{TurnID: "task", Sequence: 6, Kind: domain.ActivityKindSystem, Detail: []byte(`{"event":"steer","text":"WORKER_GUIDANCE","origin":"automation","senderSessionId":"worker-1"}`)},
+		{TurnID: "continued", Sequence: 8, Kind: domain.ActivityKindSystem, Detail: []byte(`{"event":"steer","text":"Report delivery and actual replies separately.","origin":"human"}`)},
+		{TurnID: "continued", Sequence: 9, Kind: domain.ActivityKindSystem, Detail: []byte(`{"event":"steer","text":"SPOOFED_GUIDANCE","origin":"human","senderSessionId":"worker-2"}`)},
+		{TurnID: "withdrawn", Sequence: 10, Kind: domain.ActivityKindSystem, Detail: []byte(`{"event":"steer","text":"WITHDRAWN_GUIDANCE","origin":"human"}`)},
+	}
+	reminder := stoppedContinuationContext(rows)
+	for _, want := range []string{rows.Messages[2].Text, "Check every worker; do not authorize new work.", "Report delivery and actual replies separately."} {
+		if !strings.Contains(reminder, want) {
+			t.Fatalf("Continue lost human guidance %q: %s", want, reminder)
+		}
+	}
+	for _, unwanted := range []string{"OLD_GUIDANCE", "WORKER_GUIDANCE", "SPOOFED_GUIDANCE", "WITHDRAWN_GUIDANCE"} {
+		if strings.Contains(reminder, unwanted) {
+			t.Fatalf("Continue misattributed guidance %q: %s", unwanted, reminder)
+		}
+	}
+}
+
+func TestPrepareContinuationRefusesOversizedHumanGuidance(t *testing.T) {
+	rows := continuationRows()
+	for i := range 2 {
+		detail, err := json.Marshal(map[string]string{
+			"event": "steer", "origin": "human", "text": strings.Repeat("g", continuationTextBudget/2),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows.Activities = append(rows.Activities, domain.ConversationActivity{
+			TurnID: "task", Sequence: int64(5 + i), Kind: domain.ActivityKindSystem, Detail: detail,
+		})
+	}
+	controller := Controller{continuationReader: SnapshotReaderFunc(func(context.Context, string) (ConversationRows, error) {
+		return rows, nil
+	})}
+	request := ports.ChatUserMessage{Text: "Continue", Continuation: true}
+	if _, err := controller.prepareContinuation(context.Background(), request); err != nil {
+		t.Fatalf("guidance at the budget was refused: %v", err)
+	}
+	rows.Activities = append(rows.Activities, domain.ConversationActivity{
+		TurnID: "task", Sequence: 7, Kind: domain.ActivityKindSystem,
+		Detail: []byte(`{"event":"steer","origin":"human","text":"g"}`),
+	})
+	got, err := controller.prepareContinuation(context.Background(), request)
+	if !errors.Is(err, ErrContinuationUnavailable) || len(got.Content) != 0 {
+		t.Fatalf("oversized guidance started a turn with dropped constraints: %#v, %v", got, err)
+	}
+}
+
 func TestStoppedContinuationContextIgnoresWithdrawnWork(t *testing.T) {
 	rows := continuationRows()
 	rolledBack := time.Now()
