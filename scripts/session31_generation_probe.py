@@ -187,6 +187,8 @@ def apply_rules():
 
 
 def self_check():
+    if not __debug__:
+        raise RuntimeError("Self-check requires assertions; run Python without -O")
     events = [
         {"type": "api-request-shape", "shapeHash": "s", "shape": {"system": []}},
         {"type": "api-request-blob", "hash": "a", "message": {"role": "user"}},
@@ -214,7 +216,8 @@ def self_check():
     assert identity == "second"
     assert original["messages"] == [{"role": "user"}, {"role": "assistant"}]
     revised = candidate(original)
-    assert revised.pop("system") == [{"type": "text", "text": RULES}]
+    revised_system = revised.pop("system")
+    assert revised_system == [{"type": "text", "text": RULES}]
     assert revised == {key: value for key, value in original.items() if key != "system"}
     assert original["system"] == []
     events[-1]["keep"] = 2
@@ -231,9 +234,8 @@ def self_check():
         "orchestrator": {"agentConfig": {"effort": "max"}},
     }
     updated = rule_config(config)
-    assert (
-        updated.pop("orchestratorRules") == config["orchestratorRules"] + "\n\n" + RULES
-    )
+    updated_rules = updated.pop("orchestratorRules")
+    assert updated_rules == config["orchestratorRules"] + "\n\n" + RULES
     assert updated == {
         key: value for key, value in config.items() if key != "orchestratorRules"
     }
