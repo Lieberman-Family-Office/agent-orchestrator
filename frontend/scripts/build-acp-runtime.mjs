@@ -22,6 +22,7 @@ import {
 	patchClaudeRetryDetails,
 	patchClaudeStaleIdleDebt,
 	patchClaudeSteerSettlement,
+	patchClaudeThinkingProgress,
 	patchClaudeWorkerSteering,
 	pruneNodeDistribution,
 	runtimeSourceFiles,
@@ -90,6 +91,7 @@ for (const source of runtimeSources) {
 const npm = npmInvocation(["ci", "--omit=dev", "--omit=optional", "--ignore-scripts"]);
 run(npm.command, npm.args, { cwd: outDir });
 patchClaudeRetryDetails(claudeAdapter);
+patchClaudeThinkingProgress(claudeAdapter);
 patchClaudeContextUsage(claudeAdapter);
 patchClaudeHibernationCheck(claudeAdapter);
 patchClaudeWorkerSteering(claudeAdapter);

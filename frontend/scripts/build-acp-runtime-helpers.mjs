@@ -82,6 +82,45 @@ export function patchClaudeRetryDetails(adapterPath) {
 	return true;
 }
 
+// Forward real SDK thinking progress so redacted reasoning is not ACP silence.
+// ponytail: text progress every 30 seconds; use a native ACP status update when available.
+export function patchClaudeThinkingProgress(adapterPath) {
+	const source = readFileSync(adapterPath, "utf8");
+	const original = `case "plugin_install":
+                            case "notification":
+                            case "thinking_tokens":
+                                // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
+                                break;`;
+	const patched = `case "thinking_tokens": {
+                                const turn = session.activeTurn;
+                                if (!turn || turn.settled || session.cancelled ||
+                                    !Number.isFinite(message.estimated_tokens) || message.estimated_tokens <= 0 ||
+                                    !Number.isFinite(message.estimated_tokens_delta) || message.estimated_tokens_delta <= 0 ||
+                                    message.estimated_tokens_delta > message.estimated_tokens) break;
+                                const now = performance.now();
+                                if (now - (turn.aoThinkingProgressAt ?? -Infinity) < 30000) break;
+                                turn.aoThinkingProgressAt = now;
+                                await sendUpdate({
+                                    sessionId: params.sessionId,
+                                    update: {
+                                        sessionUpdate: "agent_thought_chunk",
+                                        content: { type: "text", text: \`Thinking: approximately \${message.estimated_tokens} tokens in the current block.\\n\` },
+                                    },
+                                });
+                                break;
+                            }
+                            case "plugin_install":
+                            case "notification":
+                                // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
+                                break;`;
+	if (source.includes(patched)) return false;
+	if (source.split(original).length !== 2) {
+		throw new Error("claude-agent-acp no longer matches AO's thinking progress patch");
+	}
+	writeFileSync(adapterPath, source.replace(original, patched));
+	return true;
+}
+
 /**
  * claude-agent-acp 0.70 reports the last assistant message's token usage as
  * context occupancy. The SDK's getContextUsage returns its current retained
