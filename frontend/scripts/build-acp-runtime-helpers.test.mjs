@@ -22,6 +22,7 @@ import {
 	patchClaudeRetryDetails,
 	patchClaudeStaleIdleDebt,
 	patchClaudeSteerSettlement,
+	patchClaudeThinkingProgress,
 	patchClaudeWorkerSteering,
 	pruneNodeDistribution,
 	runtimeSourceFiles,
@@ -113,6 +114,84 @@ describe("patchClaudeRetryDetails", () => {
 		expect(patched).toContain("message.retry_delay_ms / 1000");
 		expect(patched).toContain("Trying again in ${retryDelay}.");
 		expect(patched).toContain("details: retryDetails");
+	});
+});
+
+describe("patchClaudeThinkingProgress", () => {
+	const ignoredProgress = `case "plugin_install":
+                            case "notification":
+                            case "thinking_tokens":
+                                // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
+                                break;`;
+
+	it("forwards genuine thinking progress without timers or answer text", async () => {
+		const adapterPath = join(temporaryDirectory(), "acp-agent.js");
+		writeFileSync(adapterPath, `return async (message, session, params, sendUpdate) => {
+			switch (message.subtype) { ${ignoredProgress} }
+		};`);
+		const before = vi.fn();
+		await new Function(readFileSync(adapterPath, "utf8"))()(
+			{ subtype: "thinking_tokens", estimated_tokens: 1000, estimated_tokens_delta: 100 },
+			{ activeTurn: {}, cancelled: false }, { sessionId: "native" }, before,
+		);
+		expect(before).not.toHaveBeenCalled();
+		expect(patchClaudeThinkingProgress(adapterPath)).toBe(true);
+		expect(patchClaudeThinkingProgress(adapterPath)).toBe(false);
+		const consume = new Function(readFileSync(adapterPath, "utf8"))();
+		const sendUpdate = vi.fn();
+		const session = { activeTurn: {}, cancelled: false };
+		const progress = { subtype: "thinking_tokens", estimated_tokens: 1000, estimated_tokens_delta: 100 };
+		const clock = vi.spyOn(performance, "now").mockReturnValue(100000);
+		try {
+			await consume(progress, session, { sessionId: "native" }, sendUpdate);
+			expect(sendUpdate).toHaveBeenCalledExactlyOnceWith({
+				sessionId: "native",
+				update: {
+					sessionUpdate: "agent_thought_chunk",
+					content: { type: "text", text: "Thinking: approximately 1000 tokens in the current block.\n" },
+				},
+			});
+			await consume({ ...progress, estimated_tokens: 2000 }, session, {}, sendUpdate);
+			expect(sendUpdate).toHaveBeenCalledTimes(1);
+			clock.mockReturnValue(130000);
+			await consume({ ...progress, estimated_tokens: 4000 }, session, {}, sendUpdate);
+			expect(sendUpdate).toHaveBeenCalledTimes(2);
+			clock.mockReturnValue(130000 + 16 * 60000);
+			// Time passing alone does not create activity or mask a dead stream.
+			expect(sendUpdate).toHaveBeenCalledTimes(2);
+			session.activeTurn = {};
+			for (const value of [undefined, null, true, "1", 0, -1, NaN, Infinity]) {
+				await consume({ ...progress, estimated_tokens_delta: value }, session, {}, sendUpdate);
+				await consume({ ...progress, estimated_tokens: value }, session, {}, sendUpdate);
+			}
+			await consume({ ...progress, estimated_tokens_delta: 1001 }, session, {}, sendUpdate);
+			session.activeTurn = { settled: true };
+			await consume(progress, session, {}, sendUpdate);
+			session.activeTurn = {};
+			for (const subtype of ["plugin_install", "notification"]) {
+				await consume({ ...progress, subtype }, session, {}, sendUpdate);
+			}
+			session.cancelled = true;
+			await consume(progress, session, {}, sendUpdate);
+			session.cancelled = false;
+			session.activeTurn = null;
+			await consume(progress, session, {}, sendUpdate);
+			expect(sendUpdate).toHaveBeenCalledTimes(2);
+			session.activeTurn = {};
+			await consume(progress, session, {}, sendUpdate);
+			expect(sendUpdate).toHaveBeenCalledTimes(3);
+		} finally {
+			clock.mockRestore();
+		}
+	});
+
+	it("refuses changed or ambiguous upstream code without writing it", () => {
+		const adapterPath = join(temporaryDirectory(), "acp-agent.js");
+		for (const source of ["upstream changed", ignoredProgress.repeat(2)]) {
+			writeFileSync(adapterPath, source);
+			expect(() => patchClaudeThinkingProgress(adapterPath)).toThrow(/thinking progress patch/);
+			expect(readFileSync(adapterPath, "utf8")).toBe(source);
+		}
 	});
 });
 
