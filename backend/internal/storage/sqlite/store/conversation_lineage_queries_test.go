@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +38,7 @@ type lineageProbe struct {
 }
 
 func (p *lineageProbe) ExecContext(ctx context.Context, q string, args ...any) (sql.Result, error) {
+	p.query, p.args = q, args
 	return p.db.ExecContext(ctx, q, args...)
 }
 
@@ -191,6 +193,50 @@ func seedForkedConversation(t *testing.T, s *sqlite.Store) (conversationID strin
 		visibleTurns = append(visibleTurns, fmt.Sprintf("turn-n%02d", i))
 	}
 	return conversation.ID, visibleTurns
+}
+
+func TestReplayActivitiesKeepLineageAndSeekCandidateIdentities(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	s := sqlitetest.MustOpenAt(t, dir)
+	id, _ := seedForkedConversation(t, s)
+	full, err := s.LoadConversationSnapshot(ctx, id)
+	mustNoError(t, err)
+	turnIDs := []string{"turn-r00", "turn-c00", "turn-n00", "turn-r24", "turn-c24"}
+	itemIDs := []string{"item-n01", "item-r24", "item-c24"}
+	got, err := s.ConversationReplayActivities(ctx, id, turnIDs, itemIDs)
+	mustNoError(t, err)
+	var want []domain.ConversationActivity
+	for _, activity := range full.Activities {
+		if slices.Contains(turnIDs, activity.TurnID) || slices.Contains(itemIDs, activity.ProviderItemID) {
+			want = append(want, activity)
+		}
+	}
+	if len(want) != 4 || !reflect.DeepEqual(got, want) {
+		t.Fatalf("candidate activities=%+v, want four visible matches=%+v", got, want)
+	}
+	empty, err := s.ConversationReplayActivities(ctx, id, nil, nil)
+	mustNoError(t, err)
+	if len(empty) != 0 {
+		t.Fatalf("empty replay loaded %d activities", len(empty))
+	}
+	raw, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "ao.db"))
+	mustNoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	probe := &lineageProbe{db: raw}
+	_, err = gen.New(probe).SelectConversationReplayActivities(ctx, gen.SelectConversationReplayActivitiesParams{
+		ConversationID: id, TurnIds: `["turn-n00"]`, ProviderItemIds: `["item-n01"]`,
+	})
+	mustNoError(t, err)
+	plan := probe.plan(t)
+	if strings.Contains(plan, "SEARCH conversation_activities USING INDEX idx_conversation_activities_order") {
+		t.Errorf("replay scans every activity in the conversation:\n%s", plan)
+	}
+	for _, index := range []string{"idx_conversation_activities_turn_sequence (turn_id=?)", "idx_conversation_activities_provider_item (conversation_id=? AND provider_item_id=?)"} {
+		if !strings.Contains(plan, index) {
+			t.Errorf("replay does not seek %s:\n%s", index, plan)
+		}
+	}
 }
 
 func TestLineageTurnQueriesAreBoundByConversation(t *testing.T) {

@@ -59,6 +59,7 @@ type Store interface {
 	ClaimChatControllerGeneration(ctx context.Context, session domain.SessionID, generation string) error
 	ClaimReviewChatController(ctx context.Context, reviewID, providerID, generation string, now time.Time) (bool, error)
 	ConversationBranch(ctx context.Context, conversationID, branchID string) (domain.ConversationBranch, error)
+	HasConversationBranchTurns(ctx context.Context, conversationID, branchID string) (bool, error)
 	CommitProviderSwitch(ctx context.Context, rec domain.SessionRecord, branch domain.ConversationBranch, generation string, settings domain.ConversationSettings, activity domain.ConversationActivity) error
 	ListTerminalTurns(ctx context.Context, id domain.SessionID) ([]domain.HandoffTurn, error)
 	ConversationEditAnchor(ctx context.Context, conversationID, replacedTurnID string) (domain.ConversationEditAnchor, error)
@@ -76,6 +77,8 @@ type Store interface {
 	AppendReviewUserMessage(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation string, msg domain.ConversationMessage, turnID string, now time.Time) (bool, error)
 	ConversationMessageByClientID(ctx context.Context, conversationID, clientMessageID string) (domain.ConversationMessage, bool, error)
 	ConversationMessages(ctx context.Context, conversationID string) ([]domain.ConversationMessage, error)
+	ConversationTurns(ctx context.Context, conversationID string) ([]domain.ConversationTurn, error)
+	ConversationReplayActivities(ctx context.Context, conversationID string, turnIDs, providerItemIDs []string) ([]domain.ConversationActivity, error)
 	AppendRetryUserMessage(ctx context.Context, conversationID string, session domain.SessionID, generation string, msg domain.ConversationMessage, turnID, retryOfTurnID string, now time.Time) (bool, error)
 	AppendReviewRetryUserMessage(ctx context.Context, conversationID string, session domain.SessionID, reviewID, generation string, msg domain.ConversationMessage, turnID, retryOfTurnID string, now time.Time) (bool, error)
 	MarkTurnDispatching(ctx context.Context, turnID string) error
@@ -1036,9 +1039,38 @@ func nativeHistorySettleDelay(refresh int) time.Duration {
 // Re-running it is safe because history events carry stable identities and
 // ProjectProviderEvent deduplicates archive+projection together.
 func (c *Controller) projectNativeHistory(ctx context.Context, events []ports.ChatEvent) error {
-	for _, event := range events {
-		if _, _, err := c.projectEvent(ctx, event); err != nil {
-			return fmt.Errorf("import native history event %s: %w", event.Kind, err)
+	// ponytail: 64 events bound writer ownership; add a byte bound if replay payloads grow.
+	for start := 0; start < len(events); start += 64 {
+		batch := events[start:min(start+64, len(events))]
+		for i, head := range batch {
+			var applied []ports.ChatEvent
+			projected, err := c.archive(ctx, head, func(txCtx context.Context) error {
+				if err := c.apply(txCtx, head); err != nil {
+					return err
+				}
+				applied = append(applied, head)
+				for _, next := range batch[i+1:] {
+					fresh, err := c.archive(txCtx, next, func(eventCtx context.Context) error {
+						return c.apply(eventCtx, next)
+					})
+					if err != nil {
+						return err
+					}
+					if fresh {
+						applied = append(applied, next)
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				return fmt.Errorf("import native history event %s: %w", head.Kind, err)
+			}
+			for _, event := range applied {
+				c.applyCommittedTurnLifecycle(event)
+			}
+			if projected {
+				break
+			}
 		}
 	}
 	return nil

@@ -1335,6 +1335,96 @@ func TestResumeCanSkipNativeHistoryImportWithoutStartingFresh(t *testing.T) {
 	}
 }
 
+func TestResumeNativeHistoryBatchesArchiveTransactions(t *testing.T) {
+	st := openStore(t)
+	ctx := context.Background()
+	_, err := st.CreateConversation(ctx, "batched-history", domain.ConversationScopeSession, testProject, testSession, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	counting := &commitCountingStore{Store: st}
+	conv := &nativeHistoryConversation{fakeConversation: newFakeConversation()}
+	for i := range 130 {
+		conv.events = append(conv.events, ports.ChatEvent{
+			Kind: ports.ChatEventMessageDelta, ProviderEventID: fmt.Sprintf("replay-%d", i),
+			ProviderItemID: "answer", Delta: "x",
+		})
+	}
+	var ids atomic.Uint64
+	svc := chatsvc.New(chatsvc.Options{
+		Store: counting, Sessions: st, Drivers: fakeRegistry{driver: fakeDriver{conv: conv}},
+		Log:   slog.New(slog.DiscardHandler),
+		NewID: func() string { return fmt.Sprintf("batched-replay-%d", ids.Add(1)) },
+	})
+	t.Cleanup(func() { _ = svc.Stop(ctx, testSession) })
+	controller, err := svc.Start(ctx, chatsvc.StartConfig{
+		SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex,
+		WorkspacePath: t.TempDir(), ProviderConversationID: "thread-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := st.LoadConversationSnapshot(ctx, controller.ConversationID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Messages) != 1 || snapshot.Messages[0].Text != strings.Repeat("x", len(conv.events)) {
+		t.Fatalf("replay lost message content: %+v", snapshot.Messages)
+	}
+	if commits := counting.deltaCommitted.Load(); commits != 3 {
+		t.Fatalf("replay committed %d transactions, want 3 bounded batches", commits)
+	}
+	if err := svc.Stop(ctx, testSession); err != nil {
+		t.Fatal(err)
+	}
+	// Archived replay must remain idempotent when batch boundaries change.
+	conv.events = append([]ports.ChatEvent{conv.events[0]}, conv.events...)
+	if _, err := svc.Start(ctx, chatsvc.StartConfig{
+		SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex,
+		WorkspacePath: t.TempDir(), ProviderConversationID: "thread-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := st.LoadConversationSnapshot(ctx, controller.ConversationID())
+	if err != nil || len(replayed.Messages) != 1 || replayed.Messages[0].Text != snapshot.Messages[0].Text {
+		t.Fatalf("duplicate replay changed content: messages=%+v err=%v", replayed.Messages, err)
+	}
+}
+
+func TestResumeNativeHistoryRollsBackFailedBatch(t *testing.T) {
+	st := openStore(t)
+	ctx := context.Background()
+	conversation, err := st.CreateConversation(ctx, "failed-history", domain.ConversationScopeSession, testProject, testSession, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conv := &nativeHistoryConversation{fakeConversation: newFakeConversation(), events: []ports.ChatEvent{
+		{Kind: ports.ChatEventMessageDelta, ProviderEventID: "replay-delta", ProviderItemID: "answer", Delta: "must roll back"},
+		{Kind: ports.ChatEventActivityCompleted, ProviderEventID: "replay-bad", ProviderItemID: "bad-item",
+			ActivityKind: domain.ActivityKind("invalid-kind"), ActivityStatus: domain.ActivityStatusCompleted},
+	}}
+	var ids atomic.Uint64
+	svc := chatsvc.New(chatsvc.Options{
+		Store: st, Sessions: st, Drivers: fakeRegistry{driver: fakeDriver{conv: conv}},
+		NewID: func() string { return fmt.Sprintf("failed-replay-%d", ids.Add(1)) },
+	})
+	t.Cleanup(func() { _ = svc.Stop(ctx, testSession) })
+	if _, err := svc.Start(ctx, chatsvc.StartConfig{
+		SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex,
+		WorkspacePath: t.TempDir(), ProviderConversationID: "thread-1",
+	}); err == nil {
+		t.Fatal("invalid replay succeeded")
+	}
+	snapshot, err := st.LoadConversationSnapshot(ctx, conversation.ID)
+	if err != nil || len(snapshot.Messages) != 0 || len(snapshot.Activities) != 0 {
+		t.Fatalf("failed batch left partial projection: %+v err=%v", snapshot, err)
+	}
+	archive, err := st.ProviderEventsSince(ctx, conversation.ID, 0, 100)
+	if err != nil || len(archive) != 0 {
+		t.Fatalf("failed batch left archive receipts: %+v err=%v", archive, err)
+	}
+}
+
 func TestResumeImportsNativeHistoryBeforeTheChatControllerStarts(t *testing.T) {
 	st := openStore(t)
 	now := time.Date(2026, 8, 5, 10, 0, 0, 0, time.UTC)
@@ -1463,6 +1553,80 @@ func TestResumeImportsNativeHistoryBeforeTheChatControllerStarts(t *testing.T) {
 	}
 	if snapshot.Turns[0].CompletedAt == nil || !snapshot.Turns[0].CompletedAt.Equal(now) {
 		t.Fatalf("replayed completion = %v, want original %s", snapshot.Turns[0].CompletedAt, now)
+	}
+}
+
+func TestOrdinaryResumeReconcilesActivityAliasesWithoutLoadingFullTimeline(t *testing.T) {
+	for _, mapping := range []string{"provider-turn", "prompt-text", "activity-alias"} {
+		t.Run(mapping, func(t *testing.T) {
+			st := openStore(t)
+			ctx := context.Background()
+			now := time.Now().UTC()
+			conversation, err := st.CreateConversation(ctx, "targeted-replay", domain.ConversationScopeSession, testProject, testSession, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := st.ClaimChatControllerGeneration(ctx, testSession, "old"); err != nil {
+				t.Fatal(err)
+			}
+			for _, suffix := range []string{"target", "unrelated"} {
+				created, err := st.AppendUserMessage(ctx, conversation.ID, testSession, "old", domain.ConversationMessage{
+					ID: suffix + "-message", Text: suffix, Origin: domain.MessageOriginHuman, ClientMessageID: suffix + "-client",
+				}, suffix, now)
+				if err != nil || !created {
+					t.Fatalf("seed prompt created=%v err=%v", created, err)
+				}
+				if err := st.BindTurnToProvider(ctx, suffix, suffix+"-provider", now); err != nil {
+					t.Fatal(err)
+				}
+				if err := st.UpsertActivity(ctx, conversation.ID, suffix+"-provider", domain.ConversationActivity{
+					ID: suffix + "-activity", Kind: domain.ActivityKindCommand, Status: domain.ActivityStatusCompleted,
+					ProviderItemID: suffix + "-item", Summary: "same command", Detail: json.RawMessage(`{"command":"status"}`),
+				}, now); err != nil {
+					t.Fatal(err)
+				}
+				if err := st.SettleTurn(ctx, conversation.ID, suffix+"-provider", domain.TurnStateCompleted, "", now); err != nil {
+					t.Fatal(err)
+				}
+			}
+			providerTurn := "new-turn"
+			if mapping == "provider-turn" {
+				providerTurn = "target-provider"
+			}
+			events := []ports.ChatEvent{{Kind: ports.ChatEventTurnStarted, ProviderEventID: "start", ProviderTurnID: providerTurn}}
+			if mapping == "prompt-text" {
+				events = append(events, ports.ChatEvent{Kind: ports.ChatEventUserMessageCompleted, ProviderEventID: "prompt", ProviderTurnID: providerTurn, ProviderItemID: "new-prompt", Text: "target"})
+			}
+			activity := ports.ChatEvent{Kind: ports.ChatEventActivityCompleted, ProviderEventID: "activity", ProviderTurnID: providerTurn,
+				ProviderItemID: "new-item", ActivityKind: domain.ActivityKindCommand, ActivityStatus: domain.ActivityStatusCompleted,
+				Summary: "same command", Detail: json.RawMessage(`{"command":"status"}`)}
+			if mapping == "activity-alias" {
+				activity.ProviderItemAliases = []string{"target-item"}
+			}
+			events = append(events, activity, ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderEventID: "complete", ProviderTurnID: providerTurn, TurnState: domain.TurnStateRecovered})
+			conv := &nativeHistoryConversation{fakeConversation: newFakeConversation(), events: events}
+			svc := chatsvc.New(chatsvc.Options{
+				Store: st, Sessions: st, Drivers: fakeRegistry{driver: fakeDriver{conv: conv}},
+				NewID: sequentialIDs("targeted"),
+				Reader: chatsvc.SnapshotReaderFunc(func(context.Context, string) (chatsvc.ConversationRows, error) {
+					return chatsvc.ConversationRows{}, errors.New("ordinary resume must not load the full timeline")
+				}),
+			})
+			t.Cleanup(func() { _ = svc.Stop(ctx, testSession) })
+			if _, err := svc.Start(ctx, chatsvc.StartConfig{
+				SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex,
+				WorkspacePath: t.TempDir(), ProviderConversationID: "thread-1",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			snapshot, err := st.LoadConversationSnapshot(ctx, conversation.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(snapshot.Turns) != 2 || len(snapshot.Messages) != 2 || len(snapshot.Activities) != 2 {
+				t.Fatalf("replay duplicated facts: turns=%d messages=%d activities=%d", len(snapshot.Turns), len(snapshot.Messages), len(snapshot.Activities))
+			}
+		})
 	}
 }
 

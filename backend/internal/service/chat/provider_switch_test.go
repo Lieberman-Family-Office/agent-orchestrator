@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -481,6 +483,72 @@ func TestResumeStartsAnUnansweredSwitchBranchFresh(t *testing.T) {
 	branch, err := h.st.ConversationBranch(ctx, conversation.ID, conversation.ActiveBranchID)
 	if err != nil || branch.ProviderConversationID != "thread-started-fresh" {
 		t.Fatalf("active branch provider = %q, %v; want it moved to the fresh conversation", branch.ProviderConversationID, err)
+	}
+}
+
+func TestResumeChecksBranchTurnsWithoutLoadingTimeline(t *testing.T) {
+	for _, hasTurn := range []bool{false, true} {
+		t.Run(fmt.Sprintf("hasTurn=%v", hasTurn), func(t *testing.T) {
+			h, _, _ := newEditHarness(t, false)
+			ctx := context.Background()
+			if err := h.svc.SwitchProvider(ctx, testSession, domain.ProviderSwitchRequest{TargetHarness: domain.HarnessClaudeCode}); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.svc.Stop(ctx, testSession); err != nil {
+				t.Fatal(err)
+			}
+			record, found, err := h.st.GetSession(ctx, testSession)
+			if err != nil || !found {
+				t.Fatalf("read stopped session: found=%v err=%v", found, err)
+			}
+			conversation, err := h.st.ConversationForSession(ctx, testSession)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if hasTurn {
+				if err := h.st.AdoptProviderTurn(ctx, conversation.ID, testSession, record.Metadata.ControllerGeneration, "existing-turn", "existing-provider-turn", h.clock); err != nil {
+					t.Fatal(err)
+				}
+				if err := h.st.SettleTurn(ctx, conversation.ID, "existing-provider-turn", domain.TurnStateCompleted, "", h.clock); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var timelineReads atomic.Int32
+			var resumed ports.ChatResumeConfig
+			driver := fakeDriver{conv: newFakeConversation()}
+			driver.resume = func(cfg ports.ChatResumeConfig) (ports.ChatConversation, error) {
+				resumed = cfg
+				if got := timelineReads.Load(); got != 0 {
+					t.Errorf("provider launch waited for %d full timeline reads", got)
+				}
+				conv := newFakeConversation()
+				conv.providerConversationID = cfg.ProviderConversationID
+				return conv, nil
+			}
+			restarted := chatsvc.New(chatsvc.Options{
+				Store: h.st, Sessions: h.st,
+				Reader: chatsvc.SnapshotReaderFunc(func(ctx context.Context, id string) (chatsvc.ConversationRows, error) {
+					timelineReads.Add(1)
+					return fullSnapshotReader(h.st).LoadConversationSnapshot(ctx, id)
+				}),
+				Drivers: fakeRegistry{driver: driver}, Log: slog.New(slog.DiscardHandler),
+				NewID: sequentialIDs("resume-branch"), Now: func() time.Time { return h.clock },
+			})
+			t.Cleanup(func() { _ = restarted.Stop(context.Background(), testSession) })
+			if _, err := restarted.Start(ctx, chatsvc.StartConfig{
+				SessionID: testSession, ProjectID: testProject, Kind: domain.KindWorker,
+				Harness: domain.HarnessClaudeCode, WorkspacePath: t.TempDir(),
+				ProviderConversationID: record.Metadata.ProviderConversationID,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if got := timelineReads.Load(); got != 0 {
+				t.Fatalf("ordinary resume loaded %d full timelines", got)
+			}
+			if resumed.FreshIfMissing != !hasTurn || resumed.HasPriorTurns != hasTurn {
+				t.Fatalf("resume: fresh=%v prior=%v; branch has turn=%v", resumed.FreshIfMissing, resumed.HasPriorTurns, hasTurn)
+			}
+		})
 	}
 }
 

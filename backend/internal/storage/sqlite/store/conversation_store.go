@@ -1195,6 +1195,17 @@ func (s *Store) HasConversationTurns(ctx context.Context, conversationID string)
 	return hasTurns, nil
 }
 
+// HasConversationBranchTurns checks branch ownership without reading timeline payloads.
+func (s *Store) HasConversationBranchTurns(ctx context.Context, conversationID, branchID string) (bool, error) {
+	hasTurns, err := s.qr.HasConversationBranchTurns(ctx, gen.HasConversationBranchTurnsParams{
+		ConversationID: conversationID, BranchID: branchID,
+	})
+	if err != nil {
+		return false, fmt.Errorf("check conversation branch turns %s: %w", branchID, err)
+	}
+	return hasTurns, nil
+}
+
 // LatestConversationTurn reads the latest non-rolled-back turn on the active
 // branch lineage without loading messages or activities.
 func (s *Store) LatestConversationTurn(ctx context.Context, conversationID string) (domain.ConversationTurn, error) {
@@ -1505,6 +1516,42 @@ func (s *Store) ConversationMessages(ctx context.Context, conversationID string)
 		messages = append(messages, messageToDomain(row))
 	}
 	return messages, nil
+}
+
+// ConversationTurns returns turns on the visible lineage, with durable provider identities.
+func (s *Store) ConversationTurns(ctx context.Context, conversationID string) ([]domain.ConversationTurn, error) {
+	rows, err := s.qr.SelectConversationTurns(ctx, conversationID)
+	if err != nil {
+		return nil, err
+	}
+	turns := make([]domain.ConversationTurn, 0, len(rows))
+	for _, row := range rows {
+		turns = append(turns, turnToDomain(row))
+	}
+	return turns, nil
+}
+
+// ConversationReplayActivities reads visible activities matching replay identities.
+func (s *Store) ConversationReplayActivities(ctx context.Context, conversationID string, turnIDs, providerItemIDs []string) ([]domain.ConversationActivity, error) {
+	turnJSON, err := json.Marshal(turnIDs)
+	if err != nil {
+		return nil, err
+	}
+	itemJSON, err := json.Marshal(providerItemIDs)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := s.qr.SelectConversationReplayActivities(ctx, gen.SelectConversationReplayActivitiesParams{
+		ConversationID: conversationID, TurnIds: string(turnJSON), ProviderItemIds: string(itemJSON),
+	})
+	if err != nil {
+		return nil, err
+	}
+	activities := make([]domain.ConversationActivity, 0, len(rows))
+	for _, row := range rows {
+		activities = append(activities, activityToDomain(row))
+	}
+	return activities, nil
 }
 
 // AdoptProviderTurn records a turn the provider started that AO never dispatched.
