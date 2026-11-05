@@ -89,6 +89,75 @@ func TestSelectConversationTurnsUsesLineageIndexes(t *testing.T) {
 	}
 }
 
+// Provider identifiers are optional, so their indexes exclude empty values.
+// Parameterized replay lookups must explicitly qualify for those indexes.
+func TestNativeReplayLookupsUseProviderIndexes(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	s, err := sqlite.Open(dataDir)
+	mustNoError(t, err)
+	mustNoError(t, s.Close())
+	raw, err := sql.Open("sqlite", "file:"+filepath.Join(dataDir, "ao.db"))
+	mustNoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	capture := &lineageProbe{db: raw}
+	q := gen.New(capture)
+	for _, test := range []struct {
+		name, index, key string
+		run              func() error
+	}{
+		{"turn", "idx_conversation_turns_provider", "provider_turn_id", func() error {
+			_, err := q.SelectConversationTurnByProviderID(ctx, gen.SelectConversationTurnByProviderIDParams{ConversationID: "conv", ProviderTurnID: "turn"})
+			return err
+		}},
+		{"user_message", "idx_conversation_turns_provider", "provider_turn_id", func() error {
+			_, err := q.SelectConversationUserMessageByTurn(ctx, gen.SelectConversationUserMessageByTurnParams{ConversationID: "conv", ProviderTurnID: "turn"})
+			return err
+		}},
+		{"authentication", "idx_conversation_turns_provider", "provider_turn_id", func() error {
+			_, err := q.SelectVerifiedAuthenticationTurn(ctx, gen.SelectVerifiedAuthenticationTurnParams{ConversationID: "conv", Generation: "generation", ProviderTurnID: "turn", AfterAt: sql.NullTime{Time: time.Now(), Valid: true}})
+			return err
+		}},
+		{"message", "idx_conversation_messages_provider_item", "provider_item_id", func() error {
+			_, err := q.SelectConversationMessageByProviderItem(ctx, gen.SelectConversationMessageByProviderItemParams{ConversationID: "conv", ProviderItemID: "message"})
+			return err
+		}},
+		{"activity", "idx_conversation_activities_provider_item", "provider_item_id", func() error {
+			_, err := q.SelectConversationActivityByProviderItem(ctx, gen.SelectConversationActivityByProviderItemParams{ConversationID: "conv", ProviderItemID: "activity"})
+			return err
+		}},
+		{"output", "idx_conversation_activities_provider_item", "provider_item_id", func() error {
+			_, err := q.AppendConversationActivityOutput(ctx, gen.AppendConversationActivityOutputParams{ConversationID: "conv", ProviderItemID: "activity", Delta: "output", UpdatedAt: time.Now()})
+			return err
+		}},
+		{"streamed_text", "idx_conversation_activities_provider_item", "provider_item_id", func() error {
+			_, err := q.AppendConversationActivityStreamedText(ctx, gen.AppendConversationActivityStreamedTextParams{ConversationID: "conv", ProviderItemID: "activity", Delta: "text", UpdatedAt: time.Now()})
+			return err
+		}},
+		{"activity_exists", "idx_conversation_activities_provider_item", "provider_item_id", func() error {
+			_, err := q.ConversationActivityExistsForProviderItem(ctx, gen.ConversationActivityExistsForProviderItemParams{ConversationID: "conv", ProviderItemID: "activity"})
+			return err
+		}},
+		{"message_delta", "idx_conversation_messages_provider_item", "provider_item_id", func() error {
+			return q.AppendConversationMessageDelta(ctx, gen.AppendConversationMessageDeltaParams{ConversationID: "conv", ProviderItemID: "message", Text: "delta", UpdatedAt: time.Now()})
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.run(); err != nil && !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("lookup on empty database: %v", err)
+			}
+			plan := capture.plan(t)
+			if test.name == "authentication" && strings.Contains(plan, "SEARCH t USING INDEX idx_conversation_turns_branch") {
+				t.Errorf("targeted authentication scans every turn on the branch:\n%s", plan)
+			}
+			want := "USING INDEX " + test.index + " (conversation_id=? AND " + test.key + "=?)"
+			if !strings.Contains(plan, want) {
+				t.Fatalf("provider lookup does not seek both identity keys; want %q in:\n%s", want, plan)
+			}
+		})
+	}
+}
+
 // queryCapture records the SQL text and args a generated query sends.
 type queryCapture struct {
 	gen.DBTX

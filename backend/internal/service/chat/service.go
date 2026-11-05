@@ -1053,8 +1053,23 @@ func (s *Service) startLocked(ctx context.Context, cfg StartConfig) (*Controller
 		// it in a Claude binding would leave every other ACP harness with the same
 		// restart duplication race.
 		var existing ConversationRows
+		var events []ports.ChatEvent
+		_, inheritedHistory := conv.(ports.ChatInheritedHistory)
+		// Required handoffs and inherited-prefix proofs still need the full snapshot.
+		targetedReplay := cfg.HistoryMode != ports.ChatHistoryRequired && cfg.ProviderHandoff == nil && !inheritedHistory
+		if targetedReplay {
+			events, err = controller.readNativeHistory(ctx, nil, nil, nil, false, replayCheckpoint)
+			if err != nil {
+				_ = cleanupUnpublishedConversation(conv, false)
+				return nil, err
+			}
+		}
 		if s.reader != nil {
-			existing, err = s.reader.LoadConversationSnapshot(ctx, conversation.ID)
+			if targetedReplay {
+				existing, err = s.nativeReplayCandidates(ctx, activeBranch, events)
+			} else {
+				existing, err = s.reader.LoadConversationSnapshot(ctx, conversation.ID)
+			}
 			if err != nil {
 				_ = cleanupUnpublishedConversation(conv, false)
 				return nil, fmt.Errorf("load conversation before native history import: %w", err)
@@ -1090,10 +1105,13 @@ func (s *Service) startLocked(ctx context.Context, cfg StartConfig) (*Controller
 				cfg.SessionID, existing.Turns, existing.Messages, existing.Activities,
 			)
 		}
-		events, historyErr := controller.readNativeHistory(
-			ctx, existing.Turns, existing.Messages, existing.Activities,
-			(cfg.HistoryMode == ports.ChatHistoryRequired), replayCheckpoint,
-		)
+		var historyErr error
+		if !targetedReplay {
+			events, historyErr = controller.readNativeHistory(
+				ctx, existing.Turns, existing.Messages, existing.Activities,
+				(cfg.HistoryMode == ports.ChatHistoryRequired), replayCheckpoint,
+			)
+		}
 		if historyErr != nil {
 			if cleanupErr := cleanupUnpublishedConversation(conv, false); cleanupErr != nil && (cfg.HistoryMode == ports.ChatHistoryRequired) {
 				return nil, fmt.Errorf("%w: failed history target shutdown: %w",
@@ -2364,16 +2382,8 @@ func (s *Service) branchUnanswered(ctx context.Context, session domain.SessionID
 	if s.reader == nil || !switchBranch && !ownBoundary {
 		return false
 	}
-	rows, err := s.reader.LoadConversationSnapshot(ctx, conversationID)
-	if err != nil {
-		return false
-	}
-	for _, turn := range rows.Turns {
-		if turn.BranchID == branch.ID {
-			return false
-		}
-	}
-	return true
+	hasTurns, err := s.store.HasConversationBranchTurns(ctx, conversationID, branch.ID)
+	return err == nil && !hasTurns
 }
 
 // PrewarmChat runs PreflightChat's capability probe in the background so a

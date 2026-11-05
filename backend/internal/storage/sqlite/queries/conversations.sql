@@ -151,6 +151,16 @@ SELECT * FROM conversations WHERE id = ? LIMIT 1;
 -- name: HasConversationTurns :one
 SELECT EXISTS (SELECT 1 FROM conversation_turns WHERE conversation_id = ?);
 
+-- Resume only needs to know whether this branch has a non-promoted turn.
+-- Match SelectConversationTurns without reading the entire timeline.
+-- name: HasConversationBranchTurns :one
+SELECT EXISTS (
+    SELECT 1 FROM conversation_turns
+    WHERE conversation_id = sqlc.arg(conversation_id)
+      AND branch_id = sqlc.arg(branch_id)
+      AND promoted_to_turn_id IS NULL
+);
+
 -- Hibernation only needs the latest visible user prompt's outcome. Match the
 -- active-branch and discarded-turn filters used by SelectConversationMessages
 -- without loading the entire conversation timeline.
@@ -709,7 +719,7 @@ INSERT OR IGNORE INTO conversation_turns (
 -- event, so it is a keyed lookup rather than a scan.
 -- name: SelectConversationTurnByProviderID :one
 SELECT * FROM conversation_turns
-WHERE conversation_id = ? AND provider_turn_id = ?
+WHERE conversation_id = ? AND provider_turn_id = ? AND provider_turn_id <> ''
 LIMIT 1;
 
 -- name: BindConversationTurnProviderID :exec
@@ -854,7 +864,7 @@ ORDER BY conversation_turns.requested_at, conversation_turns.rowid;
 -- name: UpdateConversationTurnDiff :execrows
 UPDATE conversation_turns
 SET diff_json = ?
-WHERE conversation_id = ? AND provider_turn_id = ?;
+WHERE conversation_id = ? AND provider_turn_id = ? AND provider_turn_id <> '';
 
 -- Overwrite the turn's plan. The provider re-sends the whole plan on every change,
 -- so the latest payload is the complete answer and there is nothing to merge.
@@ -866,7 +876,7 @@ WHERE conversation_id = ? AND provider_turn_id = ?;
 -- name: UpdateConversationTurnPlan :execrows
 UPDATE conversation_turns
 SET plan_json = ?
-WHERE conversation_id = ? AND provider_turn_id = ?;
+WHERE conversation_id = ? AND provider_turn_id = ? AND provider_turn_id <> '';
 
 -- name: SelectConversationTurnByID :one
 SELECT * FROM conversation_turns WHERE id = ? LIMIT 1;
@@ -1411,16 +1421,17 @@ SET text = text || ?, revision = revision + 1,
         WHERE conversation_turns.id = conversation_messages.turn_id
           AND conversation_turns.state IN ('completed', 'recovered', 'interrupted', 'failed', 'cancelled')
     ), updated_at = ?
-WHERE conversation_messages.conversation_id = ? AND conversation_messages.provider_item_id = ?;
+WHERE conversation_messages.conversation_id = ? AND conversation_messages.provider_item_id = ?
+  AND conversation_messages.provider_item_id <> '';
 
 -- name: SettleConversationMessage :exec
 UPDATE conversation_messages
 SET text = ?, revision = revision + 1, streaming = 0, updated_at = ?
-WHERE conversation_id = ? AND provider_item_id = ?;
+WHERE conversation_id = ? AND provider_item_id = ? AND provider_item_id <> '';
 
 -- name: SelectConversationMessageByProviderItem :one
 SELECT * FROM conversation_messages
-WHERE conversation_id = ? AND provider_item_id = ?
+WHERE conversation_id = ? AND provider_item_id = ? AND provider_item_id <> ''
 LIMIT 1;
 
 -- name: SelectConversationMessageByClientID :one
@@ -1435,8 +1446,10 @@ LIMIT 1;
 SELECT conversation_messages.*
 FROM conversation_messages
 JOIN conversation_turns ON conversation_turns.id = conversation_messages.turn_id
+  AND conversation_turns.conversation_id = conversation_messages.conversation_id
 WHERE conversation_messages.conversation_id = ?
   AND conversation_turns.provider_turn_id = ?
+  AND conversation_turns.provider_turn_id <> ''
   AND conversation_messages.role = 'user'
 LIMIT 1;
 
@@ -1525,7 +1538,7 @@ INSERT INTO conversation_activities (
 -- name: SettleConversationActivity :exec
 UPDATE conversation_activities
 SET status = ?, summary = ?, detail_json = ?, revision = revision + 1, updated_at = ?
-WHERE conversation_id = ? AND provider_item_id = ? AND status <> 'cancelled';
+WHERE conversation_id = ? AND provider_item_id = ? AND provider_item_id <> '' AND status <> 'cancelled';
 
 -- Resolving an approval matches on the provider's request id, so a card the user
 -- left on screen cannot answer a request that replaced it.
@@ -1763,7 +1776,7 @@ SET command_output = substr(command_output || sqlc.arg(delta), 1, sqlc.arg(max_o
     revision = revision + 1,
     updated_at = sqlc.arg(updated_at)
 WHERE conversation_id = sqlc.arg(conversation_id)
-  AND provider_item_id = sqlc.arg(provider_item_id)
+  AND provider_item_id = sqlc.arg(provider_item_id) AND provider_item_id <> ''
   AND status <> 'cancelled'
   AND command_output_truncated = 0;
 
@@ -1792,7 +1805,7 @@ SET streamed_text = substr(streamed_text || sqlc.arg(delta), 1, sqlc.arg(max_tex
     revision = revision + 1,
     updated_at = sqlc.arg(updated_at)
 WHERE conversation_id = sqlc.arg(conversation_id)
-  AND provider_item_id = sqlc.arg(provider_item_id)
+  AND provider_item_id = sqlc.arg(provider_item_id) AND provider_item_id <> ''
   AND status <> 'cancelled'
   AND streamed_text_truncated = 0;
 
@@ -1804,7 +1817,7 @@ SELECT EXISTS(
     SELECT 1
     FROM conversation_activities
     WHERE conversation_id = sqlc.arg(conversation_id)
-      AND provider_item_id = sqlc.arg(provider_item_id)
+      AND provider_item_id = sqlc.arg(provider_item_id) AND provider_item_id <> ''
       AND status <> 'cancelled'
 );
 
@@ -1820,11 +1833,11 @@ SELECT EXISTS(
 -- name: SettleConversationActivityStreamedText :execrows
 UPDATE conversation_activities
 SET streamed_text = ?, streamed_text_truncated = 0, revision = revision + 1, updated_at = ?
-WHERE conversation_id = ? AND provider_item_id = ? AND status <> 'cancelled';
+WHERE conversation_id = ? AND provider_item_id = ? AND provider_item_id <> '' AND status <> 'cancelled';
 
 -- name: SelectConversationActivityByProviderItem :one
 SELECT * FROM conversation_activities
-WHERE conversation_id = ? AND provider_item_id = ?
+WHERE conversation_id = ? AND provider_item_id = ? AND provider_item_id <> ''
 LIMIT 1;
 
 -- name: SelectConversationContextResetSequence :one
@@ -1863,6 +1876,44 @@ WHERE conversation_activities.conversation_id = sqlc.arg(conversation_id)
           discarded.rolled_back_at IS NOT NULL
           OR discarded.state = 'cancelled'
         )
+  ))
+ORDER BY conversation_activities.sequence;
+
+-- Native replay needs complete activities only for turns it can match. Seek
+-- provider items first, then the matched turns, rather than reading every payload.
+-- name: SelectConversationReplayActivities :many
+WITH RECURSIVE active_path(branch_id, max_sequence) AS (
+    SELECT conversations.active_branch_id, CAST(NULL AS INTEGER)
+    FROM conversations
+    WHERE conversations.id = sqlc.arg(conversation_id)
+    UNION ALL
+    SELECT branch.parent_branch_id,
+           CASE
+               WHEN path.max_sequence IS NULL THEN branch.fork_after_sequence
+               WHEN branch.fork_after_sequence < path.max_sequence THEN branch.fork_after_sequence
+               ELSE path.max_sequence
+           END
+    FROM active_path AS path
+    JOIN conversation_branches AS branch ON branch.id = path.branch_id
+    WHERE branch.parent_branch_id IS NOT NULL
+), candidates(id) AS (
+    SELECT by_turn.id FROM conversation_activities AS by_turn
+    WHERE by_turn.turn_id IN (SELECT value FROM json_each(sqlc.arg(turn_ids)))
+    UNION
+    SELECT by_item.id FROM conversation_activities AS by_item
+    WHERE by_item.conversation_id = sqlc.arg(conversation_id)
+      AND by_item.provider_item_id <> ''
+      AND by_item.provider_item_id IN (SELECT value FROM json_each(sqlc.arg(provider_item_ids)))
+)
+SELECT conversation_activities.* FROM candidates
+CROSS JOIN conversation_activities ON conversation_activities.id = candidates.id
+JOIN active_path AS path ON path.branch_id = conversation_activities.branch_id
+WHERE conversation_activities.conversation_id = sqlc.arg(conversation_id)
+  AND (path.max_sequence IS NULL OR conversation_activities.sequence <= path.max_sequence)
+  AND (conversation_activities.turn_id IS NULL OR conversation_activities.turn_id NOT IN (
+      SELECT discarded.id FROM conversation_turns AS discarded
+      WHERE discarded.conversation_id = sqlc.arg(conversation_id)
+        AND (discarded.rolled_back_at IS NOT NULL OR discarded.state = 'cancelled')
   ))
 ORDER BY conversation_activities.sequence;
 
@@ -2190,7 +2241,16 @@ WHERE conversation_id = ?
 -- A completed turn proves usable authentication only for the current controller
 -- and active provider branch, after the last rejection/account change.
 -- name: SelectVerifiedAuthenticationTurn :one
-SELECT t.* FROM conversation_turns t
+WITH candidates(id) AS (
+    SELECT targeted.id FROM conversation_turns AS targeted
+    WHERE targeted.conversation_id = sqlc.arg(conversation_id)
+      AND targeted.provider_turn_id = sqlc.arg(provider_turn_id) AND targeted.provider_turn_id <> ''
+    UNION
+    SELECT legacy.id FROM conversation_turns AS legacy
+    WHERE legacy.conversation_id = sqlc.arg(conversation_id) AND sqlc.arg(provider_turn_id) = ''
+)
+SELECT t.* FROM candidates
+CROSS JOIN conversation_turns t ON t.id = candidates.id
 JOIN conversations c ON c.id = t.conversation_id
 WHERE t.conversation_id = sqlc.arg(conversation_id)
   AND t.controller_generation = COALESCE(
@@ -2210,7 +2270,6 @@ WHERE t.conversation_id = sqlc.arg(conversation_id)
       AND json_extract(e.payload_json, '$.error') IS NULL
       AND COALESCE(json_extract(e.payload_json, '$.providerConversationId'), '') IN ('', b.provider_conversation_id)
   )
-  AND (sqlc.arg(provider_turn_id) = '' OR t.provider_turn_id = sqlc.arg(provider_turn_id))
   AND t.started_at > sqlc.arg(after_at)
   AND t.completed_at > sqlc.arg(after_at)
 ORDER BY t.completed_at DESC LIMIT 1;
