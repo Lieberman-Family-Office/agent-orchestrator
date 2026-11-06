@@ -408,7 +408,7 @@ describe("Windows app labels", () => {
 		expect(windowsInstaller?.config.productName).toBe(WINDOWS_DISPLAY_NAME);
 		expect(windowsInstaller?.config.appId).toBe("dev.agent-orchestrator.desktop");
 		expect(appPackage.name).toBe("agent-orchestrator");
-		expect(appPackage.productName).toBe("Orchestrator");
+		expect(appPackage.productName).toBe("Agent Orchestrator");
 		expect(config.packagerConfig?.executableName).toBe("agent-orchestrator");
 		expect(config.packagerConfig?.name).toBe("Agent Orchestrator");
 		expect(config.packagerConfig?.appBundleId).toBe("dev.agent-orchestrator.desktop");

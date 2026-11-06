@@ -235,7 +235,7 @@ func (s *Service) SubmitLoginCode(ctx context.Context, agentID, id, code string)
 		writeErr = writeCtx.Err()
 		op.cancel()
 		_ = op.stdin.Close()
-		<-written
+		_ = <-written // Preserve the cancellation error while joining the writer.
 	}
 	if writeErr != nil {
 		s.mu.Lock()
