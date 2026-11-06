@@ -10,7 +10,7 @@ import (
 
 // nativeReplayCandidates keeps all prompt matching evidence, then reads complete
 // activities only for turns named by that evidence or stable provider items.
-func (s *Service) nativeReplayCandidates(ctx context.Context, active domain.ConversationBranch, events []ports.ChatEvent) (ConversationRows, error) {
+func (s *Service) nativeReplayCandidates(ctx context.Context, harness domain.AgentHarness, active domain.ConversationBranch, events []ports.ChatEvent) (ConversationRows, error) {
 	if len(events) == 0 {
 		return ConversationRows{}, nil
 	}
@@ -41,7 +41,7 @@ func (s *Service) nativeReplayCandidates(ctx context.Context, active domain.Conv
 	if err != nil {
 		return ConversationRows{}, err
 	}
-	mapped, _ := mapNativeHistoryTurns(events, rows.Turns, rows.Messages, rows.Activities)
+	mapped, _ := indexNativeHistoryTurnsForHarness(harness, rows.Turns, rows.Messages, rows.Activities).mapReplay(events)
 	matched := make(map[string]bool, len(mapped))
 	for _, turn := range mapped {
 		matched[turn.providerTurnID] = true

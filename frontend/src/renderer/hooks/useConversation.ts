@@ -1,3 +1,4 @@
+import { apiErrorException } from "../lib/api-error-exception";
 import type { ChatFileReference } from "../../shared/chat-file-reference";
 /**
  * Live conversation data for a Chat session.
@@ -358,6 +359,11 @@ const CONVERSATION_PAGE_SIZE = 200;
 const remoteConversationRefreshErrorKey = (sessionId: string, hostId: string) => ["remote-conversation-refresh-error", hostId, sessionId] as const;
 const CONFIG_OPTIONS_POLL_INTERVAL_MS = 5_000;
 const CONFIG_OPTION_WRITE_TIMEOUT_MS = 60_000;
+/**
+ * A send with no answer by now is treated as unanswered: the composer keeps it as
+ * an unsent message to retry with the same id, instead of waiting forever.
+ */
+const SEND_ANSWER_TIMEOUT_MS = 60_000;
 const SKILLS_POLL_INTERVAL_MS = 60_000;
 
 /**
@@ -670,6 +676,8 @@ export function useConversationCommands(sessionId: string | undefined, hostId?: 
 					// A stable id per attempt makes a retry idempotent: the daemon
 					// answers `duplicate` instead of opening a second provider turn.
 					body: { ...message, clientMessageId },
+					// ponytail: no timeout with attachments, whose upload can outlast it on a slow tunnel; scale it by size if those hang too.
+					signal: input.attachments?.length ? undefined : AbortSignal.timeout(SEND_ANSWER_TIMEOUT_MS),
 				},
 			);
 			if (error) throw error;
@@ -991,7 +999,7 @@ export function useConversationCommands(sessionId: string | undefined, hostId?: 
 					body: { turnIds },
 				},
 			);
-			if (error) throw new Error(apiErrorMessage(error, "Could not reorder queued messages"));
+			if (error) throw apiErrorException(error, "Could not reorder queued messages");
 		},
 		onMutate: async (turnIds) => {
 			if (!sessionId) return;
@@ -1225,7 +1233,7 @@ export function useConversationCommands(sessionId: string | undefined, hostId?: 
 				"/api/v1/sessions/{sessionId}/exit-agent",
 				{ params: { path: { sessionId: sessionId as string } } },
 			);
-			if (error) throw new Error(apiErrorMessage(error));
+			if (error) throw apiErrorException(error);
 			await resume.mutateAsync();
 		},
 		/** A compaction is in flight provider-side and takes seconds, so it reads as
@@ -1737,11 +1745,12 @@ export function useWorkspaceFilePaths(sessionId: string | undefined, enabled: bo
  */
 export function useStageAttachments(sessionId: string | undefined, hostId?: string) {
 	return useCallback(
-		async (attachments: { mimeType: string; data: string }[]): Promise<string[]> => {
+		async (attachments: { mimeType: string; data: string; name?: string }[]): Promise<string[]> => {
 			if (!sessionId || attachments.length === 0) return [];
 			const { data, error } = await clientForSessionHost(hostId).POST("/api/v1/sessions/{sessionId}/attachments", {
 				params: { path: { sessionId } },
-				body: { attachments },
+				// The daemon names staged files itself; only the bytes go.
+				body: { attachments: attachments.map(({ mimeType, data }) => ({ mimeType, data })) },
 			});
 			if (error) throw error;
 			return data?.paths ?? [];
@@ -1896,6 +1905,7 @@ export function toSnapshot(wire: WireSnapshot): ConversationSnapshot {
 							}),
 						),
 						spansTurns: turn.plan.spansTurns || undefined,
+						superseded: turn.plan.superseded || undefined,
 					}
 				: undefined,
 			rolledBack: turn.rolledBack ?? undefined,

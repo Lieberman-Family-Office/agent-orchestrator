@@ -96,6 +96,8 @@ type nestedMessageState struct {
 }
 
 type conversation struct {
+	harness              domain.AgentHarness
+	suppressSessionModes bool
 	conn                 *acpsdk.ClientSideConnection
 	legacyWire           *legacyACPTransport
 	updateProcessed      chan string
@@ -103,7 +105,6 @@ type conversation struct {
 	proc                 *process
 	log                  *slog.Logger
 	providerScopeID      string
-	harness              domain.AgentHarness
 	decodeConversationID func(string) (string, error)
 	canDeleteFork        bool
 	unadoptedForkID      string
@@ -164,8 +165,12 @@ type conversation struct {
 	sessionPromptResponseFailure func(string, acpsdk.PromptResponse, bool) error
 	hibernationCheck             func(context.Context, *acpsdk.ClientSideConnection, acpsdk.SessionId) (bool, error)
 	historyNotice                func(string) bool
+	// promptErrorFailure: see Config.PromptErrorFailure.
+	promptErrorFailure func(error, bool) error
 	// historyUserChunkIsMessage: see Config.HistoryUserChunkIsMessage.
 	historyUserChunkIsMessage bool
+	// historyReconciler: see Config.HistoryReconciler.
+	historyReconciler func([]ports.ChatEvent) []ports.ChatEvent
 	// plansSpanTurns: see Config.PlansSpanTurns.
 	plansSpanTurns bool
 	// preamble is standing context attached to the first prompt that actually
@@ -175,6 +180,14 @@ type conversation struct {
 	// so a rejected or discarded turn leaves it armed for the next one.
 	preamble      []acpsdk.ContentBlock
 	preambleSpent bool
+	// standingPreamble is the launch's preamble before setSessionPreamble drops
+	// it for a conversation with prior turns. A completed reset turn re-arms it:
+	// the provider has just discarded whichever turn carried it.
+	standingPreamble []acpsdk.ContentBlock
+	// resetsConversation: see Config.ResetsConversation.
+	resetsConversation func([]acpsdk.ContentBlock) bool
+	// resetTurn is the provider turn id of the reset prompt in flight, if any.
+	resetTurn string
 	// servedModel reports the model that answered a completed turn; nil when the
 	// binding cannot tell. lastServedModel suppresses repeating the same report.
 	servedModel     func(ctx context.Context, sessionID, selectedModel string) (string, string)
@@ -397,10 +410,12 @@ func (c *conversation) setSessionPreamble(blocks []acpsdk.ContentBlock) {
 	// mid-conversation would read as a new user message. AO's durable history
 	// covers a live reconnect, which replays nothing; session/load replay covers
 	// turns made in the terminal.
+	standing := blocks
 	if c.hasPriorTurns() {
 		blocks = nil
 	}
 	c.mu.Lock()
+	c.standingPreamble = standing
 	c.preamble = blocks
 	c.preambleSpent = len(blocks) == 0
 	c.mu.Unlock()
@@ -588,7 +603,7 @@ func (c *conversation) applyTurnSettings(ctx context.Context, settings ports.Cha
 				continue
 			}
 			modelOptionFound = true
-			resolved, ok := resolveLegacyModelChoice(option.Choices, model)
+			resolved, ok := resolveModelChoice(c.harness, option.Choices, model)
 			if !ok {
 				return fmt.Errorf("%w: ACP session model does not offer %q", ports.ErrChatConfigOptionInvalid, model)
 			}
@@ -762,8 +777,12 @@ func (c *conversation) StartDeferredTurn(providerTurnID string) error {
 	// guaranteed to reach the provider: settings validation, a busy conversation
 	// and a discarded prepared turn all fail in SendTurn, and spending the
 	// preamble on any of them would silently drop AO's instructions from the
-	// session's first real turn.
-	if !c.preambleSpent && len(c.preamble) > 0 {
+	// session's first real turn. A reset prompt never carries it: the agent
+	// recognizes the command only when the prompt is the command alone, and the
+	// preamble is re-armed for the prompt after it (see finishPrompt).
+	if c.resetsConversation != nil && c.resetsConversation(turn.prompt) {
+		c.resetTurn = turn.id
+	} else if !c.preambleSpent && len(c.preamble) > 0 {
 		turn.prompt = append(append([]acpsdk.ContentBlock(nil), c.preamble...), turn.prompt...)
 		c.preambleSpent = true
 	}
@@ -894,6 +913,11 @@ func (c *conversation) finishPrompt(
 		} else {
 			state = domain.TurnStateFailed
 			turnErr = normalizeACPError("ACP session/prompt", err)
+			if c.promptErrorFailure != nil && !errors.Is(turnErr, ports.ErrChatAuthRequired) {
+				if failure := c.promptErrorFailure(err, answered); failure != nil {
+					turnErr = failure
+				}
+			}
 			if c.promptFailureCode != nil {
 				failureCode = c.promptFailureCode(err)
 			}
@@ -944,6 +968,17 @@ func (c *conversation) finishPrompt(
 		c.emit(ports.ChatEvent{Kind: ports.ChatEventAccountChanged, Account: &ports.ChatAccount{ReauthRecovered: true}})
 		c.reportServedModel(turnID, turnModel)
 	}
+	c.mu.Lock()
+	if c.resetTurn == turnID {
+		c.resetTurn = ""
+		// Only a completed reset cleared the provider's history. A failed or
+		// interrupted one left the turn that carried the preamble in place.
+		if turnErr == nil && state == domain.TurnStateCompleted && len(c.standingPreamble) > 0 {
+			c.preamble = c.standingPreamble
+			c.preambleSpent = false
+		}
+	}
+	c.mu.Unlock()
 	if isCompaction {
 		if state == domain.TurnStateCompleted {
 			c.settleCompaction(turnID)
