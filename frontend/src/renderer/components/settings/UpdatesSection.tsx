@@ -9,6 +9,7 @@ import { useUiStore } from "../../stores/ui-store";
 import { useRequestUpdateInstall } from "../../hooks/useRequestUpdateInstall";
 import { useUpdateStatus, requestUpdateDownload } from "../../hooks/useUpdateStatus";
 import type { UpdateChannel, UpdateSettings, UpdateState, UpdateStatus } from "../../../main/update-settings";
+import { localizedUpdateError } from "../../lib/update-error-copy";
 import { Button } from "../ui/button";
 import { Switch } from "../ui/switch";
 import { ConfirmDialog } from "../ConfirmDialog";
@@ -258,7 +259,7 @@ export function UpdatesSection({ titleHidden }: { titleHidden?: boolean } = {}) 
 		<>
 			<SettingsSection title={t("settings.updates.versionSection")} sectionId="updates" titleHidden={titleHidden} grouped>
 				<UpdateActions
-					status={manualCheckFailure ? { ...status, state: "error", checkFailed: true, message: manualCheckFailure } : status}
+					status={manualCheckFailure ? { ...status, state: "error", checkFailed: true, message: manualCheckFailure, errorInfo: undefined } : status}
 					manualCheckRequestId={manualCheckRequestId}
 					startManualCheck={startManualCheck}
 					finishManualCheck={finishManualCheck}
@@ -682,9 +683,12 @@ function UpdateStatusLine({
 			}
 			className = "text-error";
 			icon = <AlertTriangle className="size-icon-sm shrink-0" aria-hidden="true" />;
+			// The main process already rewrites updater failures and says what they
+			// mean, so the sentence is localized here; the English fallback still
+			// keeps a dump it has not learned yet out of Settings (#5755).
 			label = status.netError
 				? t("settings.updates.netErrorRestartGuidance")
-				: status.message ?? t("settings.updates.updateFailed");
+				: localizedUpdateError(status.message, status.errorInfo, t("settings.updates.updateFailed"), t);
 			// Name the build being held back (a full disk refuses staging, a
 			// download failed) so the user still learns what they are missing.
 			detail = status.version ? t("settings.updates.availableVersion", { version: status.version }) : null;

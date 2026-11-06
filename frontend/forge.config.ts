@@ -63,18 +63,50 @@ async function prepareNativeDependencies(platform: NodeJS.Platform, arch: string
 	});
 }
 
+// Keep the installed bundle filename and Finder label stable across upgrades.
+const PACKAGER_NAME = "Agent Orchestrator";
+
+// Finder uses the localized label only when the base display name matches the
+// bundle filename, but the packager defaults it to the executable name. Set it,
+// then keep the fork's name in every regional lproj Finder might pick.
+// Must run before signing so the plist and localized strings are sealed.
+// A failure aborts the Packager hook rather than shipping a partial label.
+export function labelMacBundle(
+	buildPath: string,
+	setDisplayName: (plistPath: string, name: string) => void = setPlistDisplayName,
+): void {
+	const contents = path.join(buildPath, `${PACKAGER_NAME}.app`, "Contents");
+	setDisplayName(path.join(contents, "Info.plist"), PACKAGER_NAME);
+	const resources = path.join(contents, "Resources");
+	const label = `CFBundleDisplayName = "${PACKAGER_NAME}";\nCFBundleName = "${PACKAGER_NAME}";\n`;
+	for (const locale of readdirSync(resources).filter((entry) => entry.endsWith(".lproj"))) {
+		writeFileSync(path.join(resources, locale, "InfoPlist.strings"), label);
+	}
+}
+
+function setPlistDisplayName(plistPath: string, name: string): void {
+	const result = spawnSync("plutil", ["-replace", "CFBundleDisplayName", "-string", name, plistPath], {
+		encoding: "utf8",
+	});
+	if (result.error) throw result.error;
+	if (result.status !== 0) throw new Error(`Setting macOS display name failed: ${result.stderr}`);
+}
+
 export function extraResourcesForPlatform(platform: NodeJS.Platform): string[] {
 	return [
 		"daemon",
 		// AO Browser Bridge (Chrome extension); the daemon finds it beside daemon/.
 		"browser-extension",
 		"agent-browser",
-		...(platform === "darwin" ? ["update-helper", "wake-helper", "cloudflared"] : []),
+		...(platform === "darwin" ? ["update-helper", "wake-helper", "cloudflared", "assets/mac/en.lproj"] : []),
 		...(platform === "darwin" || platform === "linux" ? ["tmux"] : []),
 		"assets/icon.png",
 		"assets/icon.ico",
 		"assets/trayIconTemplate.png",
 		"assets/trayIconTemplate@2x.png",
+		"assets/trayAwakeIconTemplate.png",
+		"assets/trayAwakeIconTemplate@2x.png",
+		"assets/trayAwakeIcon.LICENSE",
 		"app-update.yml",
 	];
 }
@@ -128,8 +160,9 @@ const config: ForgeConfig = {
 		// the .node binary outside app.asar.
 		ignore: ignoreFromVitePackage,
 		appBundleId: "dev.agent-orchestrator.desktop",
-		name: "Agent Orchestrator",
+		name: PACKAGER_NAME,
 		executableName: EXECUTABLE_NAME,
+		extendInfo: { LSHasLocalizedDisplayName: true, CFBundleDevelopmentRegion: "en" },
 		protocols: [AUTH_PROTOCOL],
 		appCategoryType: "public.app-category.developer-tools",
 		// App icon. electron-packager appends the per-platform extension
@@ -140,12 +173,13 @@ const config: ForgeConfig = {
 		// ponytail: Packager 20.3 rewrites ACP links outside the bundle; remove when its resource copy preserves them.
 		afterCopyExtraResources: [({ buildPath, platform }) => {
 			const resources = platform === "darwin" || platform === "mas"
-				? path.join(buildPath, "Agent Orchestrator.app", "Contents", "Resources")
+				? path.join(buildPath, `${PACKAGER_NAME}.app`, "Contents", "Resources")
 				: path.join(buildPath, "resources");
 			cpSync(path.join(process.cwd(), "resources", "acp-runtime"), path.join(resources, "acp-runtime"), {
 				recursive: true,
 				verbatimSymlinks: true,
 			});
+			if (platform === "darwin") labelMacBundle(buildPath);
 		}],
 		// Notarization. Two paths:
 		//  - CI: an App Store Connect API key. APPLE_API_KEY is a PATH to the .p8
@@ -346,7 +380,7 @@ const config: ForgeConfig = {
 		new MakerAppImage(
 			{
 				appId: "dev.agent-orchestrator.desktop",
-				productName: "Agent Orchestrator",
+				productName: PACKAGER_NAME,
 				icon: "assets/icon.png",
 				protocols: [AUTH_PROTOCOL],
 			},

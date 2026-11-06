@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, readlinkSync, rmSync, symlinkSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MachOParseError } from "./makers/macho-archs";
+import MakerAppImage from "./makers/maker-appimage";
 
 // postMake's dmg/zip branches only need to prove they call the right
 // maker-dmg functions with the right gates; the functions' own behavior
@@ -29,7 +30,7 @@ vi.mock("./scripts/build-mac-dmg.mjs", async (importOriginal) => {
 	return { ...actual, checkMacDmgLayout };
 });
 
-import config, { extraResourcesForPlatform, macSignOptionsForFile } from "./forge.config";
+import config, { extraResourcesForPlatform, labelMacBundle, macSignOptionsForFile } from "./forge.config";
 
 // Minimal synthetic Mach-O headers (thin little-endian + fat big-endian), the
 // two on-disk layouts the signing selector must tell apart. Full parser
@@ -93,26 +94,38 @@ afterEach(() => {
 });
 
 describe("native runtime resources", () => {
-	it.skipIf(process.platform === "win32").each(["darwin", "linux", "win32"] as const)("copies ACP links inside the %s bundle before signing", async (platform) => {
-		const source = join(fixtureDir, "resources", "acp-runtime");
-		mkdirSync(join(source, "node_modules", ".bin"), { recursive: true });
-		writeFileSync(join(source, "node_modules", "adapter.js"), "adapter");
-		symlinkSync("../adapter.js", join(source, "node_modules", ".bin", "adapter"));
-		const cwd = vi.spyOn(process, "cwd").mockReturnValue(fixtureDir);
-		try {
-			const hooks = config.packagerConfig?.afterCopyExtraResources;
-			expect(hooks?.length).toBeGreaterThan(0);
-			const buildPath = join(fixtureDir, "package");
-			for (const hook of hooks ?? []) await hook({ buildPath, platform, arch: "arm64", electronVersion: "44.7.0" });
-			const resources = platform === "darwin" ? join(buildPath, "Agent Orchestrator.app", "Contents", "Resources") : join(buildPath, "resources");
-			const link = join(resources, "acp-runtime", "node_modules", ".bin", "adapter");
-			expect(readlinkSync(link)).toBe("../adapter.js");
-			expect(readFileSync(link, "utf8")).toBe("adapter");
-			expect(extraResourcesForPlatform(platform)).not.toContain("resources/acp-runtime");
-		} finally {
-			cwd.mockRestore();
-		}
-	});
+	for (const platform of ["darwin", "linux", "win32"] as const) {
+		// The macOS hook uses real plutil; label-copy tests below run on every host.
+		it.skipIf(process.platform === "win32" || (platform === "darwin" && process.platform !== "darwin"))(`copies ACP links inside the ${platform} bundle before signing`, async () => {
+			const source = join(fixtureDir, "resources", "acp-runtime");
+			mkdirSync(join(source, "node_modules", ".bin"), { recursive: true });
+			writeFileSync(join(source, "node_modules", "adapter.js"), "adapter");
+			symlinkSync("../adapter.js", join(source, "node_modules", ".bin", "adapter"));
+			const cwd = vi.spyOn(process, "cwd").mockReturnValue(fixtureDir);
+			try {
+				const hooks = config.packagerConfig?.afterCopyExtraResources;
+				expect(hooks?.length).toBeGreaterThan(0);
+				const buildPath = join(fixtureDir, "package");
+				const resources = platform === "darwin" ? join(buildPath, "Agent Orchestrator.app", "Contents", "Resources") : join(buildPath, "resources");
+				if (platform === "darwin") {
+					mkdirSync(join(resources, "en.lproj"), { recursive: true });
+					writeFileSync(join(resources, "..", "Info.plist"), '<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleDisplayName</key><string>agent-orchestrator</string></dict></plist>');
+					writeFileSync(join(resources, "en.lproj", "InfoPlist.strings"), 'CFBundleDisplayName = "Orchestrator";\n');
+				}
+				for (const hook of hooks ?? []) await hook({ buildPath, platform, arch: "arm64", electronVersion: "44.7.0" });
+				const link = join(resources, "acp-runtime", "node_modules", ".bin", "adapter");
+				expect(readlinkSync(link)).toBe("../adapter.js");
+				expect(readFileSync(link, "utf8")).toBe("adapter");
+				expect(extraResourcesForPlatform(platform)).not.toContain("resources/acp-runtime");
+				if (platform === "darwin") {
+					expect(readFileSync(join(resources, "..", "Info.plist"), "utf8")).toMatch(/<key>CFBundleDisplayName<\/key>\s*<string>Agent Orchestrator<\/string>/);
+					expect(readFileSync(join(resources, "en.lproj", "InfoPlist.strings"), "utf8")).toBe('CFBundleDisplayName = "Agent Orchestrator";\nCFBundleName = "Agent Orchestrator";\n');
+				}
+			} finally {
+				cwd.mockRestore();
+			}
+		});
+	}
 
 	it("fails packaging when the macOS helper was not copied into Resources", async () => {
 		mkdirSync(join(fixtureDir, "AO.app", "Contents", "Resources"), { recursive: true });
@@ -129,6 +142,13 @@ describe("native runtime resources", () => {
 		}
 		expect(extraResourcesForPlatform("linux")).not.toContain("update-helper");
 		expect(extraResourcesForPlatform("win32")).not.toContain("update-helper");
+	});
+
+	it("bundles both menu bar wake icon resolutions", () => {
+		expect(extraResourcesForPlatform("darwin")).toEqual(expect.arrayContaining([
+			"assets/trayAwakeIconTemplate.png",
+			"assets/trayAwakeIconTemplate@2x.png",
+		]));
 	});
 
 	it("bundles the wake coordinator only on macOS", () => {
@@ -388,5 +408,60 @@ describe("packaged native dependencies", () => {
 		expect(ignore("/node_modules/react/index.js")).toBe(true);
 		expect(ignore("/src/main.ts")).toBe(true);
 		expect(config.hooks?.prePackage).toBeTypeOf("function");
+	});
+});
+
+describe("fork package identity and feed", () => {
+	it("keeps the existing AppImage naming behavior", async () => {
+		const maker = config.makers?.find((candidate): candidate is MakerAppImage => candidate instanceof MakerAppImage);
+		expect(maker).toBeDefined();
+		await maker?.prepareConfig("x64");
+		expect(maker?.config.productName).toBe("Agent Orchestrator");
+		expect(maker?.config.appImage).toBeUndefined();
+	});
+
+	it("keeps the release repository override on the publisher", async () => {
+		vi.stubEnv("AO_RELEASE_REPO", "fork-owner/fork-release");
+		vi.resetModules();
+		const { default: forkConfig } = await import("./forge.config");
+		const publisher = (forkConfig.publishers as Array<{ name?: string; config?: { repository?: object } }>)
+			.find((candidate) => candidate.name === "@electron-forge/publisher-github");
+		expect(publisher?.config?.repository).toEqual({ owner: "fork-owner", name: "fork-release" });
+		expect(extraResourcesForPlatform("darwin")).toContain("app-update.yml");
+	});
+});
+
+describe("macOS bundle display label", () => {
+	let buildPath: string;
+	beforeEach(() => {
+		buildPath = mkdtempSync(join(tmpdir(), "ao-label-"));
+	});
+	afterEach(() => rmSync(buildPath, { recursive: true, force: true }));
+
+	it("labels the bundle the packager builds and copies the label into every lproj", () => {
+		const packagerName = config.packagerConfig?.name;
+		expect(packagerName).toBe("Agent Orchestrator");
+		expect(config.packagerConfig?.appBundleId).toBe("dev.agent-orchestrator.desktop");
+		const resources = join(buildPath, `${packagerName}.app`, "Contents", "Resources");
+		for (const locale of ["en", "fr", "zh_CN"]) mkdirSync(join(resources, `${locale}.lproj`), { recursive: true });
+		writeFileSync(join(resources, "en.lproj", "InfoPlist.strings"), 'CFBundleDisplayName = "Orchestrator";\n');
+		writeFileSync(join(resources, "fr.lproj", "InfoPlist.strings"), "stale");
+
+		const setDisplayName = vi.fn();
+		labelMacBundle(buildPath, setDisplayName);
+
+		expect(setDisplayName).toHaveBeenCalledWith(
+			join(buildPath, `${packagerName}.app`, "Contents", "Info.plist"),
+			packagerName,
+		);
+		for (const locale of ["en", "fr", "zh_CN"]) {
+			expect(readFileSync(join(resources, `${locale}.lproj`, "InfoPlist.strings"), "utf8")).toBe(
+				'CFBundleDisplayName = "Agent Orchestrator";\nCFBundleName = "Agent Orchestrator";\n',
+			);
+		}
+	});
+
+	it("fails when the packaged bundle is missing instead of silently skipping the label", () => {
+		expect(() => labelMacBundle(buildPath, vi.fn())).toThrow();
 	});
 });

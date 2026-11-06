@@ -83,12 +83,16 @@ test("question replies remain readable after another question and a reload @T0",
 	await expect(dock.getByRole("textbox", { name: "Other" })).toHaveValue("");
 	await expect(dock.getByRole("radio", { name: /fix\/login/ })).not.toBeChecked();
 	await page.reload();
+	// Reload runs the route loader again; history assertions need a mounted conversation.
+	await expect(page.getByRole("log", { name: "Conversation" })).toBeVisible({ timeout: 15_000 });
 	await expect(history.getByText(feedback)).toBeVisible();
 	settled = true;
 	await page.reload();
+	await expect(page.getByRole("log", { name: "Conversation" })).toBeVisible({ timeout: 15_000 });
 	await expect(dock).toHaveCount(0);
 	await expect(history.getByText(prompt)).toBeVisible();
-	await expect(history.getByText("fix/login — Merged with no local changes")).toBeVisible();
+	await expect(history.getByText("fix/login", { exact: true })).toBeVisible();
+	await expect(history.getByText("Merged with no local changes")).toHaveCount(0);
 	await expect(history.getByText(feedback)).toBeVisible();
 	await expect(history.getByRole("button")).toHaveCount(0);
 	const evidenceDirectory = process.env.AO_QUESTION_HISTORY_EVIDENCE_DIR;
