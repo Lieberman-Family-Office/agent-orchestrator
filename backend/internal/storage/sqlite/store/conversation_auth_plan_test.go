@@ -16,10 +16,8 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 )
 
-// Break caught: ReconcileConversationAuthentication runs this query under the
-// writer lock after every completed chat turn. Without the partial
-// turn.completed index its EXISTS probe walks every provider event on the
-// active branch.
+// Reconciliation holds the writer lock at startup and after completed turns.
+// Read only completion evidence, once per query rather than once per candidate.
 func TestSelectVerifiedAuthenticationTurnUsesTurnCompletedIndex(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()
@@ -34,7 +32,7 @@ func TestSelectVerifiedAuthenticationTurnUsesTurnCompletedIndex(t *testing.T) {
 	// production sends, not a hand copy of the query.
 	capture := &queryCapture{DBTX: raw}
 	_, err = gen.New(capture).SelectVerifiedAuthenticationTurn(ctx, gen.SelectVerifiedAuthenticationTurnParams{
-		ConversationID: "conv", Generation: "gen-1", ProviderTurnID: "turn-1",
+		ConversationID: "conv", Generation: "", ProviderTurnID: "",
 		AfterAt: sql.NullTime{Time: time.Unix(1700000000, 0).UTC(), Valid: true},
 	})
 	if !errors.Is(err, sql.ErrNoRows) {
@@ -45,16 +43,30 @@ func TestSelectVerifiedAuthenticationTurnUsesTurnCompletedIndex(t *testing.T) {
 	mustNoError(t, err)
 	defer func() { _ = rows.Close() }()
 	var plan []string
+	parents := map[int]int{}
+	details := map[int]string{}
+	archiveID := 0
+	const want = "SEARCH e USING INDEX idx_conversation_provider_events_turn_completed (branch_id=?)"
 	for rows.Next() {
 		var id, parent, unused int
 		var detail string
 		mustNoError(t, rows.Scan(&id, &parent, &unused, &detail))
 		plan = append(plan, detail)
+		parents[id], details[id] = parent, detail
+		if detail == want {
+			archiveID = id
+		}
 	}
 	mustNoError(t, rows.Err())
-	const want = "SEARCH e USING INDEX idx_conversation_provider_events_turn_completed (branch_id=?)"
 	if !slices.Contains(plan, want) {
 		t.Fatalf("alias e does not search the turn.completed index; want %q in plan:\n%s", want, strings.Join(plan, "\n"))
+	}
+	// The partial index alone still reparses every completion for each candidate
+	// turn during startup. Archive evidence must be read once per reconciliation.
+	for id := archiveID; id != 0; id = parents[id] {
+		if strings.Contains(details[id], "CORRELATED") {
+			t.Fatalf("authentication archive scan is correlated with candidate turns:\n%s", strings.Join(plan, "\n"))
+		}
 	}
 }
 

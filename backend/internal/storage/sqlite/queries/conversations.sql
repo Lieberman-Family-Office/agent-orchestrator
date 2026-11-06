@@ -2260,12 +2260,12 @@ WHERE t.conversation_id = sqlc.arg(conversation_id)
   AND t.branch_id = c.active_branch_id
   AND t.state = 'completed' AND t.rolled_back_at IS NULL
   AND t.provider_turn_id <> ''
-  AND EXISTS (
-    SELECT 1 FROM conversation_provider_events e
-    JOIN conversation_branches b ON b.id = c.active_branch_id
-    WHERE e.conversation_id = c.id AND e.branch_id = c.active_branch_id
+  AND t.provider_turn_id IN (
+    SELECT json_extract(e.payload_json, '$.providerTurnId') FROM conversation_provider_events e
+    JOIN conversations current ON current.id = sqlc.arg(conversation_id)
+    JOIN conversation_branches b ON b.id = current.active_branch_id
+    WHERE e.conversation_id = current.id AND e.branch_id = current.active_branch_id
       AND e.method = 'turn.completed'
-      AND json_extract(e.payload_json, '$.providerTurnId') = t.provider_turn_id
       AND json_extract(e.payload_json, '$.turnState') = 'completed'
       AND json_extract(e.payload_json, '$.error') IS NULL
       AND COALESCE(json_extract(e.payload_json, '$.providerConversationId'), '') IN ('', b.provider_conversation_id)
