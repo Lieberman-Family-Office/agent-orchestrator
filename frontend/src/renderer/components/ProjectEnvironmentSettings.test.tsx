@@ -21,12 +21,16 @@ it("saves validated variables without dropping other project settings", async ()
 	expect(value).toHaveAttribute("type", "password");
 	await userEvent.clear(value);
 	await userEvent.type(value, "new");
+	// A pause between edits can autosave the first draft before the form is submitted.
+	await waitFor(() => expect(putMock).toHaveBeenCalledOnce());
 	await userEvent.click(screen.getByRole("button", { name: "Add variable" }));
 	await userEvent.type(screen.getByLabelText("Name 2"), "SECOND");
 	await userEvent.type(screen.getByLabelText("Value 2"), "another");
 	fireEvent.submit(document.getElementById("project-settings-form")!);
-	await waitFor(() => expect(putMock).toHaveBeenCalledOnce());
-	expect(putMock.mock.calls[0][1].body).toEqual({ displayName: "Example", config: { env: { EXISTING: "new", SECOND: "another" }, autoReview: true } });
+	await waitFor(() => expect(putMock).toHaveBeenLastCalledWith("/api/v1/projects/{id}", {
+		params: { path: { id: "p" } },
+		body: { displayName: "Example", config: { env: { EXISTING: "new", SECOND: "another" }, autoReview: true } },
+	}));
 });
 
 it("imports pasted .env entries into the draft, replacing matching names without saving early", async () => {
