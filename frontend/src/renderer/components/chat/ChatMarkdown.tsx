@@ -37,6 +37,8 @@ import remend from "remend";
 import { splitStreamingMarkdown } from "../../lib/streaming-markdown";
 import { WrapText } from "lucide-react";
 import { cn } from "../../lib/utils";
+import { Button } from "../ui/button";
+import { Pressable } from "../ui/pressable";
 import { isHostLocalWebLink } from "../../lib/loopback";
 import { canonicalLanguage } from "../../lib/code-highlight";
 import { fenceOf } from "../../lib/markdown-fence";
@@ -52,10 +54,13 @@ import {
 	workspaceFilePath,
 } from "../../lib/external-link-policy";
 import { AppLink } from "../AppLink";
+import { ChatPathMenu, ChatPathMenuContext } from "../ChatPathMenu";
 import { ArtifactLinkPreviewCard, SessionLinkPreviewCard } from "../SessionLinkPreviewCard";
 import {
 	explicitWorkspaceFilePath,
 	findWorkspaceFilePath,
+	isAbsoluteFileReference,
+	normalizeWorkspaceFileReference,
 	workspaceFileOpenTarget,
 	workspaceFileReferenceLine,
 } from "../../lib/workspace-file-path";
@@ -116,6 +121,7 @@ const OpenChatLink = createContext<{
 const EMPTY_WORKSPACE_PATHS: string[] = [];
 
 export function ChatLinkProvider({
+	sessionId,
 	onLinkOpen,
 	onFileOpen,
 	onArtifactOpen,
@@ -128,6 +134,7 @@ export function ChatLinkProvider({
 	workspacePaths = EMPTY_WORKSPACE_PATHS,
 	children,
 }: {
+	sessionId?: string;
 	onLinkOpen?: (url: string) => void;
 	onFileOpen?: (path: string, line?: number) => void;
 	onArtifactOpen?: (path:string)=>void;
@@ -144,7 +151,13 @@ export function ChatLinkProvider({
 		() => ({ open: onLinkOpen, openFile: onFileOpen, openArtifact:onArtifactOpen,openFileExternal:onFileExternalOpen,artifactPaths, openSession: onSessionLinkOpen, remoteHost, sessionLinkHostId, sessionLinkSourceKind,workspacePaths }),
 		[onLinkOpen, onFileOpen, onArtifactOpen,onFileExternalOpen,artifactPaths,onSessionLinkOpen, remoteHost,sessionLinkHostId,sessionLinkSourceKind, workspacePaths],
 	);
-	return <OpenChatLink.Provider value={value}>{children}</OpenChatLink.Provider>;
+	const pathMenuValue = useMemo(
+		() => ({ sessionId, remote: Boolean(remoteHost || sessionLinkHostId || sessionLinkSourceKind === "cloud") }),
+		[sessionId, remoteHost, sessionLinkHostId, sessionLinkSourceKind],
+	);
+	return <ChatPathMenuContext.Provider value={pathMenuValue}>
+		<OpenChatLink.Provider value={value}>{children}</OpenChatLink.Provider>
+	</ChatPathMenuContext.Provider>;
 }
 
 function chatUrlTransform(url: string, key: string): string | undefined {
@@ -301,8 +314,10 @@ function CodeBlock({ code, language }: { code: string; language?: string }) {
 				    timeline's whole point is that prose dominates; a permanent row of
 				    controls on every fence is the opposite. */}
 				<div className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity duration-150 focus-within:opacity-100 group-hover/code:opacity-100">
-					<button
+					<Button
 						type="button"
+						variant="quiet"
+						size="icon-sm"
 						onClick={() => {
 							preferredWrap = !wrap;
 							setWrap(!wrap);
@@ -310,13 +325,9 @@ function CodeBlock({ code, language }: { code: string; language?: string }) {
 						aria-pressed={wrap}
 						aria-label="Wrap long lines"
 						title="Wrap long lines"
-						className={cn(
-							"flex size-7 items-center justify-center rounded-md transition-[background-color,color,transform] hover:bg-interactive-hover hover:text-foreground",
-							wrap ? "text-accent" : "text-muted-foreground",
-						)}
 					>
 						<WrapText aria-hidden="true" className="size-3" />
-					</button>
+					</Button>
 					<CopyButton text={code} label="Copy code" />
 				</div>
 			</div>
@@ -356,7 +367,7 @@ function compactEmoji(children: ReactNode): ReactNode {
 	return children;
 }
 
-function MarkdownLink({ href, children, className }: { href?: string; children?: ReactNode; className?: string }) {
+function MarkdownLink({ href, children, className, menuPath }: { href?: string; children?: ReactNode; className?: string; menuPath?: string }) {
 	const safeOriginContent = useContext(SafeOriginContent);
 	const { open: onLinkOpen, openFile: onFileOpen, openSession: onSessionLinkOpen, remoteHost, sessionLinkHostId, sessionLinkSourceKind, workspacePaths } = useContext(OpenChatLink);
 	const filePath = href && onFileOpen
@@ -366,9 +377,12 @@ function MarkdownLink({ href, children, className }: { href?: string; children?:
 	if (safeOriginContent && !sessionLink) return <>{children}</>;
 	const openInFiles = filePath && href && !/\.html?$/i.test(filePath) ? workspaceFileOpenTarget(href, filePath) : undefined;
 	if (remoteHost && href && (isHostLocalWebLink(href) || (isPotentialWorkspaceFileLink(href) && !openInFiles))) {
-		return <span className="text-muted-foreground" title={REMOTE_PREVIEW_UNAVAILABLE}>
+		const unavailable = <span className="text-muted-foreground" title={REMOTE_PREVIEW_UNAVAILABLE}>
 			{children}<span className="sr-only"> (remote preview unavailable)</span>
 		</span>;
+		return isPotentialWorkspaceFileLink(href)
+			? <ChatPathMenu path={normalizeWorkspaceFileReference(href)}>{unavailable}</ChatPathMenu>
+			: unavailable;
 	}
 	const browserLink = href ? !sessionLink && (isWebLink(href) || (!remoteHost && (!!filePath || isPotentialWorkspaceFileLink(href)))) : false;
 	return (
@@ -377,6 +391,7 @@ function MarkdownLink({ href, children, className }: { href?: string; children?:
 			onBrowserOpen={onLinkOpen}
 			inAppLink={href ? () => browserLink : undefined}
 			filePath={filePath && href ? workspaceFileOpenTarget(href, filePath) : filePath}
+			menuPath={menuPath ?? (href && (filePath || isPotentialWorkspaceFileLink(href)) ? normalizeWorkspaceFileReference(href) : undefined)}
 			onFileOpen={onFileOpen}
 			hoverPreview={sessionLink
 				? () => isSessionLink(href!)
@@ -514,10 +529,15 @@ export function FileReference({ path, line, className, children }: { path: strin
 	const file = useWorkspaceFile(path);
 	if (!file) return <span className={className} title={path}>{children}</span>;
 	return (
-		<button type="button" className={className} title={path} onClick={() => file.open(line)}>
+		<Pressable className={className} title={path} onClick={() => file.open(line)}>
 			{children}
-		</button>
+		</Pressable>
 	);
+}
+
+/** Opens a URL in this chat session's Browser panel; undefined when the chat cannot. */
+export function useChatBrowserOpen() {
+	return useContext(OpenChatLink).open;
 }
 
 /** The workspaces this chat's session links resolve against: the local daemon's, a remote host's, or Cloud's. */
@@ -530,7 +550,9 @@ export function useChatLinkWorkspaces() {
 export function ArtifactPathCode({ text, children }: { text: string; children: ReactNode }) {
 	const workspaces = useChatLinkWorkspaces();
 	const href = artifactLinkForPath(text, workspaces);
-	return href ? <MarkdownLink href={href}>{children}</MarkdownLink> : <>{children}</>;
+	const path = explicitWorkspaceFilePath(text);
+	if (href) return <MarkdownLink href={href} menuPath={path && isAbsoluteFileReference(path) ? path : undefined}>{children}</MarkdownLink>;
+	return path ? <ChatPathMenu path={path}><span>{children}</span></ChatPathMenu> : <>{children}</>;
 }
 
 function InlineCode({ children, className }: { children?: ReactNode; className?: string }) {
@@ -548,18 +570,25 @@ function InlineCode({ children, className }: { children?: ReactNode; className?:
 		</code>
 	);
 	if (insideLink || (workspacePath && artifactPath)) return code;
-	if (!filePath) return text?.includes("/") && openSession ? <ArtifactPathCode text={text}>{code}</ArtifactPathCode> : code;
-	return (
+	if (!filePath) {
+		if (text?.includes("/") && openSession) return <ArtifactPathCode text={text}>{code}</ArtifactPathCode>;
+		const path = text ? explicitWorkspaceFilePath(text) : undefined;
+		return path ? <ChatPathMenu path={path}>{code}</ChatPathMenu> : code;
+	}
+	const target = workspaceFileOpenTarget(text ?? "", filePath);
+	const openFile = () => {
+		if (source === "artifact") { onArtifactOpen?.(filePath); return; }
+		const line = workspaceFileReferenceLine(text ?? "");
+		if (line == null) onFileOpen?.(target);
+		else onFileOpen?.(target, line);
+	};
+	const link = (
 		<a
 			href={filePath}
 			onClick={(event) => {
 				event.preventDefault();
-				const target = workspaceFileOpenTarget(text ?? "", filePath);
-				if (event.metaKey && !remoteHost && onFileExternalOpen) {onFileExternalOpen(target,source);return;}
-				if(source==="artifact") {onArtifactOpen?.(filePath);return;}
-				const line = workspaceFileReferenceLine(text ?? "");
-				if (line == null) onFileOpen?.(target);
-				else onFileOpen?.(target, line);
+				if (event.metaKey && !remoteHost && onFileExternalOpen) { onFileExternalOpen(target, source); return; }
+				openFile();
 			}}
 			aria-label={`Open ${filePath} in Files`}
 			title={!remoteHost && onFileExternalOpen ? "Click to open in AO; Command-click to open in the default app" : "Open in AO"}
@@ -567,6 +596,12 @@ function InlineCode({ children, className }: { children?: ReactNode; className?:
 		>
 			{code}
 		</a>
+	);
+	// ponytail: Relative native paths use the workspace; add relative artifact menus when they accept an artifact source.
+	return artifactPath && !isAbsoluteFileReference(target) ? link : (
+		<ChatPathMenu path={artifactPath ? target : normalizeWorkspaceFileReference(text ?? "")} onFileOpen={openFile}>
+			{link}
+		</ChatPathMenu>
 	);
 }
 

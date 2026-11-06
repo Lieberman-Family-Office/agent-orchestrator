@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/kimiacp"
 	"github.com/aoagents/agent-orchestrator/backend/internal/attachmentstore"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
@@ -1557,8 +1558,22 @@ func TestResumeImportsNativeHistoryBeforeTheChatControllerStarts(t *testing.T) {
 }
 
 func TestOrdinaryResumeReconcilesActivityAliasesWithoutLoadingFullTimeline(t *testing.T) {
-	for _, mapping := range []string{"provider-turn", "prompt-text", "activity-alias"} {
-		t.Run(mapping, func(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		mapping   string
+		harness   domain.AgentHarness
+		prompt    string
+		wantFacts int
+	}{
+		{"provider-turn", "provider-turn", domain.HarnessCodex, "target", 2},
+		{"prompt-text", "prompt-text", domain.HarnessCodex, "target", 2},
+		{"activity-alias", "activity-alias", domain.HarnessCodex, "target", 2},
+		{"hermes-trimmed-prompt", "prompt-text", domain.HarnessHermes, " \n\ttarget\t\n ", 2},
+		{"codex-whitespace-distinct", "prompt-text", domain.HarnessCodex, " \n\ttarget\t\n ", 3},
+		{"claude-whitespace-distinct", "prompt-text", domain.HarnessClaudeCode, " \n\ttarget\t\n ", 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mapping := tc.mapping
 			st := openStore(t)
 			ctx := context.Background()
 			now := time.Now().UTC()
@@ -1570,8 +1585,12 @@ func TestOrdinaryResumeReconcilesActivityAliasesWithoutLoadingFullTimeline(t *te
 				t.Fatal(err)
 			}
 			for _, suffix := range []string{"target", "unrelated"} {
+				text := suffix
+				if suffix == "target" {
+					text = tc.prompt
+				}
 				created, err := st.AppendUserMessage(ctx, conversation.ID, testSession, "old", domain.ConversationMessage{
-					ID: suffix + "-message", Text: suffix, Origin: domain.MessageOriginHuman, ClientMessageID: suffix + "-client",
+					ID: suffix + "-message", Text: text, Origin: domain.MessageOriginHuman, ClientMessageID: suffix + "-client",
 				}, suffix, now)
 				if err != nil || !created {
 					t.Fatalf("seed prompt created=%v err=%v", created, err)
@@ -1614,7 +1633,7 @@ func TestOrdinaryResumeReconcilesActivityAliasesWithoutLoadingFullTimeline(t *te
 			})
 			t.Cleanup(func() { _ = svc.Stop(ctx, testSession) })
 			if _, err := svc.Start(ctx, chatsvc.StartConfig{
-				SessionID: testSession, ProjectID: testProject, Harness: domain.HarnessCodex,
+				SessionID: testSession, ProjectID: testProject, Harness: tc.harness,
 				WorkspacePath: t.TempDir(), ProviderConversationID: "thread-1",
 			}); err != nil {
 				t.Fatal(err)
@@ -1623,8 +1642,8 @@ func TestOrdinaryResumeReconcilesActivityAliasesWithoutLoadingFullTimeline(t *te
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(snapshot.Turns) != 2 || len(snapshot.Messages) != 2 || len(snapshot.Activities) != 2 {
-				t.Fatalf("replay duplicated facts: turns=%d messages=%d activities=%d", len(snapshot.Turns), len(snapshot.Messages), len(snapshot.Activities))
+			if len(snapshot.Turns) != tc.wantFacts || len(snapshot.Messages) != tc.wantFacts || len(snapshot.Activities) != tc.wantFacts {
+				t.Fatalf("replay facts: turns=%d messages=%d activities=%d, want %d each", len(snapshot.Turns), len(snapshot.Messages), len(snapshot.Activities), tc.wantFacts)
 			}
 		})
 	}
@@ -3579,6 +3598,40 @@ func TestSendVerifiesExcerptAndFallsBackToTextForProvider(t *testing.T) {
 				t.Fatalf("stale excerpt error = %v, want ErrExcerptStale", err)
 			}
 		})
+	}
+}
+
+// Claude Code can answer on its own after a background task finishes. That
+// message has no AO turn, but it is settled transcript the user can select.
+func TestSendAcceptsExcerptFromMessageOutsideAnyTurn(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	source := "Nothing else has changed. Did you close the `test` window?"
+	h.conv.emit(
+		ports.ChatEvent{Kind: ports.ChatEventMessageDelta, ProviderItemID: "turnless", Delta: source},
+		ports.ChatEvent{Kind: ports.ChatEventMessageCompleted, ProviderItemID: "turnless", Text: source},
+	)
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Messages) == 1 && !s.Messages[0].Streaming
+	})
+	message := snapshot.Messages[0]
+	if message.TurnID != "" {
+		t.Fatalf("source turn = %q, want a message outside any turn", message.TurnID)
+	}
+
+	if _, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+		Text: "I think it crashed", ClientMessageID: "turnless-followup", Origin: domain.MessageOriginHuman,
+		Excerpts: []ports.ChatExcerptReference{{
+			ConversationID: h.ctrl.ConversationID(), MessageID: message.ID,
+			Revision: message.Revision, Text: "Did you close the test window?",
+		}},
+	}); err != nil {
+		t.Fatalf("send with excerpt from a message outside any turn: %v", err)
+	}
+	sent := h.conv.sentMessages()
+	if len(sent) != 1 || !strings.Contains(sent[0].Text, "Selected text:\n---\nDid you close the test window?") ||
+		!strings.Contains(sent[0].Text, "Assistant:\n"+source) {
+		t.Fatalf("provider delivery = %#v", sent)
 	}
 }
 
@@ -5975,6 +6028,17 @@ func TestStopAfterRecoveryAutoDropConfirmsHostBeforeOwnedCleanup(t *testing.T) {
 				t.Fatalf("Stop cleaned unconfirmed or replacement-owned work: turns=%+v activity=%+v", states, snapshot.Activities[0])
 			}
 		})
+	}
+}
+
+func TestServiceTerminateAllTerminatesPersistentConversation(t *testing.T) {
+	provider := &terminatingConversation{fakeConversation: newFakeConversation()}
+	h := newHarnessWithConversation(t, provider)
+	if err := h.svc.TerminateAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !provider.terminated.Load() {
+		t.Fatal("desktop quit detached the persistent provider instead of terminating it")
 	}
 }
 
@@ -8685,5 +8749,62 @@ func TestReservedBoundaryAdoptsSuccessorHandleWithoutRewritingHistory(t *testing
 	if keptSource.ProviderConversationID != ancestor ||
 		keptSource.ProviderScopeID != sourceBranch.ProviderScopeID {
 		t.Fatalf("ancestor branch = %+v, want the recorded handle untouched", keptSource)
+	}
+}
+
+// No real executable is started by capability discovery or admission.
+type kimiCapabilityPlugin struct{}
+
+func (kimiCapabilityPlugin) ResolveBinary(context.Context) (string, error) { return "/fake/kimi", nil }
+func (kimiCapabilityPlugin) AuthStatus(context.Context) (ports.AgentAuthStatus, error) {
+	return ports.AgentAuthStatusAuthorized, nil
+}
+
+func TestPermissionModeCatalogMatchesPreflight(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		driver ports.ChatDriver
+		want   []ports.PermissionMode
+	}{
+		{"kimi", kimiacp.New(kimiCapabilityPlugin{}, nil), []ports.PermissionMode{ports.PermissionModeDefault}},
+		{"full approvals", fakeDriver{}, ports.PermissionModesStrictestFirst},
+		{"no approval channel", fakeDriver{caps: ports.ChatCapabilities{ports.ChatCapabilityStreaming: true, ports.ChatCapabilityInterrupt: true, ports.ChatCapabilityResume: true}}, []ports.PermissionMode{ports.PermissionModeBypassPermissions}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := chatsvc.New(chatsvc.Options{Store: openStore(t), Drivers: fakeRegistry{driver: tc.driver}, Log: slog.New(slog.DiscardHandler)})
+			modes, err := svc.PermissionModes(context.Background(), tc.driver.Harness())
+			if err != nil || !reflect.DeepEqual(modes, tc.want) {
+				t.Fatalf("modes = %v, %v; want %v", modes, err, tc.want)
+			}
+			for _, mode := range ports.PermissionModesStrictestFirst {
+				err := svc.PreflightChat(context.Background(), tc.driver.Harness(), mode)
+				if slices.Contains(tc.want, mode) != (err == nil) {
+					t.Fatalf("preflight %s = %v; modes %v", mode, err, modes)
+				}
+				if tc.name == "kimi" && mode != ports.PermissionModeDefault && !errors.Is(err, ports.ErrChatPermissionModeUnsupported) {
+					t.Fatalf("Kimi rejection = %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestStartRejectsProviderPermissionBeforeDriverLaunch(t *testing.T) {
+	launched := false
+	svc := chatsvc.New(chatsvc.Options{
+		Store: openStore(t), Drivers: fakeRegistry{driver: fakeDriver{
+			supports: func(mode ports.PermissionMode) bool { return mode == ports.PermissionModeDefault },
+			start: func(ports.ChatStartConfig) (ports.ChatConversation, error) {
+				launched = true
+				return newFakeConversation(), nil
+			},
+		}}, Log: slog.New(slog.DiscardHandler),
+	})
+	_, err := svc.Start(context.Background(), chatsvc.StartConfig{SessionID: testSession, Harness: domain.HarnessKimi, WorkspacePath: t.TempDir(), Permissions: ports.PermissionModeAuto})
+	if !errors.Is(err, ports.ErrChatPermissionModeUnsupported) {
+		t.Fatalf("Start = %v", err)
+	}
+	if launched {
+		t.Fatal("unsupported permission reached provider launch")
 	}
 }
