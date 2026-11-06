@@ -28,6 +28,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 )
 
 var ctx = context.Background()
@@ -11127,7 +11128,7 @@ func TestSend_PaneFallbackCannotPairLostPromptHookWithPriorTrustedAssistant(t *t
 	dataDir := t.TempDir()
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	st, err := sqlite.Open(dataDir)
+	st, err := sqlitetest.Open(dataDir)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -11270,7 +11271,7 @@ func TestActivitySignal_CASRetryPreservesCorrelatedPermissionPost(t *testing.T) 
 	dataDir := t.TempDir()
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	baseStore, err := sqlite.Open(dataDir)
+	baseStore, err := sqlitetest.Open(dataDir)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
@@ -11369,7 +11370,7 @@ func TestSend_PaneFallbackWinsAgainstStaleLifecycleProjection(t *testing.T) {
 	dataDir := t.TempDir()
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
-	baseStore, err := sqlite.Open(dataDir)
+	baseStore, err := sqlitetest.Open(dataDir)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
