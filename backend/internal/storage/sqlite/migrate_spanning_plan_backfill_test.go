@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 )
@@ -75,7 +76,30 @@ INSERT INTO conversation_activities (id, conversation_id, turn_id, sequence, kin
     ('forked-edit', 'forked', NULL, 3, 'plan', 'completed', '', '{"event":"plan","steps":`+done+`}', '', ?, ?, 'forked:edit');`,
 		at(5), at(5), at(6), at(6))
 
-	upTo(t, db, 20261103094403671)
+	// The production migration path must prepare the lookup index before any
+	// backfill writes, not install it after the expensive migration has run.
+	mustExec(t, db, `CREATE TRIGGER require_spanning_plan_lookup_index
+BEFORE UPDATE OF detail_json ON conversation_activities
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1 FROM sqlite_master WHERE type = 'index'
+        AND name = 'idx_spanning_plan_backfill_switch'
+    ) THEN RAISE(ABORT, 'spanning plan backfill index missing') END;
+END;`)
+	if err := migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, `DROP TRIGGER require_spanning_plan_lookup_index`)
+	if err := migrate(db); err != nil {
+		t.Fatalf("reopen migrated database: %v", err)
+	}
+	var indexes int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE name = 'idx_spanning_plan_backfill_switch'`).Scan(&indexes); err != nil {
+		t.Fatal(err)
+	}
+	if indexes != 0 {
+		t.Fatal("migration-only index remained after the backfill")
+	}
 
 	type flags struct{ spans, superseded bool }
 	row := func(id string) flags {
@@ -105,6 +129,58 @@ INSERT INTO conversation_activities (id, conversation_id, turn_id, sequence, kin
 			t.Errorf("%s: spansTurns=%v superseded=%v, want spansTurns=%v superseded=%v",
 				name, test.got.spans, test.got.superseded, test.want.spans, test.want.superseded)
 		}
+	}
+}
+
+func TestSpanningPlanBackfillUsesSwitchIndex(t *testing.T) {
+	db := openMigratedDatabaseCopyNoForeignKeys(t, 20261102164353715)
+	// Invalid system JSON must remain safe when the index evaluates its filter.
+	mustExec(t, db, `INSERT INTO conversation_activities
+(id, conversation_id, branch_id, sequence, kind, status, detail_json, created_at, updated_at)
+VALUES ('invalid-system', 'missing', 'missing:root', 1, 'system', 'completed', '{', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`)
+	gooseMu.Lock()
+	defer gooseMu.Unlock()
+	for range 2 {
+		if err := prepareSpanningPlanBackfillMigration(db); err != nil {
+			t.Fatal(err)
+		}
+	}
+	body, err := migrationsFS.ReadFile("migrations/20261103094403671_backfill_spanning_plan_copies.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Explain the shipped statement, not a rewritten approximation of its probes.
+	_, statement, ok := strings.Cut(string(body), "CREATE TEMP TABLE legacy_spanning_plan_rows AS\n")
+	if !ok {
+		t.Fatal("legacy plan selection not found")
+	}
+	statement, _, ok = strings.Cut(statement, ";")
+	if !ok {
+		t.Fatal("legacy plan selection has no terminator")
+	}
+	rows, err := db.Query("EXPLAIN QUERY PLAN " + statement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = rows.Close() }()
+	indexed := map[string]bool{}
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		for _, direction := range []string{"<", ">"} {
+			if detail == "SEARCH m USING INDEX idx_spanning_plan_backfill_switch (conversation_id=? AND sequence"+direction+"?)" {
+				indexed[direction] = true
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !indexed["<"] || !indexed[">"] {
+		t.Fatalf("provider-switch probes lack bounded index searches: %v", indexed)
 	}
 }
 
