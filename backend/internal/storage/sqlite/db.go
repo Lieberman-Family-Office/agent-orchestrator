@@ -369,6 +369,9 @@ func migrate(db *sql.DB) error {
 	if err := prepareSessionReviewerAgentConfigMigration(db); err != nil {
 		return fmt.Errorf("prepare session reviewer agent-config migration: %w", err)
 	}
+	if err := prepareSpanningPlanBackfillMigration(db); err != nil {
+		return fmt.Errorf("prepare spanning-plan backfill migration: %w", err)
+	}
 	// Builds can advance a database past a migration that is added or
 	// renumbered later (notably across fast-moving Nightly releases). Apply
 	// those embedded migrations instead of permanently wedging daemon startup
@@ -376,7 +379,33 @@ func migrate(db *sql.DB) error {
 	if err := goose.Up(db, "migrations", goose.WithAllowMissing()); err != nil {
 		return fmt.Errorf("run migrations: %w", err)
 	}
+	if _, err := db.Exec(`DROP INDEX IF EXISTS idx_spanning_plan_backfill_switch`); err != nil {
+		return fmt.Errorf("remove spanning-plan backfill index: %w", err)
+	}
 	return reconcileSchema(db)
+}
+
+// prepareSpanningPlanBackfillMigration bounds each historical plan's two
+// provider-switch lookups to switch events instead of scanning its whole chat.
+// Apply preceding migrations first: older table rebuilds would drop the index.
+// The shipped SQL stays unchanged; migrate removes the index after success.
+func prepareSpanningPlanBackfillMigration(db *sql.DB) error {
+	if _, err := goose.EnsureDBVersion(db); err != nil {
+		return err
+	}
+	var applied bool
+	if err := db.QueryRow(`SELECT COALESCE((SELECT is_applied FROM goose_db_version
+WHERE version_id = 20261103094403671 ORDER BY id DESC LIMIT 1), 0)`).Scan(&applied); err != nil || applied {
+		return err
+	}
+	if err := goose.UpTo(db, "migrations", 20261103094403671-1, goose.WithAllowMissing()); err != nil {
+		return err
+	}
+	_, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_spanning_plan_backfill_switch
+ON conversation_activities(conversation_id, sequence)
+WHERE kind = 'system' AND json_valid(detail_json)
+  AND json_extract(detail_json, '$.event') = 'provider_switch'`)
+	return err
 }
 
 const (
