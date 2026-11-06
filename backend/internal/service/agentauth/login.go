@@ -2,6 +2,7 @@ package agentauth
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/url"
 	"os"
@@ -235,7 +236,7 @@ func (s *Service) SubmitLoginCode(ctx context.Context, agentID, id, code string)
 		writeErr = writeCtx.Err()
 		op.cancel()
 		_ = op.stdin.Close()
-		_ = <-written // Preserve the cancellation error while joining the writer.
+		writeErr = errors.Join(writeErr, <-written)
 	}
 	if writeErr != nil {
 		s.mu.Lock()

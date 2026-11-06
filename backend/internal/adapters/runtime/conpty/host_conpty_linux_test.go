@@ -99,7 +99,13 @@ func TestLinuxDefaultSpawnHostEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	addr, hostPID, err := defaultSpawnHost(ctx, "spawn-e2e", t.TempDir(), []string{
 		"env", "AO_PREFIX_VALUE=prefix", "/bin/sh", "-c",
-		`printf '\033[c'; sleep 0.05; printf 'ready:%s:%s\n' "$AO_DIRECT_PTY_TEST" "$AO_PREFIX_VALUE"; IFS= read -r line; printf 'received:%s\n' "$line"; sleep 30`,
+		`stty -echo -icanon min 1 time 0
+printf '\033[c'
+reply=$(dd bs=1 count=7 2>/dev/null)
+[ "$reply" = "$(printf '\033[?1;2c')" ] || exit 1
+stty echo icanon
+printf 'ready:%s:%s\n' "$AO_DIRECT_PTY_TEST" "$AO_PREFIX_VALUE"
+IFS= read -r line; printf 'received:%s\n' "$line"; sleep 30`,
 	}, map[string]string{"AO_DIRECT_PTY_TEST": "works"}, HostOptions{})
 	if err != nil {
 		cancel()
@@ -117,9 +123,8 @@ func TestLinuxDefaultSpawnHostEndToEnd(t *testing.T) {
 		}
 	})
 
-	if err := clientSendInput(addr, "hello\n"); err != nil {
-		t.Fatalf("send input: %v", err)
-	}
+	// Wait for the fixture to consume the DA1 reply before sending user input.
+	sentInput := false
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		output, outputErr := clientGetOutput(context.Background(), addr, 20)
@@ -127,7 +132,13 @@ func TestLinuxDefaultSpawnHostEndToEnd(t *testing.T) {
 			t.Fatalf("get output: %v", outputErr)
 		}
 		text := strings.ReplaceAll(output, "\r", "")
-		if strings.Contains(text, "ready:works:prefix") && strings.Contains(text, "received:hello") {
+		if !sentInput && strings.Contains(text, "ready:works:prefix") {
+			if err := clientSendInput(addr, "hello\n"); err != nil {
+				t.Fatalf("send input: %v", err)
+			}
+			sentInput = true
+		}
+		if sentInput && strings.Contains(text, "received:hello") {
 			break
 		}
 		if time.Now().After(deadline) {
