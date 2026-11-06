@@ -22,6 +22,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	chatsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/chat"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 )
 
 type fixedBrowserCapability string
@@ -849,7 +850,7 @@ func TestSpawnPostCreateSessionContext(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dataDir, workspace := t.TempDir(), t.TempDir()
-			st, err := sqlite.Open(dataDir)
+			st, err := sqlitetest.Open(dataDir)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1064,7 +1065,7 @@ func TestChatGenerationReservationPreservesUnpublishedWorkspace(t *testing.T) {
 			t.Run(fmt.Sprintf("async=%v/setup=%v", async, setup), func(t *testing.T) {
 				ctx := context.Background()
 				dataDir, repo := t.TempDir(), newManagerGitRepo(t)
-				st, err := sqlite.Open(dataDir)
+				st, err := sqlitetest.Open(dataDir)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -1219,7 +1220,7 @@ func TestKnownSynchronousFailureCanRetryWorkspaceCleanup(t *testing.T) {
 		t.Run(fmt.Sprintf("%v/setup=%v/effect=%s", tc.refusal, tc.setup, tc.effect), func(t *testing.T) {
 			m, seed, rt, ws := newManager()
 			m.dataDir, ws.path = t.TempDir(), t.TempDir()
-			st, err := sqlite.Open(m.dataDir)
+			st, err := sqlitetest.Open(m.dataDir)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1393,7 +1394,7 @@ func TestBackgroundHealthOverlapsRealPostCreate(t *testing.T) {
 		t.Skip("POSIX shell hook")
 	}
 	dataDir, workspace, signals := t.TempDir(), t.TempDir(), t.TempDir()
-	st, err := sqlite.Open(dataDir)
+	st, err := sqlitetest.Open(dataDir)
 	if err != nil {
 		t.Fatal(err)
 	}

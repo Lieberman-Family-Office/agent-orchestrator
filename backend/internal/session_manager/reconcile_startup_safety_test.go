@@ -17,6 +17,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 )
 
 type failingProvisionStore struct {
@@ -98,7 +99,7 @@ func TestKillPreservesPublishedWorkspaceAfterStartupSettlementFailure(t *testing
 			t.Run(string(setup)+"/dirty="+strconv.FormatBool(dirty), func(t *testing.T) {
 				ctx := context.Background()
 				dataDir, repo := t.TempDir(), newManagerGitRepo(t)
-				st, err := sqlite.Open(dataDir)
+				st, err := sqlitetest.Open(dataDir)
 				if err != nil {
 					t.Fatal(err)
 				}

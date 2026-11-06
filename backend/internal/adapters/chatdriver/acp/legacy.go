@@ -2,6 +2,7 @@ package acp
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	jsonv2 "encoding/json/v2"
@@ -28,12 +29,15 @@ type legacyACPTransport struct {
 	output *io.PipeWriter
 	nextID atomic.Uint64
 
-	mu              sync.Mutex
-	pending         map[string]chan legacyACPResponse
-	models          *legacySessionModelState
-	reader          *io.PipeReader
-	updateProcessed <-chan string
-	streamDone      <-chan struct{}
+	mu                    sync.Mutex
+	pending               map[string]chan legacyACPResponse
+	models                *legacySessionModelState
+	reader                *io.PipeReader
+	updateProcessed       <-chan string
+	streamDone            <-chan struct{}
+	toolCallToRPCID       map[string]string
+	latestPermissionRPCID string
+	pendingAnswers        map[string]map[string]string
 }
 
 type lockedWriteCloser struct {
@@ -80,16 +84,22 @@ const localNotificationBarrierMethod = "_ao/local_notification_barrier"
 
 func newLegacyACPTransport(stdin io.WriteCloser, updateProcessed <-chan string, streamDone <-chan struct{}) (*legacyACPTransport, io.WriteCloser, io.Reader) {
 	writer := &lockedWriteCloser{inner: stdin}
+	sdkReader, sdkWriter := io.Pipe()
 	transport := &legacyACPTransport{
 		writer:          writer,
+		reader:          sdkReader,
+		output:          sdkWriter,
 		pending:         make(map[string]chan legacyACPResponse),
 		updateProcessed: updateProcessed,
 		streamDone:      streamDone,
+		toolCallToRPCID: make(map[string]string),
+		pendingAnswers:  make(map[string]map[string]string),
 	}
-	sdkReader, sdkWriter := io.Pipe()
-	transport.reader = sdkReader
-	transport.output = sdkWriter
-	return transport, writer, sdkReader
+	rewriter := &permissionResponseRewriter{
+		inner:     writer,
+		transport: transport,
+	}
+	return transport, rewriter, sdkReader
 }
 
 func (t *legacyACPTransport) forward(source io.Reader) {
@@ -104,7 +114,7 @@ func (t *legacyACPTransport) forward(source io.Reader) {
 		decoded := jsonv2.Unmarshal(line, &notification, json.DefaultOptionsV1(), json.ReportErrorsWithLegacySemantics(false)) == nil
 		var intercepted bool
 		if decoded {
-			intercepted = t.interceptEnvelope(notification)
+			intercepted = t.interceptEnvelope(notification, line)
 		} else {
 			// Legacy responses historically ignore unrelated malformed envelope fields.
 			intercepted = t.intercept(line)
@@ -170,10 +180,29 @@ func (t *legacyACPTransport) intercept(line []byte) bool {
 	if err := json.Unmarshal(line, &envelope); err != nil {
 		return false
 	}
-	return t.interceptEnvelope(legacyACPEnvelope{ID: &envelope.ID, Result: envelope.Result, Error: envelope.Error})
+	return t.interceptEnvelope(legacyACPEnvelope{ID: &envelope.ID, Result: envelope.Result, Error: envelope.Error}, line)
 }
 
-func (t *legacyACPTransport) interceptEnvelope(envelope legacyACPEnvelope) bool {
+func (t *legacyACPTransport) interceptEnvelope(envelope legacyACPEnvelope, line []byte) bool {
+	if envelope.Method == "session/request_permission" && envelope.ID != nil && len(*envelope.ID) > 0 {
+		var req struct {
+			Params struct {
+				ToolCall struct {
+					ToolCallID string `json:"toolCallId"`
+				} `json:"toolCall"`
+			} `json:"params"`
+		}
+		if json.Unmarshal(line, &req) == nil {
+			rawID := string(bytes.TrimSpace(*envelope.ID))
+			t.mu.Lock()
+			if req.Params.ToolCall.ToolCallID != "" {
+				t.toolCallToRPCID[req.Params.ToolCall.ToolCallID] = rawID
+			}
+			t.latestPermissionRPCID = rawID
+			t.mu.Unlock()
+		}
+	}
+
 	var requestID string
 	if envelope.ID != nil && len(*envelope.ID) > 0 && json.Unmarshal(*envelope.ID, &requestID) == nil &&
 		strings.HasPrefix(requestID, "ao-legacy-") {
@@ -256,4 +285,86 @@ func (t *legacyACPTransport) removePending(requestID string) {
 	t.mu.Lock()
 	delete(t.pending, requestID)
 	t.mu.Unlock()
+}
+
+func (t *legacyACPTransport) registerAnswersForToolCall(toolCallID string, answers map[string]string) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	rpcID := t.toolCallToRPCID[toolCallID]
+	if rpcID == "" {
+		rpcID = t.latestPermissionRPCID
+	}
+	if rpcID != "" {
+		t.pendingAnswers[rpcID] = answers
+	}
+}
+
+func (t *legacyACPTransport) hasPendingAnswers() bool {
+	if t == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.pendingAnswers) > 0
+}
+
+func (t *legacyACPTransport) rewriteResponse(data []byte) []byte {
+	var envelope struct {
+		ID     json.RawMessage `json:"id"`
+		Result map[string]any  `json:"result"`
+	}
+	if err := json.Unmarshal(data, &envelope); err != nil || len(envelope.ID) == 0 || envelope.Result == nil {
+		return data
+	}
+
+	rpcID := string(bytes.TrimSpace(envelope.ID))
+	t.mu.Lock()
+	answers, ok := t.pendingAnswers[rpcID]
+	if ok {
+		delete(t.pendingAnswers, rpcID)
+	}
+	t.mu.Unlock()
+
+	if !ok || len(answers) == 0 {
+		return data
+	}
+
+	var rawMsg map[string]any
+	if err := json.Unmarshal(data, &rawMsg); err != nil {
+		return data
+	}
+	envelope.Result["answers"] = answers
+	rawMsg["result"] = envelope.Result
+	modifiedLine, err := json.Marshal(rawMsg)
+	if err != nil {
+		return data
+	}
+	return append(modifiedLine, '\n')
+}
+
+type permissionResponseRewriter struct {
+	inner     *lockedWriteCloser
+	transport *legacyACPTransport
+}
+
+func (r *permissionResponseRewriter) Write(data []byte) (int, error) {
+	originalLength := len(data)
+	if r.transport != nil && r.transport.hasPendingAnswers() {
+		data = r.transport.rewriteResponse(data)
+	}
+	n, err := r.inner.Write(data)
+	if err != nil {
+		return 0, err
+	}
+	if n != len(data) {
+		return 0, io.ErrShortWrite
+	}
+	return originalLength, nil
+}
+
+func (r *permissionResponseRewriter) Close() error {
+	return r.inner.Close()
 }

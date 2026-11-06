@@ -9,7 +9,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	"github.com/aoagents/agent-orchestrator/backend/internal/observe/reaper"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
-	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 )
 
 // idleRestartRuntime restarts a terminal in place and reports no command
@@ -25,7 +25,7 @@ func (idleRestartRuntime) RunningWorkloadCommands(context.Context, ports.Runtime
 // the recent-activity window: it must leave the session the update resumes.
 func TestTerminalStoppedForUpdateSurvivesTheReaperAndResumes(t *testing.T) {
 	ctx := context.Background()
-	st, err := sqlite.Open(t.TempDir())
+	st, err := sqlitetest.Open(t.TempDir())
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}

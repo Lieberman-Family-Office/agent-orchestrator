@@ -2330,6 +2330,10 @@ BEGIN
 	// this column, so repair field databases that recorded 0132 without adding it.
 	{version: 132, table: "conversations", column: "opencode_mode",
 		addDDL: `ALTER TABLE conversations ADD COLUMN opencode_mode TEXT NOT NULL DEFAULT ''`},
+	// 0203_conversation_message_continuation.sql (upstream 0199). Use the fork
+	// version so its 0199 interrupt receipt cannot preempt a pending 0203.
+	{version: 203, table: "conversation_messages", column: "continuation",
+		addDDL: `ALTER TABLE conversation_messages ADD COLUMN continuation INTEGER NOT NULL DEFAULT 0 CHECK (continuation IN (0, 1))`},
 }
 
 // reconcileSchema verifies that the columns in schemaRepairs physically exist

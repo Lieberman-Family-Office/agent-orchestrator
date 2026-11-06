@@ -980,6 +980,16 @@ func TestPrepareSessionHomeAnchorsConditionalIncludeHeaders(t *testing.T) {
 		}
 	}
 
+	canonicalHome, err := filepath.EvalSymlinks(realHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := effectiveGitConfigIn(t, realHome, "", work)["user.email"]; got != "home@example.com" {
+		t.Fatalf("native user.email = %q, want the fixture's gitdir:./ include to match", got)
+	}
+	if got := effectiveGitConfigIn(t, realHome, "", project)["commit.gpgsign"]; got != "true" {
+		t.Fatalf("native commit.gpgsign = %q, want the fixture's gitdir:~/ include to match", got)
+	}
 	home := prepareHome(t, t.TempDir(), domain.SessionID("mer-1"), "worker role")
 
 	workConfig := effectiveGitConfigIn(t, home, "", work)
@@ -1003,7 +1013,7 @@ func TestPrepareSessionHomeAnchorsConditionalIncludeHeaders(t *testing.T) {
 	if err != nil || len(copies) == 0 {
 		t.Fatalf("session git config copies = %v (%v), want the rewritten config", copies, err)
 	}
-	anchored := "gitdir:" + filepath.ToSlash(realHome) + "/"
+	anchored := "gitdir:" + filepath.ToSlash(canonicalHome) + "/"
 	for _, entry := range copies {
 		contents := readHomeFile(t, filepath.Join(home, sessionGitConfigCopiesDir, entry.Name()))
 		for _, stale := range []string{"~/", "gitdir:./", "gitdir/i:./"} {
@@ -1253,6 +1263,28 @@ func TestGitConditionPatternAnchoring(t *testing.T) {
 		}
 		if got != test.want || gotOK != test.ok {
 			t.Fatalf("anchor %q -> (%q, %v), want (%q, %v)", test.condition, got, gotOK, test.want, test.ok)
+		}
+	}
+}
+
+func TestGitConditionPatternAnchoringResolvesSymlinkBases(t *testing.T) {
+	base := t.TempDir()
+	canonical, err := filepath.EvalSymlinks(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "home")
+	if err := os.Symlink(base, link); err != nil {
+		if runtime.GOOS == "windows" {
+			t.Skipf("symlink privilege unavailable: %v", err)
+		}
+		t.Fatal(err)
+	}
+	for _, pattern := range []string{"./", "~/", "./projects/**", "~/projects/**/"} {
+		got, ok := anchorConfigPattern(pattern, link, link)
+		want := filepath.ToSlash(canonical) + "/" + pattern[2:]
+		if !ok || got != want {
+			t.Fatalf("anchor %q = (%q, %v), want (%q, true)", pattern, got, ok, want)
 		}
 	}
 }

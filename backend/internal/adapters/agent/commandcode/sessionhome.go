@@ -531,6 +531,10 @@ func anchorConfigPattern(pattern, sourceDir, realHome string) (string, bool) {
 		// already mean the same thing from any location.
 		return "", false
 	}
+	// Git matches the physical directory; resolve only the base, not its glob suffix.
+	if resolved, err := filepath.EvalSymlinks(base); err == nil {
+		base = resolved
+	}
 	anchored := filepath.ToSlash(base)
 	if rest == "" {
 		// A directory pattern only matches with its trailing separator.

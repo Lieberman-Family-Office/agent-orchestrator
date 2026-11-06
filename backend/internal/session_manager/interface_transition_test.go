@@ -23,6 +23,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
+	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
 )
 
 type transitionStore struct {
@@ -1565,7 +1566,7 @@ func TestInterfaceTransitionProviderHistoryRecoverySurvivesDaemonRestart(t *test
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
 
-	beforeRestart, err := sqlite.Open(dataDir)
+	beforeRestart, err := sqlitetest.Open(dataDir)
 	if err != nil {
 		t.Fatalf("open pre-restart store: %v", err)
 	}
@@ -3209,7 +3210,7 @@ func TestRecoverInterruptedClaudeTUIToChatPreservesPoisonedCheckpointThroughResu
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Millisecond)
 
-	st, err := sqlite.Open(dataDir)
+	st, err := sqlitetest.Open(dataDir)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
