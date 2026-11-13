@@ -22,7 +22,7 @@ describe("chat path menus", () => {
 	it.each(["inline", "link"])("keeps the displayed %s path for native actions when the catalog matches only its basename", async (kind) => {
 		const action = vi.spyOn(aoBridge.editorHandoff, "pathAction").mockResolvedValue(undefined);
 		const openFile = chat(kind === "inline" ? "`dist/a file.ts:12`" : "[source](dist/a%20file.ts#L12)");
-		const trigger = kind === "inline" ? screen.getByRole("link") : screen.getByRole("link", { name: "source" });
+		const trigger = kind === "inline" ? screen.getByRole("button") : screen.getByRole("link", { name: "source" });
 		await userEvent.click(trigger);
 		expect(openFile).toHaveBeenCalledExactlyOnceWith("src/a file.ts", 12);
 		for (const [label, expected] of [
@@ -44,7 +44,7 @@ describe("chat path menus", () => {
 		else vi.spyOn(aoBridge.editorHandoff, "pathAction").mockReturnValue(pending);
 		const toast = vi.spyOn(useUiStore.getState(), "showGlobalToast").mockClear();
 		chat("`src/a file.ts`", { remoteHost });
-		fireEvent.contextMenu(screen.getByRole("link"));
+		fireEvent.contextMenu(screen.getByRole("button"));
 		await userEvent.click(screen.getByRole("menuitem", { name: "Copy path" }));
 		expect(toast).not.toHaveBeenCalled();
 		complete();
@@ -56,7 +56,7 @@ describe("chat path menus", () => {
 		else vi.spyOn(aoBridge.editorHandoff, "pathAction").mockRejectedValue(new Error("Clipboard unavailable"));
 		const toast = vi.spyOn(useUiStore.getState(), "showGlobalToast").mockClear();
 		chat("`src/a file.ts`", { remoteHost });
-		fireEvent.contextMenu(screen.getByRole("link"));
+		fireEvent.contextMenu(screen.getByRole("button"));
 		await userEvent.click(screen.getByRole("menuitem", { name: "Copy path" }));
 		await waitFor(() => expect(toast).toHaveBeenCalledExactlyOnceWith("Could not complete the path action", "Clipboard unavailable", "error"));
 	});
@@ -65,7 +65,7 @@ describe("chat path menus", () => {
 		const action = vi.spyOn(aoBridge.editorHandoff, "pathAction").mockResolvedValue(undefined);
 		const getState = vi.spyOn(aoBridge.editorHandoff, "getState");
 		const openFile = chat(kind === "inline" ? `\`${reference}\`` : `[source](</other-project/src/a file.ts:12>)`);
-		const trigger = kind === "inline" ? screen.getByRole("link", { name: "Open src/a file.ts in Files" }) : screen.getByRole("link", { name: "source" });
+		const trigger = kind === "inline" ? screen.getByRole("button", { name: "Open src/a file.ts in Files" }) : screen.getByRole("link", { name: "source" });
 		await userEvent.click(trigger);
 		expect(openFile).toHaveBeenCalledExactlyOnceWith("/other-project/src/a file.ts", 12);
 		expect(getState).not.toHaveBeenCalled();
@@ -103,8 +103,8 @@ describe("chat path menus", () => {
 		const action = vi.spyOn(aoBridge.editorHandoff, "pathAction");
 		const copy = vi.spyOn(aoBridge.clipboard, "writeText").mockResolvedValue(undefined);
 		chat(`\`${reference}\``, source);
-		fireEvent.contextMenu(screen.getByRole("link"));
-		expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["Open in AO", "Copy path"]);
+		fireEvent.contextMenu(screen.getByRole("button"));
+		expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["Open in Orchestrator", "Copy path"]);
 		await userEvent.click(screen.getByRole("menuitem", { name: "Copy path" }));
 		expect(copy).toHaveBeenCalledExactlyOnceWith("/other-project/src/a file.ts");
 		expect(getState).not.toHaveBeenCalled();
@@ -117,11 +117,11 @@ describe("chat path menus", () => {
 		const copy = vi.spyOn(aoBridge.clipboard, "writeText").mockResolvedValue(undefined);
 		const openFile = chat("[source](src/a%20file.ts#L12)", { remoteHost: true });
 		fireEvent.contextMenu(screen.getByRole("link"));
-		expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["Open in AO", "Copy path"]);
+		expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual(["Open in Orchestrator", "Copy path"]);
 		await userEvent.click(screen.getByRole("menuitem", { name: "Copy path" }));
 		expect(copy).toHaveBeenCalledWith("src/a file.ts");
 		fireEvent.contextMenu(screen.getByRole("link"));
-		await userEvent.click(screen.getByRole("menuitem", { name: "Open in AO" }));
+		await userEvent.click(screen.getByRole("menuitem", { name: "Open in Orchestrator" }));
 		expect(openFile).toHaveBeenCalledWith("src/a file.ts");
 		expect(getState).not.toHaveBeenCalled();
 		expect(action).not.toHaveBeenCalled();
@@ -152,7 +152,7 @@ describe("chat path menus", () => {
 		});
 		const action = vi.spyOn(aoBridge.editorHandoff, "pathAction");
 		chat("`src/a file.ts`");
-		fireEvent.contextMenu(screen.getByRole("link"));
+		fireEvent.contextMenu(screen.getByRole("button"));
 		const reveal = await screen.findByRole("menuitem", { name: "Reveal in Finder" });
 		expect(reveal).toHaveAttribute("aria-disabled", "true");
 		expect(screen.getByRole("menuitem", { name: "Open with VS Code" })).toHaveAttribute("aria-disabled", "true");
@@ -163,13 +163,13 @@ describe("chat path menus", () => {
 
 	it.each(["inline", "link"])("offers Open in AO without a browser action for %s paths", async (kind) => {
 		const openFile = chat(kind === "inline" ? "`src/a file.ts:12`" : "[source](<src/a file.ts:12>)");
-		fireEvent.contextMenu(screen.getByRole("link"));
-		expect(screen.queryByRole("menuitem", { name: "Open in ao browser" })).not.toBeInTheDocument();
-		await userEvent.click(screen.getByRole("menuitem", { name: "Open in AO" }));
+		fireEvent.contextMenu(kind === "inline" ? screen.getByRole("button") : screen.getByRole("link"));
+		expect(screen.queryByRole("menuitem", { name: "Open in Orchestrator Browser" })).not.toBeInTheDocument();
+		await userEvent.click(screen.getByRole("menuitem", { name: "Open in Orchestrator" }));
 		expect(openFile).toHaveBeenCalledExactlyOnceWith(...(kind === "inline" ? ["src/a file.ts", 12] : ["src/a file.ts"]));
 	});
 
-	it("preserves established symbols and automatically uses native icons for other editors", async () => {
+	it("preserves established editor symbols and uses native icons for Finder and other editors", async () => {
 		const iconDataUrl = "data:image/png;base64,dGVzdA==";
 		vi.spyOn(aoBridge.editorHandoff, "getState").mockResolvedValue({
 			targets: [
@@ -181,12 +181,17 @@ describe("chat path menus", () => {
 			preferredEditorId: "cursor", workspaceAvailable: true,
 		});
 		chat("`src/a file.ts`");
-		fireEvent.contextMenu(screen.getByRole("link"));
-		for (const name of ["Reveal in Finder", "Open with Cursor", "Open with VS Code"]) {
+		fireEvent.contextMenu(screen.getByRole("button"));
+		for (const name of ["Open with Cursor", "Open with VS Code"]) {
 			const item = await screen.findByRole("menuitem", { name });
 			expect(item.querySelector("image")).toBeNull();
 			expect(item.querySelector("svg")).not.toBeNull();
 		}
+		const finder = await screen.findByRole("menuitem", { name: "Reveal in Finder" });
+		expect(finder.querySelector("image")).toHaveAttribute("href", iconDataUrl);
+		fireEvent.error(finder.querySelector("image")!);
+		expect(finder.querySelector("image")).toBeNull();
+		expect(finder.querySelector("svg")).not.toBeNull();
 		const editor = await screen.findByRole("menuitem", { name: "Open with Kiro" });
 		expect(editor.querySelector("image")).toHaveAttribute("href", iconDataUrl);
 		fireEvent.error(editor.querySelector("image")!);
@@ -200,7 +205,7 @@ describe("chat path menus", () => {
 			preferredEditorId: "vscode", workspaceAvailable: true,
 		});
 		chat("`src/a file.ts`");
-		fireEvent.contextMenu(screen.getByRole("link"));
+		fireEvent.contextMenu(screen.getByRole("button"));
 		const item = await screen.findByRole("menuitem", { name: "Open with VS Code" });
 		expect(item.querySelector("image")).toBeNull();
 	});
@@ -209,7 +214,7 @@ describe("chat path menus", () => {
 		vi.spyOn(aoBridge.editorHandoff, "pathAction").mockRejectedValue(new Error("That path no longer exists."));
 		const toast = vi.spyOn(useUiStore.getState(), "showGlobalToast").mockClear();
 		chat("`src/a file.ts`");
-		fireEvent.contextMenu(screen.getByRole("link"));
+		fireEvent.contextMenu(screen.getByRole("button"));
 		await userEvent.click(await screen.findByRole("menuitem", { name: "Reveal in Finder" }));
 		await waitFor(() => expect(toast).toHaveBeenCalledWith("Could not complete the path action", "That path no longer exists.", "error"));
 	});

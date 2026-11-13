@@ -83,7 +83,7 @@ func initialMessage(inv ports.ReviewInvocation) (string, error) {
 	if strings.TrimSpace(inv.SystemPromptFile) == "" {
 		return "", errors.New("devin reviewer: system prompt file is required")
 	}
-	return "Read and follow the AO reviewer role in `" + filepath.ToSlash(inv.SystemPromptFile) + "`, then " + strings.TrimSpace(inv.Prompt), nil
+	return "Read and follow the Orchestrator reviewer role in `" + filepath.ToSlash(inv.SystemPromptFile) + "`, then " + strings.TrimSpace(inv.Prompt), nil
 }
 
 // ReviewMessage reuses the same Devin TUI for subsequent review passes.

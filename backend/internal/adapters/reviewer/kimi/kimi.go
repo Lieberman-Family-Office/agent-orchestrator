@@ -72,7 +72,7 @@ func (r *Reviewer) ReviewCommand(ctx context.Context, inv ports.ReviewInvocation
 	if err := os.MkdirAll(skillsDir, 0o700); err != nil {
 		return ports.ReviewCommandSpec{}, fmt.Errorf("kimi reviewer: create empty skills directory: %w", err)
 	}
-	message := "Read and follow the AO reviewer role in `" + filepath.ToSlash(inv.SystemPromptFile) + "`, then " + strings.TrimSpace(inv.Prompt)
+	message := "Read and follow the Orchestrator reviewer role in `" + filepath.ToSlash(inv.SystemPromptFile) + "`, then " + strings.TrimSpace(inv.Prompt)
 	return ports.ReviewCommandSpec{
 		Argv:           []string{binary, "--plan", "--auto", "--skills-dir", skillsDir},
 		InitialMessage: message,

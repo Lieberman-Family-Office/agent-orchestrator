@@ -1027,6 +1027,47 @@ func TestPrepareSessionHomeAnchorsConditionalIncludeHeaders(t *testing.T) {
 	}
 }
 
+// Git resolves symlinks in the config file's path and in HOME before it
+// expands gitdir:./ and gitdir:~/, so the rebased conditions must too.
+func TestPrepareSessionHomeAnchorsConditionalIncludesBehindSymlinkedHome(t *testing.T) {
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git is unavailable")
+	}
+	realHome := filepath.Join(t.TempDir(), "home")
+	if err := os.Symlink(t.TempDir(), realHome); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+	t.Setenv("HOME", realHome)
+	t.Setenv("USERPROFILE", realHome)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("APPDATA", t.TempDir())
+
+	at := func(name string) string { return filepath.Join(realHome, filepath.FromSlash(name)) }
+	writeHomeFile(t, at(".gitconfig"), []byte("[includeIf \"gitdir:./\"]\n\tpath = identity/home.gitconfig\n"+
+		"[includeIf \"gitdir:~/projects/\"]\n\tpath = identity/projects.gitconfig\n"))
+	writeHomeFile(t, at("identity/home.gitconfig"), []byte("[user]\n\temail = home@example.com\n"))
+	writeHomeFile(t, at("identity/projects.gitconfig"), []byte("[commit]\n\tgpgsign = true\n"))
+
+	work := at("work-repo")
+	project := at("projects/app")
+	for _, repo := range []string{work, project} {
+		makeHomeDir(t, repo)
+		if output, err := exec.Command(git, "init", "-q", repo).CombinedOutput(); err != nil {
+			t.Fatalf("git init %s: %v: %s", repo, err, output)
+		}
+	}
+
+	home := prepareHome(t, t.TempDir(), domain.SessionID("mer-1"), "worker role")
+
+	if got := effectiveGitConfigIn(t, home, "", work)["user.email"]; got != "home@example.com" {
+		t.Fatalf("user.email in the work repo = %q, want the gitdir:./ include to keep matching", got)
+	}
+	if got := effectiveGitConfigIn(t, home, "", project)["commit.gpgsign"]; got != "true" {
+		t.Fatalf("commit.gpgsign in a projects repo = %q, want the gitdir:~/ include to keep matching", got)
+	}
+}
+
 func TestPrepareSessionHomeAnchorsXDGGlobalIncludes(t *testing.T) {
 	for _, test := range []struct {
 		name string
