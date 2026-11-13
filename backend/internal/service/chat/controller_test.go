@@ -7144,9 +7144,10 @@ func TestSuccessiveInterruptBatchesRunNewestTargetFirst(t *testing.T) {
 			p1 := send("P1", true)
 			p2 := send("P2", true)
 			conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: a.ProviderTurnID, TurnState: domain.TurnStateInterrupted})
+			// Queue claims become running before dispatch binds the provider ID used by the events below.
 			snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
 				turn, _ := turnByID(s, p1.ID)
-				return turn.State == domain.TurnStateRunning
+				return turn.State == domain.TurnStateRunning && turn.ProviderTurnID != ""
 			})
 			active, _ := turnByID(snapshot, p1.ID)
 			conv.markActive(active.ProviderTurnID)
@@ -7155,7 +7156,7 @@ func TestSuccessiveInterruptBatchesRunNewestTargetFirst(t *testing.T) {
 			conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: active.ProviderTurnID, TurnState: domain.TurnStateInterrupted})
 			snapshot = h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
 				turn, _ := turnByID(s, p3.ID)
-				return turn.State == domain.TurnStateRunning
+				return turn.State == domain.TurnStateRunning && turn.ProviderTurnID != ""
 			})
 			waiting, _ := turnByID(snapshot, p2.ID)
 			if waiting.State != domain.TurnStateQueued {
