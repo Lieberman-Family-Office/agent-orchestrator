@@ -29,7 +29,7 @@ const job = (overrides: Partial<ArtifactSnapshotJob> = {}): ArtifactSnapshotJob 
 // Hold a cache miss until released, then let its request join the render queue.
 function cacheMiss() {
 	let miss: () => void = () => undefined;
-	const pending = new Promise<Buffer>((_resolve, reject) => {
+	const pending = new Promise<never>((_resolve, reject) => {
 		miss = () => reject(new Error("cache miss"));
 	});
 	return {
