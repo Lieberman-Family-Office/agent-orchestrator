@@ -29,6 +29,9 @@ describe("AppLink", () => {
 				fireEvent.pointerOut(link, { pointerType: "mouse" });
 				act(() => link.blur());
 			}
+			// Drain jsdom's zero-delay selectionchange events, not the 150/300 ms preview timers.
+			act(() => vi.advanceTimersByTime(0));
+			expect(vi.getTimerCount()).toBe(1);
 			view.unmount();
 			expect(vi.getTimerCount()).toBe(0);
 		} finally {
