@@ -8,16 +8,22 @@ import { aoBridge } from "../lib/bridge";
 const url = "https://github.com/aoagents/agent-orchestrator/pull/42";
 afterEach(() => vi.restoreAllMocks());
 
+function mockFocusVisible(link: HTMLElement, visible: boolean) {
+	// ponytail: Model browser focus modality here; native selector behavior needs renderer E2E coverage.
+	const matches = link.matches.bind(link);
+	return vi.spyOn(link, "matches").mockImplementation(selector => selector === ":focus-visible" ? visible : matches(selector));
+}
+
 describe("AppLink", () => {
 	it.each([false, true])("cancels overlapping preview timers on unmount (close=%s)", (close) => {
 		vi.useFakeTimers();
 		try {
 			const view = render(<AppLink href="ao://sessions/project/session" hoverPreview={() => <div>Preview</div>}>Worker</AppLink>);
 			const link = screen.getByRole("link");
-			fireEvent.keyDown(document.body, { key: "Tab" });
+			const focusVisible = mockFocusVisible(link, true);
 			act(() => link.focus());
 			expect(link).toHaveFocus();
-			expect(link.matches(":focus-visible")).toBe(true);
+			expect(focusVisible).toHaveBeenCalledWith(":focus-visible");
 			fireEvent.pointerOver(link, { pointerType: "mouse" });
 			if (close) {
 				fireEvent.pointerOut(link, { pointerType: "mouse" });
@@ -35,11 +41,10 @@ describe("AppLink", () => {
 		try {
 			const view = render(<AppLink href="ao://sessions/project/session" hoverPreview={() => <div>Keyboard preview</div>}>Worker</AppLink>);
 			const link = screen.getByRole("link");
-			// Dispatching a focus event alone does not focus the link or establish keyboard modality.
-			fireEvent.keyDown(document.body, { key: "Tab" });
+			const focusVisible = mockFocusVisible(link, true);
 			act(() => link.focus());
 			expect(link).toHaveFocus();
-			expect(link.matches(":focus-visible")).toBe(true);
+			expect(focusVisible).toHaveBeenCalledWith(":focus-visible");
 			act(() => vi.advanceTimersByTime(299));
 			expect(screen.queryByText("Keyboard preview")).not.toBeInTheDocument();
 			act(() => vi.advanceTimersByTime(1));
@@ -60,16 +65,17 @@ describe("AppLink", () => {
 		try {
 			const view = render(<AppLink href="ao://sessions/project/session" hoverPreview={() => <div>Mouse preview</div>}>Worker</AppLink>);
 			const link = screen.getByRole("link");
-			fireEvent.mouseDown(link);
+			const focusVisible = mockFocusVisible(link, false);
 			act(() => link.focus());
 			expect(link).toHaveFocus();
-			expect(link.matches(":focus-visible")).toBe(false);
+			expect(focusVisible).toHaveBeenCalledWith(":focus-visible");
 			act(() => vi.advanceTimersByTime(300));
 			expect(screen.queryByText("Mouse preview")).not.toBeInTheDocument();
 			act(() => link.blur());
+			focusVisible.mockClear();
 			act(() => link.focus());
 			expect(link).toHaveFocus();
-			expect(link.matches(":focus-visible")).toBe(false);
+			expect(focusVisible).toHaveBeenCalledWith(":focus-visible");
 			act(() => vi.advanceTimersByTime(300));
 			expect(screen.queryByText("Mouse preview")).not.toBeInTheDocument();
 			view.unmount();
