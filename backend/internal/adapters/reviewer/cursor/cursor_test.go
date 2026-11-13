@@ -68,7 +68,7 @@ func TestReviewCommandBuildsPersistentInteractiveInvocation(t *testing.T) {
 		t.Fatalf("ReviewCommand: %v", err)
 	}
 
-	wantPrompt := "Read and follow the AO reviewer role in `/ao/prompts/reviewer/system.md`, then complete the AO review task in `/ao/prompts/reviewer/requests/batch-1/run-1/task.md`."
+	wantPrompt := "Read and follow the Orchestrator reviewer role in `/ao/prompts/reviewer/system.md`, then complete the AO review task in `/ao/prompts/reviewer/requests/batch-1/run-1/task.md`."
 	want := []string{
 		"cursor-agent", "--trust",
 		"--add-dir", "/ao/prompts/reviewer",
@@ -110,7 +110,7 @@ func TestCursorPromptPreservesLiteralPath(t *testing.T) {
 		SystemPromptFile: "/ao/role`%s\nfile.md",
 		Prompt:           "  Read task `%s`.\n",
 	})
-	want := "Read and follow the AO reviewer role in `/ao/role`%s\nfile.md`, then Read task `%s`."
+	want := "Read and follow the Orchestrator reviewer role in `/ao/role`%s\nfile.md`, then Read task `%s`."
 	if got != want {
 		t.Fatalf("prompt = %q, want %q", got, want)
 	}

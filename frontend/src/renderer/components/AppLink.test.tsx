@@ -8,18 +8,30 @@ import { aoBridge } from "../lib/bridge";
 const url = "https://github.com/aoagents/agent-orchestrator/pull/42";
 afterEach(() => vi.restoreAllMocks());
 
+function mockFocusVisible(link: HTMLElement, visible: boolean) {
+	// ponytail: Model browser focus modality here; native selector behavior needs renderer E2E coverage.
+	const matches = link.matches.bind(link);
+	return vi.spyOn(link, "matches").mockImplementation(selector => selector === ":focus-visible" ? visible : matches(selector));
+}
+
 describe("AppLink", () => {
 	it.each([false, true])("cancels overlapping preview timers on unmount (close=%s)", (close) => {
 		vi.useFakeTimers();
 		try {
 			const view = render(<AppLink href="ao://sessions/project/session" hoverPreview={() => <div>Preview</div>}>Worker</AppLink>);
 			const link = screen.getByRole("link");
+			const focusVisible = mockFocusVisible(link, true);
+			act(() => link.focus());
+			expect(link).toHaveFocus();
+			expect(focusVisible).toHaveBeenCalledWith(":focus-visible");
 			fireEvent.pointerOver(link, { pointerType: "mouse" });
-			fireEvent.focus(link);
 			if (close) {
 				fireEvent.pointerOut(link, { pointerType: "mouse" });
-				fireEvent.blur(link);
+				act(() => link.blur());
 			}
+			// Drain jsdom's zero-delay selectionchange events, not the 150/300 ms preview timers.
+			act(() => vi.advanceTimersByTime(0));
+			expect(vi.getTimerCount()).toBe(1);
 			view.unmount();
 			expect(vi.getTimerCount()).toBe(0);
 		} finally {
@@ -31,9 +43,44 @@ describe("AppLink", () => {
 		vi.useFakeTimers();
 		try {
 			const view = render(<AppLink href="ao://sessions/project/session" hoverPreview={() => <div>Keyboard preview</div>}>Worker</AppLink>);
-			fireEvent.focus(screen.getByRole("link"));
-			act(() => vi.advanceTimersByTime(300));
+			const link = screen.getByRole("link");
+			const focusVisible = mockFocusVisible(link, true);
+			act(() => link.focus());
+			expect(link).toHaveFocus();
+			expect(focusVisible).toHaveBeenCalledWith(":focus-visible");
+			act(() => vi.advanceTimersByTime(299));
+			expect(screen.queryByText("Keyboard preview")).not.toBeInTheDocument();
+			act(() => vi.advanceTimersByTime(1));
 			expect(screen.getByText("Keyboard preview")).toBeInTheDocument();
+			act(() => link.blur());
+			expect(link).not.toHaveFocus();
+			act(() => vi.advanceTimersByTime(150));
+			expect(screen.queryByText("Keyboard preview")).not.toBeInTheDocument();
+			view.unmount();
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not open a session preview when mouse focus is restored", () => {
+		vi.useFakeTimers();
+		try {
+			const view = render(<AppLink href="ao://sessions/project/session" hoverPreview={() => <div>Mouse preview</div>}>Worker</AppLink>);
+			const link = screen.getByRole("link");
+			const focusVisible = mockFocusVisible(link, false);
+			act(() => link.focus());
+			expect(link).toHaveFocus();
+			expect(focusVisible).toHaveBeenCalledWith(":focus-visible");
+			act(() => vi.advanceTimersByTime(300));
+			expect(screen.queryByText("Mouse preview")).not.toBeInTheDocument();
+			act(() => link.blur());
+			focusVisible.mockClear();
+			act(() => link.focus());
+			expect(link).toHaveFocus();
+			expect(focusVisible).toHaveBeenCalledWith(":focus-visible");
+			act(() => vi.advanceTimersByTime(300));
+			expect(screen.queryByText("Mouse preview")).not.toBeInTheDocument();
 			view.unmount();
 			expect(vi.getTimerCount()).toBe(0);
 		} finally {
@@ -59,9 +106,9 @@ describe("AppLink", () => {
 		fireEvent.contextMenu(screen.getByRole("link"));
 		expect(open).not.toHaveBeenCalled();
 		expect(screen.getAllByRole("menuitem").map(item => item.textContent)).toEqual([
-			"Open in ao browser", "Open in external browser", "Copy link",
+			"Open in Orchestrator Browser", "Open in external browser", "Copy link",
 		]);
-		await user.click(screen.getByRole("menuitem", { name: "Open in ao browser" }));
+		await user.click(screen.getByRole("menuitem", { name: "Open in Orchestrator Browser" }));
 		expect(open).toHaveBeenCalledExactlyOnceWith(url);
 	});
 
@@ -71,7 +118,52 @@ describe("AppLink", () => {
 		fireEvent.click(screen.getByRole("link"));
 		expect(external).toHaveBeenCalledExactlyOnceWith(url);
 		fireEvent.contextMenu(screen.getByRole("link"));
-		expect(screen.getByRole("menuitem", { name: "Open in ao browser" })).toHaveAttribute("aria-disabled", "true");
+		expect(screen.getByRole("menuitem", { name: "Open in Orchestrator Browser" })).toHaveAttribute("aria-disabled", "true");
+	});
+
+	it("sends system-browser links to the OS on every click and never to ao", async () => {
+		const user = userEvent.setup();
+		const open = vi.fn();
+		const external = vi.spyOn(aoBridge.app, "openExternal").mockResolvedValue(undefined);
+		render(<AppBrowserLinkContext.Provider value={open}>
+			<AppLink href={url} systemBrowser target="_blank">PR</AppLink>
+		</AppBrowserLinkContext.Provider>);
+		const link = screen.getByRole("link", { name: "PR" });
+
+		// Enter on a focused link dispatches this same click event.
+		expect(fireEvent.click(link)).toBe(false);
+		expect(fireEvent.click(link, { metaKey: true })).toBe(false);
+		expect(fireEvent.click(link, { ctrlKey: true })).toBe(false);
+		const middle = new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 });
+		fireEvent(link, middle);
+		expect(middle.defaultPrevented).toBe(true);
+		expect(external).toHaveBeenCalledTimes(4);
+		expect(external.mock.calls.every(([target]) => target === url)).toBe(true);
+		expect(open).not.toHaveBeenCalled();
+
+		fireEvent.contextMenu(link);
+		expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
+			"Open in external browser", "Copy link",
+		]);
+		await user.click(screen.getByRole("menuitem", { name: "Open in external browser" }));
+		expect(external).toHaveBeenCalledTimes(5);
+		expect(open).not.toHaveBeenCalled();
+	});
+
+	it("opens nothing for system-browser links outside http(s) and mailto", () => {
+		const open = vi.fn();
+		const external = vi.spyOn(aoBridge.app, "openExternal").mockResolvedValue(undefined);
+		render(<AppBrowserLinkContext.Provider value={open}>
+			<AppLink href="file:///etc/hosts" systemBrowser>File</AppLink>
+			<AppLink href="app://settings" systemBrowser>App</AppLink>
+			<AppLink href="mailto:team@example.com" systemBrowser>Mail</AppLink>
+		</AppBrowserLinkContext.Provider>);
+
+		expect(fireEvent.click(screen.getByRole("link", { name: "File" }))).toBe(false);
+		expect(fireEvent.click(screen.getByRole("link", { name: "App" }))).toBe(false);
+		fireEvent.click(screen.getByRole("link", { name: "Mail" }));
+		expect(external).toHaveBeenCalledExactlyOnceWith("mailto:team@example.com");
+		expect(open).not.toHaveBeenCalled();
 	});
 
 	it("preserves handlers that cancel navigation and fragment links", () => {
@@ -106,11 +198,11 @@ describe("AppLink", () => {
 
 		fireEvent.contextMenu(screen.getByRole("link", { name: "Report" }));
 		expect(screen.getAllByRole("menuitem").map((item) => item.textContent)).toEqual([
-			"Open in ao browser",
-			"Open in AO",
+			"Open in Orchestrator Browser",
+			"Open in Orchestrator",
 			"Copy link",
 		]);
-		await user.click(screen.getByRole("menuitem", { name: "Open in AO" }));
+		await user.click(screen.getByRole("menuitem", { name: "Open in Orchestrator" }));
 		expect(openFile).toHaveBeenCalledExactlyOnceWith(path);
 		expect(open).not.toHaveBeenCalled();
 	});

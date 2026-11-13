@@ -103,6 +103,9 @@ func (c *conversation) HandleExtensionMethod(
 		}
 		return nil, nil
 	}
+	if method == claudeSDKMessageMethod {
+		return nil, c.handleClaudeSDKMessage(params)
+	}
 	if method == persistenthost.ACPInteractionCommandMethod {
 		var command persistentInteractionCommand
 		if err := json.Unmarshal(params, &command); err != nil {

@@ -129,7 +129,7 @@ func (t *legacyACPTransport) forward(source io.Reader) {
 				}
 				if notification.ID == nil {
 					switch notification.Method {
-					case acpsdk.ClientMethodSessionUpdate, persistenthost.ACPPromptResultMethod, persistenthost.ACPInteractionCommandMethod:
+					case acpsdk.ClientMethodSessionUpdate, persistenthost.ACPPromptResultMethod, persistenthost.ACPInteractionCommandMethod, claudeSDKMessageMethod:
 						ackID = fmt.Sprintf("ao-local-%d", t.nextID.Add(1))
 					}
 				}

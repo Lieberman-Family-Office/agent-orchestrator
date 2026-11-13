@@ -77,8 +77,8 @@ func fullSnapshotReader(st *sqlite.Store) chatsvc.SnapshotReader {
 }
 
 func boundedSnapshotReader(st *sqlite.Store) chatsvc.SnapshotPageReader {
-	return chatsvc.SnapshotPageReaderFunc(func(ctx context.Context, id string, before, limit int64) (chatsvc.ConversationRows, error) {
-		rows, err := st.LoadConversationSnapshotPage(ctx, id, before, limit)
+	return chatsvc.SnapshotPageReaderFunc(func(ctx context.Context, id string, before, after, limit int64) (chatsvc.ConversationRows, error) {
+		rows, err := st.LoadConversationSnapshotRange(ctx, id, before, after, limit)
 		return chatsvc.ConversationRows{Conversation: rows.Conversation, ActiveBranch: rows.ActiveBranch,
 			Turns: rows.Turns, Messages: rows.Messages, Activities: rows.Activities}, err
 	})
@@ -7144,9 +7144,10 @@ func TestSuccessiveInterruptBatchesRunNewestTargetFirst(t *testing.T) {
 			p1 := send("P1", true)
 			p2 := send("P2", true)
 			conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: a.ProviderTurnID, TurnState: domain.TurnStateInterrupted})
+			// Queue claims become running before dispatch binds the provider ID used by the events below.
 			snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
 				turn, _ := turnByID(s, p1.ID)
-				return turn.State == domain.TurnStateRunning
+				return turn.State == domain.TurnStateRunning && turn.ProviderTurnID != ""
 			})
 			active, _ := turnByID(snapshot, p1.ID)
 			conv.markActive(active.ProviderTurnID)
@@ -7155,7 +7156,7 @@ func TestSuccessiveInterruptBatchesRunNewestTargetFirst(t *testing.T) {
 			conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: active.ProviderTurnID, TurnState: domain.TurnStateInterrupted})
 			snapshot = h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
 				turn, _ := turnByID(s, p3.ID)
-				return turn.State == domain.TurnStateRunning
+				return turn.State == domain.TurnStateRunning && turn.ProviderTurnID != ""
 			})
 			waiting, _ := turnByID(snapshot, p2.ID)
 			if waiting.State != domain.TurnStateQueued {
@@ -8171,6 +8172,12 @@ func TestCodexRateLimitsUpdateActiveAccountCapacityWithoutConversationPersistenc
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The capacity callback fires before the event reaches the archive.
+	for deadline := time.Now().Add(5 * time.Second); len(events) == 0 && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if events, err = st.ProviderEventsSince(context.Background(), ctrl.ConversationID(), 0, 10); err != nil {
+			t.Fatal(err)
+		}
+	}
 	var archived map[string]any
 	if len(events) != 1 || json.Unmarshal([]byte(events[0].PayloadJson), &archived) != nil || archived["rateLimits"] != nil || strings.Contains(events[0].PayloadJson, "usedPercent") {
 		t.Fatalf("bound Codex capacity leaked into provider archive: %#v", events)
@@ -8348,6 +8355,8 @@ func TestCompactionSettlementWithoutStartDrainsQueue(t *testing.T) {
 	for _, kind := range []ports.ChatEventKind{ports.ChatEventTurnCompleted, ports.ChatEventCompacted} {
 		t.Run(string(kind), func(t *testing.T) {
 			conv := newCompactingConversation()
+			sent := make(chan struct{}, 1)
+			conv.onSend = func(string) { sent <- struct{}{} }
 			h := newHarnessWithConversation(t, conv)
 			ctx := context.Background()
 			if _, err := h.svc.Compact(ctx, testSession); err != nil {
@@ -8360,6 +8369,13 @@ func TestCompactionSettlementWithoutStartDrainsQueue(t *testing.T) {
 			h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
 				return len(s.Turns) == 1 && s.Turns[0].State == domain.TurnStateRunning
 			})
+			// Claiming a queued turn publishes Running before SendTurn crosses
+			// the provider boundary. Wait for that boundary, not just the row.
+			select {
+			case <-sent:
+			case <-time.After(5 * time.Second):
+				t.Fatal("queued turn never reached the provider after compaction")
+			}
 			if got := conv.sentTexts(); len(got) != 1 || got[0] != "after compact" {
 				t.Fatalf("provider messages = %v", got)
 			}

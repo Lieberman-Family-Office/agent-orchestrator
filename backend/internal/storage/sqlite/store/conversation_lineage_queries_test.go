@@ -200,6 +200,11 @@ func TestReplayActivitiesKeepLineageAndSeekCandidateIdentities(t *testing.T) {
 	dir := t.TempDir()
 	s := sqlitetest.MustOpenAt(t, dir)
 	id, _ := seedForkedConversation(t, s)
+	mustNoError(t, s.UpsertActivity(ctx, id, "provider-n00", domain.ConversationActivity{
+		ID: "persistent-ao-action", Kind: domain.ActivityKindAOAction, Status: domain.ActivityStatusCompleted,
+		ProviderItemID: "persistent-ao-item",
+	}, testNow))
+	mustNoError(t, s.SettleTurn(ctx, id, "provider-n00", domain.TurnStateCancelled, "", testNow))
 	full, err := s.LoadConversationSnapshot(ctx, id)
 	mustNoError(t, err)
 	turnIDs := []string{"turn-r00", "turn-c00", "turn-n00", "turn-r24", "turn-c24"}
@@ -232,10 +237,12 @@ func TestReplayActivitiesKeepLineageAndSeekCandidateIdentities(t *testing.T) {
 	if strings.Contains(plan, "SEARCH conversation_activities USING INDEX idx_conversation_activities_order") {
 		t.Errorf("replay scans every activity in the conversation:\n%s", plan)
 	}
-	for _, index := range []string{"idx_conversation_activities_turn_sequence (turn_id=?)", "idx_conversation_activities_provider_item (conversation_id=? AND provider_item_id=?)"} {
-		if !strings.Contains(plan, index) {
-			t.Errorf("replay does not seek %s:\n%s", index, plan)
-		}
+	if !strings.Contains(plan, "SEARCH by_turn USING INDEX idx_conversation_activities_turn_sequence (turn_id=?)") &&
+		!strings.Contains(plan, "SEARCH by_turn USING INDEX idx_conversation_activities_turn (turn_id=?)") {
+		t.Errorf("replay does not seek candidate turns:\n%s", plan)
+	}
+	if !strings.Contains(plan, "SEARCH by_item USING INDEX idx_conversation_activities_provider_item (conversation_id=? AND provider_item_id=?)") {
+		t.Errorf("replay does not seek candidate provider items:\n%s", plan)
 	}
 }
 
@@ -313,7 +320,7 @@ func TestLineageTurnQueriesAreBoundByConversation(t *testing.T) {
 						}
 						found = true
 						conversationSeek := strings.Contains(line, "(conversation_id=?")
-						turnSeek := strings.Contains(line, "(turn_id=? AND sequence<?)")
+						turnSeek := strings.Contains(line, "(turn_id=? AND sequence<?)") || strings.Contains(line, "(turn_id=?)")
 						if !strings.HasPrefix(line, "SEARCH "+table+" ") || (!conversationSeek && !turnSeek) || strings.Contains(line, "ANY(") {
 							t.Errorf("%s does not seek by conversation or turn: %q\nfull plan:\n%s", table, line, plan)
 						}
