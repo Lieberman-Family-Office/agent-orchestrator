@@ -49,7 +49,11 @@ test("diagram annotations navigate to the selected repeated block and fall back 
 	const blocks = page.locator('[data-chat-message-id="source"] [data-excerpt-flowchart]');
 	const target = blocks.nth(1);
 	await target.getByRole("button", { name: "Code", exact: true }).click();
-	await target.locator("pre").evaluate(element => {
+	const source = target.locator("pre");
+	// Switching from the diagram changes its height; select the source in view, not just in the DOM.
+	await source.scrollIntoViewIfNeeded();
+	await expect(source).toBeInViewport();
+	await source.evaluate(element => {
 		const range = document.createRange(); range.selectNodeContents(element);
 		window.getSelection()!.removeAllRanges(); window.getSelection()!.addRange(range);
 		document.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));

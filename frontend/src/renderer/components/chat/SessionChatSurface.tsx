@@ -674,7 +674,7 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 				busy={commands.busy}
 				onInterruptSend={can(renderSnapshot, "interrupt_send") ? (text, attachments, clientMessageId, excerpts, fileReferences) =>
 					commands.send({ text, attachments, clientMessageId, interruptAndSend: true, fileReferences,
-						excerpts: excerpts?.map((excerpt) => ({id:excerpt.id,order:excerpt.order,conversationId:excerpt.conversationId,messageId:excerpt.messageId,revision:excerpt.revision,text:excerpt.text})),
+						excerpts: excerpts?.map((excerpt) => ({id:excerpt.id,order:excerpt.order,snapshot:excerpt.snapshot,conversationId:excerpt.conversationId,messageId:excerpt.messageId,revision:excerpt.revision,text:excerpt.text})),
 					}) : undefined}
 				excerptsEnabled
 				fileReferencesEnabled={Boolean(renderSnapshot.supportsFileReferences)}

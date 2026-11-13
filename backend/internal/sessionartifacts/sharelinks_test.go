@@ -1,6 +1,7 @@
 package sessionartifacts
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -66,6 +67,33 @@ func TestShareLinksApply(t *testing.T) {
 	var none *ShareLinks
 	if got := applied(none, "sess-1", "report.html"); len(got) != 0 {
 		t.Fatalf("nil ShareLinks set %v", got)
+	}
+}
+
+func TestParseShareLinksRejectsMalformedKeys(t *testing.T) {
+	for _, key := range []string{
+		`not-json`,
+		`null`,
+		`[]`,
+		`["https://cp.test"]`,
+		`["https://cp.test","sess-1"]`,
+		`["https://cp.test","sess-1","","art-1","extra"]`,
+		`["https://cp.test","sess-1","path.html","art-1"]`,
+		`["https://cp.test","sess-1","",""]`,
+	} {
+		t.Run(key, func(t *testing.T) {
+			records := map[string]map[string]string{key: {"url": "https://share.test/rejected"}}
+			records[`["https://cp.test","sess-1","valid.html"]`] = map[string]string{"url": "https://share.test/valid"}
+			data, err := json.Marshal(records)
+			if err != nil {
+				t.Fatal(err)
+			}
+			urls := parseShareLinks(data, "https://cp.test")
+			links := urls["sess-1"]
+			if len(urls) != 1 || len(links.byID) != 0 || len(links.byPath) != 1 || links.byPath["valid.html"] != "https://share.test/valid" {
+				t.Fatalf("parsed links = %v, want only valid.html", urls)
+			}
+		})
 	}
 }
 

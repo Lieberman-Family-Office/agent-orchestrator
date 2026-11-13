@@ -14,11 +14,14 @@ describe("AppLink", () => {
 		try {
 			const view = render(<AppLink href="ao://sessions/project/session" hoverPreview={() => <div>Preview</div>}>Worker</AppLink>);
 			const link = screen.getByRole("link");
+			fireEvent.keyDown(document.body, { key: "Tab" });
+			act(() => link.focus());
+			expect(link).toHaveFocus();
+			expect(link.matches(":focus-visible")).toBe(true);
 			fireEvent.pointerOver(link, { pointerType: "mouse" });
-			fireEvent.focus(link);
 			if (close) {
 				fireEvent.pointerOut(link, { pointerType: "mouse" });
-				fireEvent.blur(link);
+				act(() => link.blur());
 			}
 			view.unmount();
 			expect(vi.getTimerCount()).toBe(0);
@@ -31,9 +34,44 @@ describe("AppLink", () => {
 		vi.useFakeTimers();
 		try {
 			const view = render(<AppLink href="ao://sessions/project/session" hoverPreview={() => <div>Keyboard preview</div>}>Worker</AppLink>);
-			fireEvent.focus(screen.getByRole("link"));
-			act(() => vi.advanceTimersByTime(300));
+			const link = screen.getByRole("link");
+			// Dispatching a focus event alone does not focus the link or establish keyboard modality.
+			fireEvent.keyDown(document.body, { key: "Tab" });
+			act(() => link.focus());
+			expect(link).toHaveFocus();
+			expect(link.matches(":focus-visible")).toBe(true);
+			act(() => vi.advanceTimersByTime(299));
+			expect(screen.queryByText("Keyboard preview")).not.toBeInTheDocument();
+			act(() => vi.advanceTimersByTime(1));
 			expect(screen.getByText("Keyboard preview")).toBeInTheDocument();
+			act(() => link.blur());
+			expect(link).not.toHaveFocus();
+			act(() => vi.advanceTimersByTime(150));
+			expect(screen.queryByText("Keyboard preview")).not.toBeInTheDocument();
+			view.unmount();
+			expect(vi.getTimerCount()).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not open a session preview when mouse focus is restored", () => {
+		vi.useFakeTimers();
+		try {
+			const view = render(<AppLink href="ao://sessions/project/session" hoverPreview={() => <div>Mouse preview</div>}>Worker</AppLink>);
+			const link = screen.getByRole("link");
+			fireEvent.mouseDown(link);
+			act(() => link.focus());
+			expect(link).toHaveFocus();
+			expect(link.matches(":focus-visible")).toBe(false);
+			act(() => vi.advanceTimersByTime(300));
+			expect(screen.queryByText("Mouse preview")).not.toBeInTheDocument();
+			act(() => link.blur());
+			act(() => link.focus());
+			expect(link).toHaveFocus();
+			expect(link.matches(":focus-visible")).toBe(false);
+			act(() => vi.advanceTimersByTime(300));
+			expect(screen.queryByText("Mouse preview")).not.toBeInTheDocument();
 			view.unmount();
 			expect(vi.getTimerCount()).toBe(0);
 		} finally {

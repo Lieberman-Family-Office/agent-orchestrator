@@ -178,6 +178,8 @@ run: |
 
     expect(contents).toContain('AO_PUBLISHED_BUILD: "1"');
     expect(contents).toContain("name: sentry-sourcemaps-${{ matrix.platform }}");
+    expect(contents).toContain("frontend/.vite/build/*.cjs");
+    expect(contents).toContain("frontend/.vite/build/*.cjs.map");
     expect(contents).toContain("frontend/.vite/renderer/main_window/assets/*.js.map");
   });
 

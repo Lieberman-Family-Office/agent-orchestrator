@@ -98,7 +98,10 @@ const sideMocks = vi.hoisted(() => ({
 	agentSwitch: undefined as AgentSwitchProps | undefined,
 	workspaceSend: undefined as
 		| undefined
-		| ((text: string, attachments: undefined, clientMessageId: string) => Promise<void>),
+		| ((text: string, attachments: undefined, clientMessageId: string, excerpts?: ChatDraftExcerptReference[]) => Promise<void>),
+	workspaceInterruptSend: undefined as
+		| undefined
+		| ((text: string, attachments: undefined, clientMessageId: string, excerpts?: ChatDraftExcerptReference[]) => Promise<void>),
 }));
 vi.mock("./IndependentSideChats", () => ({
 	useIndependentSideChats: () => ({ ...sideMocks, panel: null }),
@@ -176,11 +179,13 @@ vi.mock("./ChatWorkspace", async () => {
 			shellTarget,
 			onAddToSideChat,
 			onSend,
+			onInterruptSend,
 			composerNotice,
 			importBlock,
 		}: {
 			importBlock?: string;
 			onSend: typeof sideMocks.workspaceSend;
+			onInterruptSend?: typeof sideMocks.workspaceInterruptSend;
 			onAddToSideChat?: typeof sideMocks.attach;
 			composerNotice?: ReactNode;
 			agentSwitch?: AgentSwitchProps;
@@ -200,6 +205,7 @@ vi.mock("./ChatWorkspace", async () => {
 			shellTarget?: { handleId: string };
 		}) => {
 			sideMocks.workspaceSend = onSend;
+			sideMocks.workspaceInterruptSend = onInterruptSend;
 			sideMocks.attach = onAddToSideChat;
 			sideMocks.agentSwitch = agentSwitch;
 			const [mountedSessionId] = useState(snapshot.sessionId);
@@ -310,6 +316,44 @@ describe("SessionChatSurface recovery", () => {
 	])("tells the commands whether %s can only be restored", (_name, target, terminated) => {
 		render(<Wrapper client={new QueryClient()}><SessionChatSurface session={target} /></Wrapper>);
 		expect(conversationCommandArgs.at(-1)).toEqual([target.id, undefined, terminated]);
+	});
+});
+
+describe("SessionChatSurface excerpt delivery", () => {
+	it.each(["workspaceSend", "workspaceInterruptSend"] as const)("preserves text and diagram snapshots through %s", async (send) => {
+		conversationState.snapshot = { ...snapshotFor(session.id), capabilities: ["interrupt_send"] };
+		const excerpts = [
+			{
+				id: "text-excerpt", order: 1, conversationId: "source-conversation", messageId: "source-text", revision: 2,
+				text: "selected text",
+				snapshot: {
+					version: 1, referenceFormat: "numbered-v1", captureMode: "exact", rawText: "**selected text**", sourceTurnId: "source-turn",
+					turn: { id: "source-turn", messages: [{ role: "user", text: "Explain the selection." }, { role: "assistant", text: "**selected text**" }] },
+				},
+			},
+			{
+				id: "diagram-excerpt", order: 2, conversationId: "source-conversation", messageId: "source-diagram", revision: 3,
+				text: "",
+				snapshot: {
+					version: 1, referenceFormat: "numbered-v1", captureMode: "block", rawText: "```mermaid\nflowchart LR; A-->B\n```",
+					containsFlowchart: true, badgeOnly: true,
+				},
+			},
+		] satisfies Omit<ChatDraftExcerptReference, "role">[];
+		render(<Wrapper client={new QueryClient()}><SessionChatSurface session={session} /></Wrapper>);
+		await act(async () => {
+			await sideMocks[send]!("Explain these annotations.", undefined, "excerpt-message", excerpts.map(excerpt => ({ ...excerpt, role: "assistant" as const })));
+		});
+		expect(conversationCommandState.send).toHaveBeenCalledExactlyOnceWith({
+			text: "Explain these annotations.", attachments: undefined, clientMessageId: "excerpt-message", fileReferences: undefined,
+			excerpts,
+			...(send === "workspaceInterruptSend" ? { interruptAndSend: true } : {}),
+		});
+	});
+
+	it("does not expose interrupt-send without the advertised capability", () => {
+		render(<Wrapper client={new QueryClient()}><SessionChatSurface session={session} /></Wrapper>);
+		expect(sideMocks.workspaceInterruptSend).toBeUndefined();
 	});
 });
 

@@ -247,6 +247,8 @@ jobs:
           path: |
             frontend/.vite/build/*.js
             frontend/.vite/build/*.js.map
+            frontend/.vite/build/*.cjs
+            frontend/.vite/build/*.cjs.map
             frontend/.vite/renderer/main_window/assets/*.js
             frontend/.vite/renderer/main_window/assets/*.js.map
           if-no-files-found: error

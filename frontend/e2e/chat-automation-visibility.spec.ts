@@ -80,7 +80,7 @@ test("automation visibility is reversible and persistent without suppressing war
 	]);
 	const toggle = page.getByRole("button", { name: "Hide automation messages" });
 	await expect(toggle).toHaveAttribute("aria-pressed", "false");
-	await expect(toggle.locator("svg")).toHaveClass(/lucide-eye(?:\s|$)/);
+	await expect(toggle.locator("svg")).toHaveClass(/(?:^|\s)icon-eye(?:\s|$)/);
 	await expect(page.getByText("Routine automation report 0", { exact: true })).toBeVisible();
 	await expect(page.getByText("Queued automation report", { exact: true })).toBeVisible();
 	const beforeToggleWrites = writes.length;
@@ -97,7 +97,7 @@ test("automation visibility is reversible and persistent without suppressing war
 	expect(toggleFocus.color).not.toBe("rgba(0, 0, 0, 0)");
 	await page.keyboard.press("Space");
 	await expect(toggle).toHaveAttribute("aria-pressed", "true");
-	await expect(toggle.locator("svg")).toHaveClass(/lucide-eye-off(?:\s|$)/);
+	await expect(toggle.locator("svg")).toHaveClass(/(?:^|\s)icon-eye-off(?:\s|$)/);
 	await expect(page.getByText("14 automation messages hidden", { exact: true })).toBeVisible();
 	await expect(page.getByText(/^Routine automation report /)).toHaveCount(0);
 	await expect(page.getByText("Queued automation report", { exact: true })).toHaveCount(0);
@@ -138,7 +138,7 @@ test("automation visibility is reversible and persistent without suppressing war
 	await expect(page.getByText("Routine automation report 0", { exact: true })).toBeVisible();
 	await expect(page.getByText(/^Routine automation report /)).toHaveCount(12);
 	await expect(toggle).toHaveAttribute("aria-pressed", "false");
-	await expect(toggle.locator("svg")).toHaveClass(/lucide-eye(?:\s|$)/);
+	await expect(toggle.locator("svg")).toHaveClass(/(?:^|\s)icon-eye(?:\s|$)/);
 	await expect(page.getByText("Queued automation report", { exact: true })).toBeVisible();
 	await expect(page.getByText("Routine worker steer", { exact: true })).toBeVisible();
 	await expect(page.getByRole("log", { name: "Conversation" })).toBeFocused();
