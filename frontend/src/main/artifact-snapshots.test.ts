@@ -26,11 +26,28 @@ const job = (overrides: Partial<ArtifactSnapshotJob> = {}): ArtifactSnapshotJob 
 	...overrides,
 });
 
+// Hold a cache miss until released, then let its request join the render queue.
+function cacheMiss() {
+	let miss: () => void = () => undefined;
+	const pending = new Promise<Buffer>((_resolve, reject) => {
+		miss = () => reject(new Error("cache miss"));
+	});
+	return {
+		pending,
+		async release() {
+			miss();
+			// Let read() and then request() handle the miss before the test continues.
+			await pending.catch(() => undefined);
+		},
+	};
+}
+
 let directory: string;
 beforeEach(async () => {
 	directory = await fs.mkdtemp(path.join(os.tmpdir(), "ao-snapshots-"));
 });
 afterEach(async () => {
+	vi.restoreAllMocks();
 	await fs.rm(directory, { force: true, recursive: true });
 });
 
@@ -110,30 +127,39 @@ describe("artifact snapshot store", () => {
 		expect(render).toHaveBeenCalledTimes(1);
 	});
 
-	it("renders the newest request first, and tells a dropped request apart from a failure", async () => {
+	it.each([false, true])("renders newest first and drops oldest requests when cache reads finish in reverse order: %s", async (reverse) => {
 		const order: string[] = [];
 		const gates: Array<() => void> = [];
-		const render = vi.fn((request: ArtifactSnapshotJob) => new Promise<Buffer>((resolve) => {
+		const render = vi.fn(async (request: ArtifactSnapshotJob) => {
 			order.push(request.path);
-			gates.push(() => resolve(Buffer.from("x")));
-		}));
+			if (order.length <= 2) await new Promise<void>((resolve) => gates.push(resolve));
+			return Buffer.from("x");
+		});
 		const store = createArtifactSnapshotStore({ directory, render, gapMs: 0 });
 		const first = store.request(job({ path: "first.html" }));
 		await vi.waitFor(() => expect(render).toHaveBeenCalledTimes(1));
+		const reads = [cacheMiss(), cacheMiss()];
+		const readFile = vi.spyOn(fs, "readFile").mockReturnValueOnce(reads[0].pending).mockReturnValueOnce(reads[1].pending);
 		const older = store.request(job({ path: "older.html" }));
 		const newest = store.request(job({ path: "newest.html" }));
+		// Both requests must be queued before the active render ends.
+		for (const read of reverse ? [...reads].reverse() : reads) await read.release();
 		gates.shift()?.();
 		await first;
 		await vi.waitFor(() => expect(render).toHaveBeenCalledTimes(2));
 		expect(order[1]).toBe("newest.html");
-		// A queue over its limit drops its oldest request, and says so.
-		const fillers = Array.from({ length: SNAPSHOT_MAX_QUEUED + 1 }, (_, n) => store.request(job({ path: `fill-${n}.html` })));
+		// Overflow must drop the oldest request, not the last cache read to finish.
+		const fillerReads = Array.from({ length: SNAPSHOT_MAX_QUEUED + 1 }, () => cacheMiss());
+		for (const read of fillerReads) readFile.mockReturnValueOnce(read.pending);
+		const fillers = fillerReads.map((_, n) => store.request(job({ path: `fill-${n}.html` })));
+		for (const read of reverse ? [...fillerReads].reverse() : fillerReads) await read.release();
+		readFile.mockRestore();
 		expect(await older).toBe(SNAPSHOT_DROPPED);
-		// Let every remaining render finish, so nothing is still writing when the directory goes.
-		const settled = Promise.all([newest, ...fillers]);
-		const opener = setInterval(() => gates.splice(0).forEach((open) => open()), 2);
-		await settled;
-		clearInterval(opener);
+		expect(await fillers[0]).toBe(SNAPSHOT_DROPPED);
+		// Release the second render; all remaining renders finish without timers.
+		gates.shift()?.();
+		await Promise.all([newest, ...fillers]);
+		expect(order.slice(2)).toEqual(Array.from({ length: SNAPSHOT_MAX_QUEUED }, (_, n) => `fill-${SNAPSHOT_MAX_QUEUED - n}.html`));
 	});
 
 	it("drops every waiting request on cancel, renders nothing more, and does not hold a cancelled render against its file", async () => {
@@ -145,9 +171,12 @@ describe("artifact snapshot store", () => {
 		const store = createArtifactSnapshotStore({ directory, render, gapMs: 0 });
 		const first = store.request(job({ path: "first.html" }));
 		await vi.waitFor(() => expect(render).toHaveBeenCalledTimes(1));
-		const waitingRequests = [1, 2, 3].map((n) => store.request(job({ path: `later-${n}.html` })));
-		// A request reads the disk cache before it joins the queue; let all three get there.
-		await new Promise((resolve) => setTimeout(resolve, 50));
+		const reads = [cacheMiss(), cacheMiss(), cacheMiss()];
+		const readFile = vi.spyOn(fs, "readFile");
+		for (const read of reads) readFile.mockReturnValueOnce(read.pending);
+		const waitingRequests = reads.map((_, n) => store.request(job({ path: `later-${n}.html` })));
+		for (const read of reads) await read.release();
+		readFile.mockRestore();
 		store.cancel();
 		expect(await Promise.all(waitingRequests)).toEqual([SNAPSHOT_DROPPED, SNAPSHOT_DROPPED, SNAPSHOT_DROPPED]);
 		gates.shift()?.();

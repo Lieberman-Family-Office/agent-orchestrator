@@ -69,8 +69,9 @@ export function createArtifactSnapshotStore(options: {
 	const fileFor = (key: string, cloud: boolean) => path.join(cloud ? cloudDirectory : directory, `${key}.webp`);
 	const inFlight = new Map<string, Promise<SnapshotResult>>();
 	const failedAt = new Map<string, number>();
-	// Oldest first; the newest request is at the end.
-	const waiting: Array<{ start: () => void; drop: () => void }> = [];
+	// Oldest first; request order must not depend on disk-read completion order.
+	const waiting: Array<{ order: number; start: () => void; drop: () => void }> = [];
+	let requestSeq = 0;
 	// One render at a time: every job shares the renderer's single window, and starting a job
 	// unmounts the previous one's preview, so two at once would wipe each other mid-render.
 	let running = false;
@@ -160,12 +161,13 @@ export function createArtifactSnapshotStore(options: {
 		waiting.pop()?.start();
 	}
 
-	function enqueue(job: ArtifactSnapshotJob, key: string): Promise<SnapshotResult> {
+	function enqueue(job: ArtifactSnapshotJob, key: string, order: number): Promise<SnapshotResult> {
 		const cloud = Boolean(job.cloud);
 		const epoch = cloudEpoch;
 		const signedOut = () => cloud && (epoch !== cloudEpoch || cloudOwner === undefined);
 		return new Promise((resolve) => {
 			waiting.push({
+				order,
 				drop: () => resolve(SNAPSHOT_DROPPED),
 				start: () => {
 					running = true;
@@ -194,6 +196,7 @@ export function createArtifactSnapshotStore(options: {
 					})();
 				},
 			});
+			waiting.sort((a, b) => a.order - b.order);
 			// The oldest request goes first when too many wait.
 			while (waiting.length > SNAPSHOT_MAX_QUEUED) waiting.shift()?.drop();
 			pump();
@@ -213,13 +216,14 @@ export function createArtifactSnapshotStore(options: {
 		async request(job: ArtifactSnapshotJob): Promise<SnapshotResult> {
 			if (job.cloud && cloudOwner === undefined) return null;
 			const key = artifactSnapshotKey(job);
+			const order = requestSeq++;
 			const cached = await read(key, Boolean(job.cloud));
 			if (cached) return cached;
 			const existing = inFlight.get(key);
 			if (existing) return existing;
 			const failed = failedAt.get(key);
 			if (failed !== undefined && now() - failed < SNAPSHOT_RETRY_MS) return null;
-			const pending = enqueue(job, key);
+			const pending = enqueue(job, key, order);
 			inFlight.set(key, pending);
 			void pending.finally(() => {
 				if (inFlight.get(key) === pending) inFlight.delete(key);
