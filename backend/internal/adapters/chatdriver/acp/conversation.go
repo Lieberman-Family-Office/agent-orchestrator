@@ -1103,16 +1103,8 @@ func (c *conversation) finishPrompt(
 		c.terminalEventID = eventID
 		c.mu.Unlock()
 	}
-	c.emit(ports.ChatEvent{
-		Kind: ports.ChatEventTurnCompleted, ProviderEventID: eventID,
-		ProviderTurnID: turnID, TurnState: state, FailureCode: failureCode, Err: turnErr,
-		UsageLimitResetsAt: usageLimitResetsAt,
-	})
-	// Release the turn before announcing readiness, not after. A consumer that
-	// reacts to ChatControllerReady by sending the next turn — AO's own queue
-	// drain does exactly that — would otherwise race this unlock and be refused
-	// with "already has a turn in flight", depending purely on which goroutine
-	// the scheduler picks. Ready has to mean ready.
+	// The service drains queued work on TurnCompleted, before ControllerReady.
+	// Release this turn before publishing either event so the next send can start.
 	c.mu.Lock()
 	if c.activeTurn == turnID {
 		c.activeTurn = ""
@@ -1127,6 +1119,11 @@ func (c *conversation) finishPrompt(
 		c.releasePendingSteersLocked()
 	}
 	c.mu.Unlock()
+	c.emit(ports.ChatEvent{
+		Kind: ports.ChatEventTurnCompleted, ProviderEventID: eventID,
+		ProviderTurnID: turnID, TurnState: state, FailureCode: failureCode, Err: turnErr,
+		UsageLimitResetsAt: usageLimitResetsAt,
+	})
 	if sessionLost {
 		// Ready would let the queue drain into a provider that cannot serve it.
 		// Stopping ends the stream after the failed turn above, so the controller
