@@ -74,7 +74,7 @@ func TestForkSetupRunsWithAOFork(t *testing.T) {
 	ws := t.TempDir()
 	project := domain.ProjectRecord{ID: "mer", Path: t.TempDir()}
 	project.Config.PostCreate = []string{`printf '%s' "$AO_FORK" > fork-flag`}
-	rec := domain.SessionRecord{ID: "mer-fork", ProjectID: project.ID, Harness: domain.HarnessClaudeCode}
+	rec := domain.SessionRecord{ID: "mer-fork", ProjectID: domain.ProjectID(project.ID), Harness: domain.HarnessClaudeCode}
 	m.markForkWorkspace(ws)
 	if err := m.provisionWorkspace(context.Background(), project, rec, ports.WorkspaceInfo{Path: ws}); err != nil {
 		t.Fatal(err)

@@ -90,7 +90,7 @@ func TestParseShareLinksRejectsMalformedKeys(t *testing.T) {
 			}
 			urls := parseShareLinks(data, "https://cp.test")
 			links := urls["sess-1"]
-			if len(urls) != 1 || len(links.byID) != 0 || len(links.byPath) != 1 || links.byPath["valid.html"] != "https://share.test/valid" {
+			if len(urls) != 1 || len(links.byID) != 0 || len(links.byPath) != 1 || links.byPath["valid.html"] != (shareLink{url: "https://share.test/valid"}) {
 				t.Fatalf("parsed links = %v, want only valid.html", urls)
 			}
 		})

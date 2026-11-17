@@ -1207,11 +1207,12 @@ describe("SessionInspector PR section", () => {
     });
 
     it("offers nothing until it knows where the PR sits", async () => {
-      const stackRead = Promise.withResolvers<{ data: unknown }>();
+      let resolveStack!: (value: { data: unknown }) => void;
+      const stackRead = new Promise<{ data: unknown }>((resolve) => { resolveStack = resolve; });
       const summary = prSummary(2, "open", ready as Partial<SessionPRSummary>);
       const respond = commonGetsResponder();
       getMock.mockImplementation(async (path: string) => {
-        if (path === "/api/v1/prs/{id}/stack") return stackRead.promise;
+        if (path === "/api/v1/prs/{id}/stack") return stackRead;
         return path === "/api/v1/sessions/{sessionId}/pr" ? { data: { prs: [summary], linkedPrs: [] } } : respond(path);
       });
       renderWithQuery(
@@ -1222,7 +1223,7 @@ describe("SessionInspector PR section", () => {
       const merge = await screen.findByRole("button", { name: /^Squash and merge: PR #2/ });
       expect(merge).toBeDisabled();
       expect(screen.queryByRole("button", { name: "New task on this PR" })).not.toBeInTheDocument();
-      stackRead.resolve({ data: stackOf(layer(1, "open"), layer(2, "open")) });
+      resolveStack({ data: stackOf(layer(1, "open"), layer(2, "open")) });
       expect(await screen.findByRole("button", { name: "Merge through #2 · 2 PRs" })).toBeEnabled();
     });
 
