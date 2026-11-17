@@ -131,9 +131,9 @@ func TestQueuedBatchAttachmentIndicesMatchDeliveredContent(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, msg := range []ports.ChatUserMessage{
-		{Text: "context message", ClientMessageID: "indexed-context", Origin: domain.MessageOriginHuman,
+		{Text: "context message", ClientMessageID: "indexed-context", Origin: domain.MessageOriginAutomation,
 			Content: []ports.ChatContent{{Type: "text", Text: "verified context", Internal: true}}},
-		{Text: "image message", ClientMessageID: "indexed-image", Origin: domain.MessageOriginHuman,
+		{Text: "image message", ClientMessageID: "indexed-image", Origin: domain.MessageOriginAutomation,
 			Content: []ports.ChatContent{{Type: "image", Data: "aW1hZ2U=", MIMEType: "image/png"}}},
 	} {
 		if _, err := h.svc.Send(ctx, testSession, msg); err != nil {
@@ -190,11 +190,11 @@ func TestSteeredBatchAttachmentIndicesMatchDeliveredContent(t *testing.T) {
 	}
 }
 
-func TestFailedBatchRetryPreservesEveryProviderInput(t *testing.T) {
+func TestFailedQueuedTurnRetryPreservesProviderInput(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
 	active, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
-		Text: "active", ClientMessageID: "retry-batch-active", Origin: domain.MessageOriginHuman,
+		Text: "active", ClientMessageID: "retry-queued-active", Origin: domain.MessageOriginHuman,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -202,15 +202,14 @@ func TestFailedBatchRetryPreservesEveryProviderInput(t *testing.T) {
 	caps := productionCaps()
 	caps[ports.ChatCapabilityEmbeddedContext] = true
 	h.conv.setCapabilities(caps)
-	for _, msg := range []ports.ChatUserMessage{
-		{Text: "first", ClientMessageID: "retry-batch-first", Origin: domain.MessageOriginHuman,
-			Content: []ports.ChatContent{{Type: "text", Text: "verified context", Internal: true}}},
-		{Text: "second", ClientMessageID: "retry-batch-second", Origin: domain.MessageOriginHuman,
-			Content: []ports.ChatContent{{Type: "resource", URI: "file:///worktree/context.txt", Name: "context.txt"}}},
-	} {
-		if _, err := h.svc.Send(ctx, testSession, msg); err != nil {
-			t.Fatal(err)
-		}
+	if _, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+		Text: "queued", ClientMessageID: "retry-queued", Origin: domain.MessageOriginHuman,
+		Content: []ports.ChatContent{
+			{Type: "text", Text: "verified context", Internal: true},
+			{Type: "resource", URI: "file:///worktree/context.txt", Name: "context.txt"},
+		},
+	}); err != nil {
+		t.Fatal(err)
 	}
 	h.conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted,
 		ProviderTurnID: active.ProviderTurnID, TurnState: domain.TurnStateCompleted})
@@ -219,9 +218,9 @@ func TestFailedBatchRetryPreservesEveryProviderInput(t *testing.T) {
 	if !strings.Contains(original.Text, "verified context") || len(original.Content) != 1 {
 		t.Fatalf("original provider input = %+v", original)
 	}
-	message, found, err := h.st.ConversationMessageByClientID(ctx, h.ctrl.ConversationID(), "retry-batch-first")
+	message, found, err := h.st.ConversationMessageByClientID(ctx, h.ctrl.ConversationID(), "retry-queued")
 	if err != nil || !found {
-		t.Fatalf("batch leader = %+v, %v", message, err)
+		t.Fatalf("queued message = %+v, %v", message, err)
 	}
 	turn, err := h.st.TurnByID(ctx, message.TurnID)
 	if err != nil || turn.ProviderInputText != original.Text {
@@ -237,7 +236,7 @@ func TestFailedBatchRetryPreservesEveryProviderInput(t *testing.T) {
 	retried := h.conv.sentMessages()[2]
 	if retried.Text != original.Text || len(retried.Content) != 1 ||
 		retried.Content[0].URI != original.Content[0].URI {
-		t.Fatalf("retry lost or duplicated batch input: original=%+v retry=%+v", original, retried)
+		t.Fatalf("retry lost or duplicated queued input: original=%+v retry=%+v", original, retried)
 	}
 }
 
@@ -269,6 +268,15 @@ func TestRollbackHidesEarlierMembersOfSteerFallbackBatch(t *testing.T) {
 	}
 	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted,
 		ProviderTurnID: active.ProviderTurnID, TurnState: domain.TurnStateCompleted})
+	h.awaitSnapshot(t, func(store.ConversationSnapshot) bool { return len(provider.sentTexts()) == 2 })
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted,
+		ProviderTurnID: "provider-turn-2", TurnState: domain.TurnStateCompleted})
+	h.awaitSnapshot(t, func(store.ConversationSnapshot) bool {
+		turn, err := h.st.TurnByID(ctx, result.Turn.ID)
+		return err == nil && turn.State == domain.TurnStateRunning
+	})
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted,
+		ProviderTurnID: "provider-turn-3", TurnState: domain.TurnStateCompleted})
 	h.awaitSnapshot(t, func(store.ConversationSnapshot) bool {
 		turn, err := h.st.TurnByID(ctx, result.Turn.ID)
 		return err == nil && turn.State == domain.TurnStateCompleted
@@ -302,7 +310,7 @@ func TestQueuedBatchKeepsConcurrentArrivalForNextTurn(t *testing.T) {
 	h.conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: "provider-turn-1"})
 	for _, text := range []string{"queued one", "queued two"} {
 		if _, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
-			Text: text, ClientMessageID: text, Origin: domain.MessageOriginHuman,
+			Text: text, ClientMessageID: text, Origin: domain.MessageOriginAutomation,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -474,24 +482,29 @@ func TestSteerRefusalFallsBackWithPendingBatch(t *testing.T) {
 	}
 	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted,
 		ProviderTurnID: "provider-turn-1", TurnState: domain.TurnStateCompleted})
-	h.awaitSnapshot(t, func(store.ConversationSnapshot) bool {
-		turn, err := h.st.TurnByID(ctx, result.Turn.ID)
-		return err == nil && turn.State == domain.TurnStateCompleted
-	})
+	h.awaitSnapshot(t, func(store.ConversationSnapshot) bool { return len(provider.sentTexts()) == 2 })
 	sent := provider.sentTexts()
-	if len(sent) != 2 {
-		t.Fatalf("provider sends = %+v", sent)
-	}
 	if id := provider.sentMessages()[1].ClientMessageID; id != "pending A" {
 		t.Fatalf("fallback batch handle = %q", id)
 	}
 	items := parseDeliveredBatch(t, sent[1])
-	if len(items) != 3 || items[0].Text != "pending A" || items[1].Text != "pending B" ||
-		items[2].Kind != "message" || items[2].Text != "steer fallback" {
-		t.Fatalf("fallback batch = %+v", items)
+	if len(items) != 2 || items[0].Text != "pending A" || items[1].Text != "pending B" {
+		t.Fatalf("pending automation batch = %+v", items)
+	}
+	if turn, err := h.st.TurnByID(ctx, result.Turn.ID); err != nil || turn.State != domain.TurnStateQueued {
+		t.Fatalf("human fallback must wait for the automation batch: %+v, %v", turn, err)
+	}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted,
+		ProviderTurnID: "provider-turn-2", TurnState: domain.TurnStateCompleted})
+	h.awaitSnapshot(t, func(store.ConversationSnapshot) bool {
+		turn, err := h.st.TurnByID(ctx, result.Turn.ID)
+		return err == nil && turn.State == domain.TurnStateRunning
+	})
+	if sent := provider.sentMessages(); len(sent) != 3 || sent[2].Text != msg.Text || sent[2].ClientMessageID != msg.ClientMessageID {
+		t.Fatalf("human fallback must have its own provider turn: %+v", sent)
 	}
 	duplicate, err := h.svc.SteerOrSend(ctx, testSession, msg, false)
-	if err != nil || !duplicate.Duplicate || len(provider.sentTexts()) != 2 {
+	if err != nil || !duplicate.Duplicate || duplicate.Turn.ID != result.Turn.ID || len(provider.sentTexts()) != 3 {
 		t.Fatalf("duplicate fallback = %+v, %v", duplicate, err)
 	}
 }
@@ -499,11 +512,15 @@ func TestSteerRefusalFallsBackWithPendingBatch(t *testing.T) {
 func TestFailedSteerFallbackSettlesClaimedBatch(t *testing.T) {
 	h, provider := steerHarness(t)
 	ctx := context.Background()
-	queued, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
-		Text: "pending", ClientMessageID: "failed-fallback-pending", Origin: domain.MessageOriginAutomation,
-	})
-	if err != nil {
-		t.Fatal(err)
+	var queued []domain.ConversationTurn
+	for _, text := range []string{"pending one", "pending two"} {
+		turn, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+			Text: text, ClientMessageID: text, Origin: domain.MessageOriginAutomation,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		queued = append(queued, turn)
 	}
 	provider.failWith(ports.ErrChatNoSteerableTurn)
 	provider.sendErr = errors.New("provider unavailable")
@@ -516,15 +533,19 @@ func TestFailedSteerFallbackSettlesClaimedBatch(t *testing.T) {
 	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted,
 		ProviderTurnID: "provider-turn-1", TurnState: domain.TurnStateCompleted})
 	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
-		turn, _ := turnByID(s, result.Turn.ID)
-		return turn.State == domain.TurnStateFailed
+		for _, expected := range queued {
+			turn, _ := turnByID(s, expected.ID)
+			if turn.State != domain.TurnStateFailed {
+				return false
+			}
+		}
+		return true
 	})
-	if _, err := h.st.NextQueuedTurn(ctx, h.ctrl.ConversationID()); !errors.Is(err, domain.ErrNoQueuedTurn) {
-		t.Fatalf("failed fallback left a queued message: %v", err)
+	if next, err := h.st.NextQueuedTurn(ctx, h.ctrl.ConversationID()); err != nil || next.TurnID != result.Turn.ID {
+		t.Fatalf("failed automation batch must preserve the queued human fallback: %+v, %v", next, err)
 	}
-	settled, err := h.st.TurnByID(ctx, queued.ID)
-	if err != nil || settled.State != domain.TurnStateFailed {
-		t.Fatalf("claimed batch receipt = %+v, %v", settled, err)
+	if calls := provider.sendCallCount(); calls != 2 {
+		t.Fatalf("human fallback retried through the provider outage: %d sends", calls)
 	}
 }
 
@@ -754,7 +775,7 @@ func TestQueuedBatchDoesNotTruncateProviderInput(t *testing.T) {
 	large := strings.Repeat("complete content ", 9000)
 	for i, text := range []string{large, "tail is retained"} {
 		if _, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
-			Text: text, ClientMessageID: "large-" + string(rune('a'+i)), Origin: domain.MessageOriginHuman,
+			Text: text, ClientMessageID: "large-" + string(rune('a'+i)), Origin: domain.MessageOriginAutomation,
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -768,5 +789,51 @@ func TestQueuedBatchDoesNotTruncateProviderInput(t *testing.T) {
 	}
 	if items[0].Text != large || items[1].Text != "tail is retained" {
 		t.Fatalf("batch content truncated: firstLength=%d", len(items[0].Text))
+	}
+}
+
+func TestQueuedTypedMessagesDrainOnePerTurn(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	if _, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+		Text: "active", ClientMessageID: "typed-active", Origin: domain.MessageOriginHuman,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: "provider-turn-1"})
+	for _, msg := range []ports.ChatUserMessage{
+		{Text: "worker one", ClientMessageID: "typed-worker-one", Origin: domain.MessageOriginAutomation},
+		{Text: "worker two", ClientMessageID: "typed-worker-two", Origin: domain.MessageOriginDaemon},
+		{Text: "typed one", ClientMessageID: "typed-one", Origin: domain.MessageOriginHuman},
+		{Text: "typed two", ClientMessageID: "typed-two", Origin: domain.MessageOriginHuman},
+		{Text: "worker three", ClientMessageID: "typed-worker-three", Origin: domain.MessageOriginAutomation},
+	} {
+		if turn, err := h.svc.Send(ctx, testSession, msg); err != nil || turn.State != domain.TurnStateQueued {
+			t.Fatalf("queue %q: turn=%+v err=%v", msg.Text, turn, err)
+		}
+	}
+	complete := func(turn int) {
+		t.Helper()
+		h.conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted,
+			ProviderTurnID: "provider-turn-" + string(rune('0'+turn)), TurnState: domain.TurnStateCompleted})
+		h.awaitSnapshot(t, func(store.ConversationSnapshot) bool { return len(h.conv.sentTexts()) == turn+1 })
+	}
+
+	complete(1)
+	items := parseDeliveredBatch(t, h.conv.sentTexts()[1])
+	if len(items) != 2 || items[0].Text != "worker one" || items[1].Text != "worker two" {
+		t.Fatalf("agent messages ahead of typed ones = %+v", items)
+	}
+	complete(2)
+	if got := h.conv.sentTexts()[2]; got != "typed one" {
+		t.Fatalf("third provider input = %q, want the first typed message alone", got)
+	}
+	complete(3)
+	if got := h.conv.sentTexts()[3]; got != "typed two" {
+		t.Fatalf("fourth provider input = %q, want the second typed message alone", got)
+	}
+	complete(4)
+	if got := h.conv.sentTexts()[4]; got != "worker three" {
+		t.Fatalf("fifth provider input = %q", got)
 	}
 }

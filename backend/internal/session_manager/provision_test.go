@@ -20,6 +20,7 @@ import (
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/lifecycle"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
+	"github.com/aoagents/agent-orchestrator/backend/internal/providerkeys"
 	chatsvc "github.com/aoagents/agent-orchestrator/backend/internal/service/chat"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite"
 	"github.com/aoagents/agent-orchestrator/backend/internal/storage/sqlite/sqlitetest"
@@ -83,6 +84,55 @@ func TestSpawnEnvWindowsRemovesCaseVariantsOfProtectedVariables(t *testing.T) {
 	}
 	if env[EnvSessionID] != "mer-1" || env["buildMode"] != "production" {
 		t.Fatalf("environment = %v, want protected ID and untouched project variable spelling", env)
+	}
+}
+
+func TestRuntimeEnvIncludesSavedProviderKeysAndProjectOverride(t *testing.T) {
+	dir := t.TempDir()
+	if err := providerkeys.Save(t.Context(), dir, "OPENAI_API_KEY", "device-secret"); err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{
+		dataDir:    dir,
+		executable: func() (string, error) { return filepath.Join(dir, "ao"), nil },
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	base := manager.runtimeEnv("session", "project", "", nil)
+	if base["OPENAI_API_KEY"] != "device-secret" {
+		t.Fatal("saved device provider key was not passed to the harness")
+	}
+	project := manager.runtimeEnv("session", "project", "", map[string]string{"OPENAI_API_KEY": "project-secret"})
+	if project["OPENAI_API_KEY"] != "project-secret" {
+		t.Fatal("project-specific provider key did not override the device default")
+	}
+}
+
+func TestRuntimeEnvKeepsAUserExportedKeyForAHarnessThatMustNotGetAOs(t *testing.T) {
+	dir := t.TempDir()
+	if err := providerkeys.Save(t.Context(), dir, "OPENAI_API_KEY", "ao-saved"); err != nil {
+		t.Fatal(err)
+	}
+	// The user exported their own key before starting AO; the daemon then
+	// exports AO's copy to itself for authentication probes.
+	t.Setenv("OPENAI_API_KEY", "user-exported")
+	t.Cleanup(func() { _ = providerkeys.RestoreInherited("OPENAI_API_KEY") })
+	if err := providerkeys.ExportForProbes("OPENAI_API_KEY", "ao-saved"); err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{
+		dataDir:    dir,
+		executable: func() (string, error) { return filepath.Join(dir, "ao"), nil },
+		logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	// Codex never claimed AO's key, so it gets the user's own value back.
+	codex, err := manager.runtimeEnvChecked("session", "project", "", nil, "", "codex")
+	if err != nil || codex["OPENAI_API_KEY"] != "user-exported" {
+		t.Fatalf("codex OPENAI_API_KEY=%q err=%v", codex["OPENAI_API_KEY"], err)
+	}
+	// Other harnesses still receive AO's saved key.
+	goose, err := manager.runtimeEnvChecked("session", "project", "", nil, "", "goose")
+	if err != nil || goose["OPENAI_API_KEY"] != "ao-saved" {
+		t.Fatalf("goose OPENAI_API_KEY=%q err=%v", goose["OPENAI_API_KEY"], err)
 	}
 }
 
@@ -574,6 +624,27 @@ func TestResolveClaudeTUIAgentConfigRejectsUnsupportedEffort(t *testing.T) {
 	}
 }
 
+func TestResolveGrokEffortIsAvailableOnlyInChat(t *testing.T) {
+	m := &Manager{}
+	for _, mode := range []domain.SessionMode{domain.SessionModeChat, domain.SessionModeTUI} {
+		t.Run(string(mode), func(t *testing.T) {
+			resolved, err := m.resolveAgentConfig(t.Context(), ports.SpawnConfig{
+				Harness: domain.HarnessGrok, Kind: domain.KindWorker, RequestedMode: mode,
+				AgentConfig: ports.AgentConfig{Model: "grok-4.7", Effort: "xhigh"}, EffortOverride: true,
+			}, domain.ProjectConfig{})
+			if mode == domain.SessionModeTUI {
+				if !errors.Is(err, ports.ErrUnsupportedEffort) {
+					t.Fatalf("TUI effort error = %v, want unsupported", err)
+				}
+				return
+			}
+			if err != nil || resolved.Model != "grok-4.7" || resolved.Effort != "xhigh" {
+				t.Fatalf("Chat config = %#v, %v; want effort forwarded to ACP", resolved, err)
+			}
+		})
+	}
+}
+
 func TestResolveAgentConfigRejectsExplicitEffortForUnsupportedHarness(t *testing.T) {
 	m := &Manager{modelCatalog: tuningCatalog{catalog: ports.AgentModelCatalog{Models: []ports.AgentModelInfo{
 		{ID: "gemini-2.5-pro", IsDefault: true, Efforts: []string{"low", "high"}},
@@ -923,7 +994,8 @@ func TestPostCreateStoreProbe(t *testing.T) {
 		t.Fatal(resolveErr)
 	}
 	if rec.ProjectID != domain.ProjectID(os.Getenv(EnvProjectID)) || rec.IssueID != domain.IssueID(os.Getenv(EnvIssueID)) ||
-		rec.Metadata.WorkspacePath != os.Getenv("AO_WORKSPACE_PATH") || actualWorkspace != cwd {
+		rec.Metadata.WorkspacePath != os.Getenv("AO_WORKSPACE_PATH") || actualWorkspace != cwd ||
+		rec.Metadata.WorkspacePath != os.Getenv("AO_WORKTREE_PATH") || rec.Metadata.WorkspaceRepoPath != os.Getenv("AO_SOURCE_TREE_PATH") {
 		t.Fatalf("postCreate identity disagrees with live store: %+v cwd=%q", rec, cwd)
 	}
 	if rec.IsTerminated || rec.Metadata.RuntimeHandleID != "" || rec.Metadata.RuntimeLaunchID != "" ||
@@ -941,7 +1013,9 @@ func TestPostCreateStoreProbe(t *testing.T) {
 		Repo    string
 		RunFile string
 		Token   string
-	}{rec.Metadata.Branch, rec.Metadata.WorkspaceRepoPath, os.Getenv(EnvRunFile), os.Getenv("PROJECT_TOKEN")})
+		Fork    string
+		APIKey  string
+	}{rec.Metadata.Branch, rec.Metadata.WorkspaceRepoPath, os.Getenv(EnvRunFile), os.Getenv("PROJECT_TOKEN"), os.Getenv("AO_FORK"), os.Getenv("OPENAI_API_KEY")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -961,12 +1035,15 @@ func TestSpawnPostCreateSessionContext(t *testing.T) {
 		async     bool
 		prepared  bool
 		noRunFile bool
+		fork      bool
 		project   domain.ProjectKind
 	}{
 		{name: "tui", mode: domain.SessionModeTUI, kind: domain.KindWorker},
 		{name: "no manager runfile", mode: domain.SessionModeTUI, kind: domain.KindWorker, noRunFile: true},
 		{name: "chat orchestrator", mode: domain.SessionModeChat, kind: domain.KindOrchestrator},
 		{name: "async chat", mode: domain.SessionModeChat, kind: domain.KindWorker, async: true},
+		{name: "fork-marked tui", mode: domain.SessionModeTUI, kind: domain.KindWorker, fork: true},
+		{name: "fork-marked async chat", mode: domain.SessionModeChat, kind: domain.KindWorker, async: true, fork: true},
 		{name: "prepared suffix", mode: domain.SessionModeTUI, kind: domain.KindWorker, prepared: true},
 		{name: "async prepared suffix", mode: domain.SessionModeChat, kind: domain.KindWorker, async: true, prepared: true},
 		{name: "workspace project", mode: domain.SessionModeTUI, kind: domain.KindWorker, project: domain.ProjectKindWorkspace},
@@ -989,7 +1066,15 @@ func TestSpawnPostCreateSessionContext(t *testing.T) {
 			quote := func(value string) string { return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'" }
 			project := domain.ProjectRecord{ID: "mer", Path: t.TempDir(), Kind: tc.project, Config: testRoleAgents()}
 			project.Config.Env = map[string]string{"PROJECT_TOKEN": "kept"}
-			for _, key := range []string{EnvSessionID, EnvProjectID, EnvIssueID, EnvDataDir, EnvRunFile, "AO_WORKSPACE_PATH"} {
+			if err := providerkeys.Save(t.Context(), dataDir, "OPENAI_API_KEY", "ao-saved"); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("OPENAI_API_KEY", "user-exported")
+			t.Cleanup(func() { _ = providerkeys.RestoreInherited("OPENAI_API_KEY") })
+			if err := providerkeys.ExportForProbes("OPENAI_API_KEY", "ao-saved"); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range []string{EnvSessionID, EnvProjectID, EnvIssueID, EnvDataDir, EnvRunFile, "AO_WORKSPACE_PATH", "AO_SOURCE_TREE_PATH", "AO_WORKTREE_PATH", "AO_FORK"} {
 				t.Setenv(key, "inherited-spoof")
 				project.Config.Env[key] = "project-spoof"
 			}
@@ -1008,6 +1093,9 @@ func TestSpawnPostCreateSessionContext(t *testing.T) {
 				Messenger: &fakeMessenger{}, Lifecycle: lifecycle.New(st, nil), Chat: &recordingLauncher{}, DataDir: dataDir,
 				RunFilePath: runFile, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 				LookPath: func(string) (string, error) { return "/bin/true", nil }})
+			if tc.fork {
+				m.markForkWorkspace(workspace)
+			}
 			deferred := deferredBackground(m)
 			cfg := ports.SpawnConfig{ProjectID: "mer", IssueID: "issue-9", Harness: domain.HarnessCodex,
 				Kind: tc.kind, RequestedMode: tc.mode, Async: tc.async}
@@ -1036,13 +1124,22 @@ func TestSpawnPostCreateSessionContext(t *testing.T) {
 				Repo    string
 				RunFile string
 				Token   string
+				Fork    string
+				APIKey  string
 			}
 			if err := json.Unmarshal(body, &got); err != nil {
 				t.Fatal(err)
 			}
+			wantFork := ""
+			if tc.fork {
+				wantFork = "1"
+			}
 			if got.Branch != ws.createBranch || got.Repo != project.Path ||
-				got.RunFile != runFile || got.Token != "kept" {
+				got.RunFile != runFile || got.Token != "kept" || got.Fork != wantFork || got.APIKey != "user-exported" {
 				t.Fatalf("postCreate context = %+v", got)
+			}
+			if m.takeForkWorkspace(workspace) {
+				t.Fatal("setup did not consume the fork marker")
 			}
 		})
 	}

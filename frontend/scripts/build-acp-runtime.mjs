@@ -16,6 +16,7 @@ import {
 	createWorkDirectory,
 	npmInvocation,
 	patchClaudeContextUsage,
+	patchClaudeContextWindowProbe,
 	patchClaudeFoldedPromptSettlement,
 	patchClaudeHibernationCheck,
 	patchClaudeQueuedStop,
@@ -28,7 +29,7 @@ import {
 	runtimeSourceFiles,
 } from "./build-acp-runtime-helpers.mjs";
 
-const NODE_VERSION = "22.23.2";
+const NODE_VERSION = "22.23.5";
 const DOWNLOAD_ATTEMPTS = 3;
 const scriptsDir = dirname(fileURLToPath(import.meta.url));
 const frontendRoot = resolve(scriptsDir, "..");
@@ -93,6 +94,7 @@ run(npm.command, npm.args, { cwd: outDir });
 patchClaudeRetryDetails(claudeAdapter);
 patchClaudeThinkingProgress(claudeAdapter);
 patchClaudeContextUsage(claudeAdapter);
+patchClaudeContextWindowProbe(claudeAdapter);
 patchClaudeHibernationCheck(claudeAdapter);
 patchClaudeWorkerSteering(claudeAdapter);
 patchClaudeQueuedStop(join(outDir, "node_modules", "@anthropic-ai", "claude-agent-sdk", "sdk.mjs"));

@@ -90,7 +90,7 @@ func TestParseShareLinksRejectsMalformedKeys(t *testing.T) {
 			}
 			urls := parseShareLinks(data, "https://cp.test")
 			links := urls["sess-1"]
-			if len(urls) != 1 || len(links.byID) != 0 || len(links.byPath) != 1 || links.byPath["valid.html"] != "https://share.test/valid" {
+			if len(urls) != 1 || len(links.byID) != 0 || len(links.byPath) != 1 || links.byPath["valid.html"] != (shareLink{url: "https://share.test/valid"}) {
 				t.Fatalf("parsed links = %v, want only valid.html", urls)
 			}
 		})
@@ -114,5 +114,31 @@ func TestShareLinksApplyByArtifactID(t *testing.T) {
 	NewShareLinks(dir, "https://cp.test").Apply("sess-1", files)
 	if files[0].ShareURL != "https://share.test/a" || files[1].ShareURL != "https://share.test/b" || files[2].ShareURL != "" {
 		t.Fatalf("share URLs = %q, %q, %q", files[0].ShareURL, files[1].ShareURL, files[2].ShareURL)
+	}
+}
+
+// A record's access says who its link opens for; anything else is not recorded.
+func TestShareLinksApplyAccess(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ShareLinksFile), []byte(`{
+		"[\"https://cp.test\",\"sess-1\",\"\",\"art-1\"]": {"shareId": "a", "url": "https://share.test/a", "access": "restricted"},
+		"[\"https://cp.test\",\"sess-1\",\"public.html\"]": {"shareId": "b", "url": "https://share.test/b", "access": "anyone"},
+		"[\"https://cp.test\",\"sess-1\",\"odd.html\"]": {"shareId": "c", "url": "https://share.test/c", "access": "everyone"},
+		"[\"https://cp.test\",\"sess-1\",\"old.html\"]": {"shareId": "d", "url": "https://share.test/d"}
+	}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	files := []domain.SessionArtifactFile{
+		{ID: "art-1", Path: "private.html"},
+		{Path: "public.html"},
+		{Path: "odd.html"},
+		{Path: "old.html"},
+	}
+	NewShareLinks(dir, "https://cp.test").Apply("sess-1", files)
+	want := []string{"restricted", "anyone", "", ""}
+	for i, file := range files {
+		if file.ShareURL == "" || file.ShareAccess != want[i] {
+			t.Fatalf("%s: url %q access %q, want access %q", file.Path, file.ShareURL, file.ShareAccess, want[i])
+		}
 	}
 }

@@ -1023,7 +1023,7 @@ func TestPersistentACPBarrierPreservesFinalFrameWithoutNewline(t *testing.T) {
 }
 
 func TestPersistentACPHostReceiptPrecedesFollowingResponse(t *testing.T) {
-	for _, method := range []string{persistenthost.ACPPromptResultMethod, persistenthost.ACPInteractionCommandMethod, claudeSDKMessageMethod} {
+	for _, method := range []string{persistenthost.ACPPromptResultMethod, persistenthost.ACPPromptHandoffMethod, persistenthost.ACPInteractionCommandMethod, claudeSDKMessageMethod} {
 		t.Run(method, func(t *testing.T) {
 			processed := make(chan string)
 			done := make(chan struct{})
@@ -1315,6 +1315,8 @@ type fakeAgent struct {
 	cancelErr           error
 	cancelCalls         int
 	customPrompt        func(ctx context.Context, params acpsdk.PromptRequest) (acpsdk.PromptResponse, error)
+	// agentInfo, when set, is reported as the handshake's agentInfo.
+	agentInfo           *acpsdk.Implementation
 	mode                string
 	modeNotFound        bool // SetSessionMode returns -32601
 	modeRequiresOption  SessionOption
@@ -1334,6 +1336,11 @@ type fakeAgent struct {
 	steerOut            string
 	steerMethodNotFound bool // HandleExtensionMethod returns -32601 for steering
 	steerExtensionErr   error
+	// extension, when set, answers every agent extension method instead of
+	// the default _session/steering handler.
+	extension func(method string, raw json.RawMessage) (any, error)
+	// initMeta, when set, replaces the initialize response's top-level _meta.
+	initMeta map[string]any
 }
 
 type legacyKimiAgent struct {
@@ -1477,6 +1484,7 @@ func (a *fakeAgent) Initialize(_ context.Context, params acpsdk.InitializeReques
 	a.initParams = params
 	initErr := a.initErr
 	caps := a.capabilities
+	agentInfo := a.agentInfo
 	a.mu.Unlock()
 	if initErr != nil {
 		return acpsdk.InitializeResponse{}, initErr
@@ -1484,6 +1492,9 @@ func (a *fakeAgent) Initialize(_ context.Context, params acpsdk.InitializeReques
 	meta := map[string]any(nil)
 	if a.steering {
 		meta = map[string]any{"steering": map[string]any{"supported": true, "aoHumanSafeBoundary": a.humanSafeBoundary, "aoGuidanceStopFence": map[bool]int{true: 3}[a.humanSafeBoundary], "aoWorkerSafeBoundary": a.workerSafeBoundary, "aoWorkerQuestionYield": a.workerSafeBoundary, "aoWorkerQuestionOwnership": a.workerSafeBoundary}}
+	}
+	if a.initMeta != nil {
+		meta = a.initMeta
 	}
 	defaultCaps := acpsdk.AgentCapabilities{
 		SessionCapabilities: acpsdk.SessionCapabilities{Resume: &acpsdk.SessionResumeCapabilities{}},
@@ -1495,10 +1506,17 @@ func (a *fakeAgent) Initialize(_ context.Context, params acpsdk.InitializeReques
 		ProtocolVersion:   acpsdk.ProtocolVersionNumber,
 		Meta:              meta,
 		AgentCapabilities: defaultCaps,
+		AgentInfo:         agentInfo,
 	}, nil
 }
 
 func (a *fakeAgent) HandleExtensionMethod(_ context.Context, method string, raw json.RawMessage) (any, error) {
+	a.mu.Lock()
+	extension := a.extension
+	a.mu.Unlock()
+	if extension != nil {
+		return extension(method, raw)
+	}
 	if method != steeringMethod {
 		return nil, acpsdk.NewMethodNotFound(method)
 	}
@@ -3009,7 +3027,7 @@ func TestConversationCapabilitiesTreatLoadSessionAsResume(t *testing.T) {
 	init := acpsdk.InitializeResponse{AgentCapabilities: acpsdk.AgentCapabilities{
 		LoadSession: true,
 	}}
-	if !conversationCapabilities(configured, init)[ports.ChatCapabilityResume] {
+	if !conversationCapabilities(configured, init, steeringFor(Config{}))[ports.ChatCapabilityResume] {
 		t.Fatal("loadSession-only ACP agent was reported as non-resumable")
 	}
 }
@@ -4473,6 +4491,46 @@ func TestDriverSuppressSessionModesDropsModeCategoryConfigOptions(t *testing.T) 
 	}
 	if kept := New(Config{}, slog.New(slog.NewTextHandler(io.Discard, nil))).suppressedModeOptions(catalog); len(kept) != 3 {
 		t.Fatalf("unsuppressed catalog = %#v, want every option kept", kept)
+	}
+}
+
+func TestACPTurnSettingsPreferModelConfigOptionAlongsideLegacyModels(t *testing.T) {
+	agent := &fakeAgent{newConfig: []acpsdk.SessionConfigOption{
+		selectConfigOption("model", "Model", "model", "grok-4.7", "grok-4.7", "grok-4.6"),
+		selectConfigOption("reasoning_effort", "Effort", "thought_level", "high", "high", "low"),
+	}}
+	driver := New(Config{
+		Harness: domain.HarnessGrok,
+		Launch:  func(context.Context, LaunchConfig) (Launch, error) { return Launch{Command: "fake"}, nil },
+		SessionOptions: func(settings ports.ChatTurnSettings) []SessionOption {
+			return []SessionOption{
+				{ID: "model", Value: settings.Model},
+				{ID: "reasoning_effort", Value: settings.Effort},
+			}
+		},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	driver.useTestProcess(fakeSpawn(agent))
+	conv, err := driver.Start(context.Background(), ports.ChatStartConfig{WorkspacePath: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conv.Close()
+	c := conv.(*conversation)
+	// Grok supplies a legacy models block as well as the modern model option.
+	// The modern catalog came through session/new above; retain the legacy
+	// fact too, without adding Grok-specific behavior to the fake wire agent.
+	c.mu.Lock()
+	c.legacyModel = true
+	c.mu.Unlock()
+	if err := c.applyTurnSettings(context.Background(), ports.ChatTurnSettings{
+		Model: "grok-4.6", Effort: "low",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	agent.mu.Lock()
+	defer agent.mu.Unlock()
+	if agent.options["model"] != "grok-4.6" || agent.options["reasoning_effort"] != "low" {
+		t.Fatalf("config-option setters = %v, want model and effort", agent.options)
 	}
 }
 
