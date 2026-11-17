@@ -1,6 +1,9 @@
 import { expect, test, type Page } from "@playwright/test";
 import { installFakeAgent } from "./support/fake-bridge";
 
+// Capture action timing when a throttled switch exhausts the test budget.
+test.use({ trace: "on-first-retry" });
+
 // A session switch renders the destination in the background while the
 // previous session stays on screen, inert, until the destination commits.
 // These cover what the hook tests cannot reach: replies streaming through
