@@ -275,23 +275,61 @@ func TestAttachmentsUpToTurnLeavesOutLaterOnes(t *testing.T) {
 	}
 }
 
+type latestForkStore struct{ Store }
+
+func (latestForkStore) ConversationForSession(context.Context, domain.SessionID) (domain.ConversationRecord, error) {
+	return domain.ConversationRecord{ID: "c"}, nil
+}
+
+func (latestForkStore) LatestConversationTurn(context.Context, string) (domain.ConversationTurn, error) {
+	return domain.ConversationTurn{ID: "t2", State: domain.TurnStateCompleted}, nil
+}
+
+type workspaceForkRegistry struct {
+	ports.ChatDriverRegistry
+	driver ports.ChatDriver
+}
+
+func (r workspaceForkRegistry) Driver(domain.AgentHarness) (ports.ChatDriver, error) {
+	return r.driver, nil
+}
+
 // A Claude fork of the latest turn copies the session only up to that turn,
 // so a turn the original starts while the fork is being made stays out.
 func TestClaudeLatestTurnForkStopsAtThatTurn(t *testing.T) {
 	driver := &workspaceForkDriver{}
-	rows := ConversationRows{Messages: []domain.ConversationMessage{
-		{TurnID: "t2", Role: domain.MessageRoleAssistant, ProviderItemID: "msg_LATEST"},
-		{TurnID: "t3", Role: domain.MessageRoleAssistant, ProviderItemID: "msg_NEWER"},
-	}}
-	plan := sessionForkPlan{
-		driver: driver, sourceProviderID: "s", sourceWorkspace: "/w/src",
-		cutTurnID: "t2", conversationID: "c",
-		reader: SnapshotReaderFunc(func(context.Context, string) (ConversationRows, error) { return rows, nil }),
+	rows := ConversationRows{}
+	reads := 0
+	svc := &Service{
+		store: latestForkStore{}, drivers: workspaceForkRegistry{driver: driver},
+		reader: SnapshotReaderFunc(func(_ context.Context, conversationID string) (ConversationRows, error) {
+			reads++
+			if conversationID != "c" {
+				t.Fatalf("conversation = %q, want c", conversationID)
+			}
+			return rows, nil
+		}),
 	}
-	if _, err := plan.prepare(context.Background(), ports.ForkTarget{SessionID: "f", WorkspacePath: "/w/fork"}); err != nil {
+	source, err := svc.SessionForkSource(context.Background(), domain.SessionRecord{
+		ID: "source", Harness: domain.HarnessClaudeCode,
+		Metadata: domain.SessionMetadata{ProviderConversationID: "s", WorkspacePath: "/w/src"},
+	}, "")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if driver.gotUpTo != "msg_LATEST" {
-		t.Fatalf("copy cut at %q, want the forked turn's last reply", driver.gotUpTo)
+	if source.PrepareChat == nil || source.LatestTurnID != "t2" || reads != 0 {
+		t.Fatalf("source = %+v, reads = %d; want a deferred fork at t2", source, reads)
+	}
+	// Replies arrive after planning; the saved reader must stop at t2.
+	rows.Messages = []domain.ConversationMessage{
+		{TurnID: "t2", Role: domain.MessageRoleAssistant, ProviderItemID: "msg_LATEST"},
+		{TurnID: "t3", Role: domain.MessageRoleAssistant, ProviderItemID: "msg_NEWER"},
+	}
+	svc.reader = nil
+	if _, err := source.PrepareChat(context.Background(), ports.ForkTarget{SessionID: "f", WorkspacePath: "/w/fork"}); err != nil {
+		t.Fatal(err)
+	}
+	if reads != 1 || driver.gotUpTo != "msg_LATEST" {
+		t.Fatalf("reads = %d, copy cut at %q; want one read through the forked turn's last reply", reads, driver.gotUpTo)
 	}
 }
