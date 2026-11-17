@@ -82,12 +82,8 @@ func (s *Service) SessionForkSource(ctx context.Context, rec domain.SessionRecor
 		if mode == forkIntoWorkspace {
 			plan.cutTurnID, plan.conversationID, plan.reader = latest.ID, conversation.ID, s.reader
 		}
-		return sessionfork.Source{
-			LatestTurnID: latest.ID, ContextMode: contextMode, AnyTurn: anyTurn,
-			PrepareChat: func(ctx context.Context, target ports.ForkTarget) (string, error) {
-				return plan.prepare(ctx, target)
-			},
-		}, nil
+		// The method value captures the plan, including the deferred workspace cutoff.
+		return sessionfork.Source{LatestTurnID: latest.ID, ContextMode: contextMode, AnyTurn: anyTurn, PrepareChat: plan.prepare}, nil
 	}
 	if !anyTurn {
 		return sessionfork.Source{Refusal: sessionfork.CodeOlderTurn}, nil
