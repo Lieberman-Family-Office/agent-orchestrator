@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -53,6 +54,49 @@ func TestTurnCompletionReleasesActiveTurn(t *testing.T) {
 		ready := nextEvent(t, conv.Events())
 		if ready.Kind != ports.ChatEventControllerState || ready.ControllerState != ports.ChatControllerReady {
 			t.Fatalf("third event = %#v, want controller ready", ready)
+		}
+	})
+}
+
+func TestSettleOpenItemsUsesStableSnapshots(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		conv := &conversation{
+			messages:       map[string]string{"a": "first", "b": "before"},
+			thoughts:       map[string]string{"thought": "before"},
+			nestedMessages: map[string]nestedMessageState{"nested": {text: "before", parentID: "parent"}},
+			tools:          map[string]*toolState{"tool": {id: "tool", title: "before", status: acpsdk.ToolCallStatusInProgress}},
+			events:         make(chan ports.ChatEvent),
+			log:            slog.New(slog.DiscardHandler),
+		}
+		go func() {
+			conv.settleOpenItems("turn")
+			close(conv.events)
+		}()
+		// Stop at the first event, after the settlement snapshot was taken.
+		synctest.Wait()
+		conv.mu.Lock()
+		conv.messages["b"] = "after"
+		conv.thoughts["thought"] = "after"
+		conv.thoughts["late"] = "after"
+		conv.nestedMessages["nested"] = nestedMessageState{text: "after", parentID: "other"}
+		conv.tools["tool"].title = "after"
+		conv.tools["tool"].status = acpsdk.ToolCallStatusCompleted
+		conv.mu.Unlock()
+
+		got := make(map[string]string)
+		for event := range conv.events {
+			if event.ProviderItemID == "tool" {
+				if event.ActivityStatus != domain.ActivityStatusFailed {
+					t.Errorf("open tool settled as %q, want failed", event.ActivityStatus)
+				}
+				got[event.ProviderItemID] = event.Summary
+			} else {
+				got[event.ProviderItemID] = event.Text
+			}
+		}
+		want := map[string]string{"a": "first", "b": "before", "thought": "before", "nested": "before", "tool": "before"}
+		if !maps.Equal(got, want) {
+			t.Fatalf("settlement snapshot = %v, want %v", got, want)
 		}
 	})
 }
