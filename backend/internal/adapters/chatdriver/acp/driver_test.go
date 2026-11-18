@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	acpsdk "github.com/coder/acp-go-sdk"
@@ -1295,6 +1296,7 @@ type fakeAgent struct {
 	loadUpdateBatches [][]acpsdk.SessionUpdate
 	blockLoadCall     int
 	loadStarted       chan struct{}
+	loadDelay         time.Duration
 	failLoadFrom      int   // LoadSession calls >= this number return failLoadErr
 	failLoadErr       error // the SDK coerces a plain error into -32603
 	// rejectReload answers a session/load of an already loaded, unclosed
@@ -1622,6 +1624,7 @@ func (a *fakeAgent) LoadSession(ctx context.Context, params acpsdk.LoadSessionRe
 	started := a.loadStarted
 	failLoad := a.failLoadFrom > 0 && loadCall >= a.failLoadFrom
 	failLoadErr := a.failLoadErr
+	loadDelay := a.loadDelay
 	if a.rejectReload && a.sessionOpen {
 		a.mu.Unlock()
 		return acpsdk.LoadSessionResponse{}, acpsdk.NewInvalidParams("Session " + string(params.SessionId) + " is already loaded")
@@ -1630,6 +1633,13 @@ func (a *fakeAgent) LoadSession(ctx context.Context, params acpsdk.LoadSessionRe
 	a.mu.Unlock()
 	if failLoad {
 		return acpsdk.LoadSessionResponse{}, failLoadErr
+	}
+	if loadDelay > 0 {
+		select {
+		case <-time.After(loadDelay):
+		case <-ctx.Done():
+			return acpsdk.LoadSessionResponse{}, ctx.Err()
+		}
 	}
 	if block {
 		if started != nil {
@@ -2925,6 +2935,68 @@ func TestACPDriverResumeMapsProviderInternalLoadErrorToLoadFailed(t *testing.T) 
 	})
 	if !errors.Is(err, ports.ErrChatResumeFailed) || !errors.Is(err, ports.ErrChatHistoryLoadFailed) {
 		t.Fatalf("Resume error = %v, want ErrChatResumeFailed wrapping ErrChatHistoryLoadFailed", err)
+	}
+}
+
+func TestACPDriverColdResumeHistoryBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name, wantError                 string
+		delay, callerLimit, wantElapsed time.Duration
+	}{
+		{name: "slow history", delay: 90 * time.Second, wantElapsed: 90 * time.Second},
+		{name: "caller deadline", delay: 90 * time.Second, callerLimit: 5 * time.Second, wantElapsed: 5 * time.Second, wantError: "context deadline exceeded"},
+		{name: "bounded load", delay: 11 * time.Minute, wantElapsed: 10 * time.Minute, wantError: "context deadline exceeded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workspace := t.TempDir()
+			synctest.Test(t, func(t *testing.T) {
+				agent := &fakeAgent{
+					capabilities: &acpsdk.AgentCapabilities{LoadSession: true},
+					loadDelay:    tc.delay,
+					loadUpdates:  []acpsdk.SessionUpdate{acpsdk.UpdateUserMessageText("retained history")},
+				}
+				driver := New(Config{
+					Harness:      domain.HarnessClaudeCode,
+					Capabilities: ports.ChatCapabilities{ports.ChatCapabilityStreaming: true},
+					Launch:       func(context.Context, LaunchConfig) (Launch, error) { return Launch{Command: "fake"}, nil },
+				}, slog.New(slog.DiscardHandler))
+				driver.useTestProcess(fakeSpawn(agent))
+				ctx := context.Background()
+				if tc.callerLimit > 0 {
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, tc.callerLimit)
+					defer cancel()
+				}
+				started := time.Now()
+				conv, err := driver.Resume(ctx, ports.ChatResumeConfig{
+					ProviderConversationID: "saved-session",
+					WorkspacePath:          workspace,
+				})
+				if elapsed := time.Since(started); elapsed != tc.wantElapsed {
+					t.Errorf("resume took %v, want %v", elapsed, tc.wantElapsed)
+				}
+				if tc.wantError != "" {
+					if err == nil || !strings.Contains(err.Error(), tc.wantError) {
+						t.Errorf("Resume error = %v, want %q", err, tc.wantError)
+					}
+					if conv != nil {
+						_ = conv.Close()
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("Resume: %v", err)
+				}
+				defer conv.Close()
+				if conv.ProviderConversationID() != "saved-session" {
+					t.Fatal("resume replaced the saved conversation")
+				}
+				history, err := conv.(ports.ChatHistoryReader).ReadHistory(ctx)
+				if err != nil || len(history) == 0 {
+					t.Fatalf("retained history = %d events, error %v", len(history), err)
+				}
+			})
+		})
 	}
 }
 

@@ -25,6 +25,12 @@ import (
 
 const handshakeTimeout = 60 * time.Second
 
+// Cold resume reads native transcripts before replaying them; a large history
+// can exceed the initialization handshake even while making progress.
+// ponytail: fixed ceiling matches the resume HTTP budget; add progress-based
+// deadlines if healthy histories outgrow it. Caller cancellation still wins.
+const historyLoadTimeout = 10 * time.Minute
+
 // Launch describes one ACP agent process. Command may be either AO's packaged
 // protocol bridge or the exact user-installed provider executable resolved by
 // the existing agent plugin.
@@ -732,7 +738,7 @@ func (d *Driver) resumeSession(
 		return nil, fmt.Errorf("%w: %w", ports.ErrChatResumeFailed, err)
 	}
 
-	resumeCtx, cancel := context.WithTimeout(ctx, handshakeTimeout)
+	resumeCtx, cancel := context.WithTimeout(ctx, historyLoadTimeout)
 	defer cancel()
 	meta := map[string]any(nil)
 	if d.cfg.SessionMeta != nil {
