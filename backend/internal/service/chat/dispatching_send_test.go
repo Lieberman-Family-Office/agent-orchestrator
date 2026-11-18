@@ -200,6 +200,51 @@ func TestDispatchingMarkerSurvivesASuccessfulSendAndIgnoresDuplicates(t *testing
 	}
 }
 
+type cancelledDispatchConversation struct {
+	*fakeConversation
+	cancel  context.CancelFunc
+	atStart bool
+}
+
+func (c *cancelledDispatchConversation) SendTurn(ctx context.Context, msg ports.ChatUserMessage) (ports.ChatTurnRef, error) {
+	if c.atStart {
+		return c.fakeConversation.SendTurn(ctx, msg)
+	}
+	c.cancel()
+	return ports.ChatTurnRef{}, ctx.Err()
+}
+
+func (c *cancelledDispatchConversation) StartDeferredTurn(string) error {
+	c.cancel()
+	return context.Canceled
+}
+
+func (*cancelledDispatchConversation) DiscardDeferredTurn(string) {}
+
+func TestCancelledDispatchSettlesDurableTurn(t *testing.T) {
+	for _, atStart := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deferred_start=%t", atStart), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			provider := &cancelledDispatchConversation{newFakeConversation(), cancel, atStart}
+			h := newHarnessWithConversation(t, provider)
+			_, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+				Text: "retained request", ClientMessageID: "cancelled-send", Origin: domain.MessageOriginHuman,
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("Send error = %v, want cancellation", err)
+			}
+			if got, want := h.storedTurnStates(t), []domain.TurnState{domain.TurnStateFailed}; !sameStates(got, want) {
+				t.Fatalf("stored turn states = %v, want %v", got, want)
+			}
+			rows, err := h.st.LoadConversationSnapshot(context.Background(), h.ctrl.ConversationID())
+			if err != nil || len(rows.Messages) != 1 || rows.Messages[0].Text != "retained request" {
+				t.Fatalf("accepted message was lost: messages=%v error=%v", rows.Messages, err)
+			}
+		})
+	}
+}
+
 func TestDispatchingMarkerIsClearedWhenDispatchFails(t *testing.T) {
 	h := newHarness(t)
 	h.conv.mu.Lock()

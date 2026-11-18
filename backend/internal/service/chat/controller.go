@@ -2263,7 +2263,7 @@ func (c *Controller) dispatch(
 		// undispatched turn the database returned first.
 		completedAt := c.now()
 		if settleErr := c.store.SettleTurnByID(
-			ctx, turnID, domain.TurnStateFailed, err.Error(), completedAt); settleErr != nil {
+			context.WithoutCancel(ctx), turnID, domain.TurnStateFailed, err.Error(), completedAt); settleErr != nil {
 			c.log.Error("failed to settle turn after send error", "error", settleErr)
 		}
 		return domain.ConversationTurn{
@@ -2311,7 +2311,7 @@ func (c *Controller) dispatch(
 			c.pendingTurnID = ""
 			c.mu.Unlock()
 			if settleErr := c.store.SettleTurnByID(
-				ctx, turnID, domain.TurnStateFailed, err.Error(), c.now()); settleErr != nil {
+				context.WithoutCancel(ctx), turnID, domain.TurnStateFailed, err.Error(), c.now()); settleErr != nil {
 				c.log.Error("failed to settle turn after deferred start error", "error", settleErr)
 			}
 			return domain.ConversationTurn{}, fmt.Errorf("start turn: %w", err)
