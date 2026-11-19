@@ -334,7 +334,7 @@ describe("ChatWorkspace subagents", () => {
 			if (rollbackable) {
 				await userEvent.click(screen.getByRole("button", { name: "Roll back to here" }));
 				expect(onRollback).not.toHaveBeenCalled();
-				await userEvent.click(screen.getByRole("button", { name: "Roll back", exact: true }));
+				await userEvent.click(screen.getByRole("button", { name: "Roll back" }));
 				expect(onRollback).toHaveBeenCalledWith(turnId, undefined);
 			}
 		},

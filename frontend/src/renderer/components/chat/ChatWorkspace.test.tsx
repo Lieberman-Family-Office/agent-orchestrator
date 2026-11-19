@@ -5147,7 +5147,7 @@ describe("automation visibility in chat", () => {
 		expect(localStorage.getItem("ao.chat.hideAutomationMessages")).toBe("true");
 	});
 
-	it("restores an automation-only turn's task and unknown outcome when the controller stops", () => {
+	it("restores an automation-only turn's task and unknown outcome when the controller stops", async () => {
 		useUiStore.setState({ hideAutomationMessages: true });
 		const at = "2026-10-07T12:00:00Z";
 		const snapshot: ConversationSnapshot = {
@@ -5171,7 +5171,7 @@ describe("automation visibility in chat", () => {
 		expect(screen.queryByText("Unrelated routine automation")).not.toBeInTheDocument();
 		expect(screen.getByText("1 automation message hidden")).toBeInTheDocument();
 		expect(screen.getByRole("button", { name: "Hide automation messages" })).toHaveAttribute("aria-pressed", "true");
-		expect(screen.queryByTestId("live-working-label")).not.toBeInTheDocument();
+		await waitFor(() => expect(screen.queryByTestId("live-working-label")).not.toBeInTheDocument());
 		expect(screen.queryByRole("button", { name: "Roll back to here" })).not.toBeInTheDocument();
 	});
 

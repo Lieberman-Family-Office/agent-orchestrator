@@ -27,7 +27,7 @@ func TestDefaultClientUsesPublicTransport(t *testing.T) {
 		t.Fatalf("transport = %T, want a dedicated *http.Transport", client.Transport)
 	}
 	t.Cleanup(transport.CloseIdleConnections)
-	if transport.Proxy != nil || transport.DialContext == nil || transport.DialTLSContext != nil || transport.DialTLS != nil {
+	if transport.Proxy != nil || transport.DialContext == nil || transport.DialTLSContext != nil || transport.DialTLS != nil { //nolint:staticcheck // Verify the deprecated TLS hook stays disabled; it bypasses destination validation.
 		t.Fatal("transport permits a proxy or a dial path outside destination validation")
 	}
 	if transport.TLSClientConfig != nil {
