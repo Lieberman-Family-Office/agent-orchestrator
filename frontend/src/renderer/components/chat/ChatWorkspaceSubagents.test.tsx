@@ -121,6 +121,21 @@ function openTeam() {
 }
 
 describe("ChatWorkspace subagents", () => {
+	it("keeps a child live when loose output splits its launch from the live segment", () => {
+		const current = snapshot("running");
+		current.items = [
+			text("prompt", 1, "user", "Audit the storefront with a subagent"),
+			launch("pages", 2, "Audit: info pages"),
+			inTurn(text("background", 3, "assistant", "Earlier background reply"), undefined),
+			text("progress", 4, "assistant", "The audit is still running."),
+		];
+		current.latestSequence = 4;
+		render(<ChatWorkspace snapshot={current} />);
+		openTeam();
+		expect(within(screen.getByRole("button", { name: /Audit: info pages/ })).getByLabelText("Working")).toBeInTheDocument();
+		expect(screen.queryByText("No report")).not.toBeInTheDocument();
+	});
+
 	it("draws the launches as one team and keeps the children's steps out of the parent's turn", () => {
 		render(<ChatWorkspace snapshot={snapshot("running")} />);
 

@@ -8,10 +8,120 @@ import (
 	"testing"
 	"time"
 
+	acpsdk "github.com/coder/acp-go-sdk"
+
 	"github.com/aoagents/agent-orchestrator/backend/internal/adapters/chatdriver/persistenthost"
 	"github.com/aoagents/agent-orchestrator/backend/internal/domain"
 	"github.com/aoagents/agent-orchestrator/backend/internal/ports"
 )
+
+func TestClaudeSDKIdleSettlesOnlyTurnlessOutput(t *testing.T) {
+	for _, active := range []bool{false, true} {
+		t.Run(fmt.Sprint(active), func(t *testing.T) {
+			conv, _ := replayBoundaryConversation(t)
+			conv.mu.Lock()
+			if !active {
+				conv.activeTurn = ""
+			}
+			conv.mu.Unlock()
+			if err := conv.processUpdate(acpsdk.SessionNotification{
+				SessionId: "review-session", Update: acpsdk.UpdateAgentMessageText("background reply"),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			delta := nextEvent(t, conv.Events())
+			if delta.Kind != ports.ChatEventMessageDelta {
+				t.Fatalf("expected message delta, got %+v", delta)
+			}
+			idle := []byte(`{"sessionId":"review-session","message":{"type":"system","subtype":"session_state_changed","state":"idle"}}`)
+			if err := conv.handleClaudeSDKMessage(idle); err != nil {
+				t.Fatal(err)
+			}
+			event := nextEvent(t, conv.Events())
+			if !active {
+				if event.Kind != ports.ChatEventMessageCompleted || event.ProviderTurnID != "" ||
+					event.ProviderItemID != delta.ProviderItemID || event.Text != "" {
+					t.Fatalf("turnless reply did not settle: %+v", event)
+				}
+				event = nextEvent(t, conv.Events())
+			}
+			if event.Kind != ports.ChatEventProviderState {
+				t.Fatalf("idle must not settle a prompted turn: %+v", event)
+			}
+			if err := conv.handleClaudeSDKMessage(idle); err != nil {
+				t.Fatal(err)
+			}
+			if event = nextEvent(t, conv.Events()); event.Kind != ports.ChatEventProviderState {
+				t.Fatalf("repeated idle finalized old output again: %+v", event)
+			}
+		})
+	}
+}
+
+func TestBackgroundReplySurvivesNextPromptAndUsesDistinctFallbackIDs(t *testing.T) {
+	conv, _ := replayBoundaryConversation(t)
+	conv.mu.Lock()
+	conv.activeTurn = ""
+	conv.mu.Unlock()
+	var previousID string
+	for range 2 {
+		if err := conv.processUpdate(acpsdk.SessionNotification{
+			SessionId: "review-session", Update: acpsdk.UpdateAgentMessageText("background reply"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		delta := nextEvent(t, conv.Events())
+		if delta.Kind != ports.ChatEventMessageDelta || delta.ProviderItemID == previousID {
+			t.Fatalf("background cycles share a message identity: %+v", delta)
+		}
+		previousID = delta.ProviderItemID
+		// A new prompt resets only its own buffers. A trailing SDK idle must
+		// still settle the background reply, never the new prompt's output.
+		conv.mu.Lock()
+		conv.activeTurn = "next-turn"
+		conv.messages = map[string]string{"next-message": "still working"}
+		conv.mu.Unlock()
+		if err := conv.handleClaudeSDKMessage([]byte(`{"sessionId":"review-session","message":{"type":"system","subtype":"session_state_changed","state":"idle"}}`)); err != nil {
+			t.Fatal(err)
+		}
+		settled := nextEvent(t, conv.Events())
+		if settled.Kind != ports.ChatEventMessageCompleted || settled.ProviderTurnID != "" ||
+			settled.ProviderItemID != delta.ProviderItemID || settled.Text != "" {
+			t.Fatalf("next prompt discarded or adopted background output: %+v", settled)
+		}
+		if event := nextEvent(t, conv.Events()); event.Kind != ports.ChatEventProviderState {
+			t.Fatalf("idle settled a message from the next prompt: %+v", event)
+		}
+		conv.mu.Lock()
+		conv.activeTurn = ""
+		conv.mu.Unlock()
+	}
+}
+
+func TestNextPromptFinalizesBackgroundReplyBeforeStarting(t *testing.T) {
+	conv, _ := replayBoundaryConversation(t)
+	conv.mu.Lock()
+	conv.activeTurn = ""
+	conv.prepared = &preparedTurn{id: "next-turn"}
+	conv.mu.Unlock()
+	if err := conv.processUpdate(acpsdk.SessionNotification{
+		SessionId: "review-session", Update: acpsdk.UpdateAgentMessageText("background reply"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	delta := nextEvent(t, conv.Events())
+	if err := conv.StartDeferredTurn("next-turn"); err != nil {
+		t.Fatal(err)
+	}
+	settled := nextEvent(t, conv.Events())
+	if settled.Kind != ports.ChatEventMessageCompleted || settled.ProviderTurnID != "" ||
+		settled.ProviderItemID != delta.ProviderItemID || settled.Text != "" {
+		t.Fatalf("prompt start lost background reply: %+v", settled)
+	}
+	if event := nextEvent(t, conv.Events()); event.Kind != ports.ChatEventTurnStarted || event.ProviderTurnID != "next-turn" {
+		t.Fatalf("prompt start was reordered: %+v", event)
+	}
+}
 
 func TestClaudeSDKStateThroughOrderedTransport(t *testing.T) {
 	conv, host := replayBoundaryConversation(t)

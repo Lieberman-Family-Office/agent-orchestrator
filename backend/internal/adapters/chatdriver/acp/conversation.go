@@ -114,6 +114,9 @@ type conversation struct {
 	handshake       acpsdk.InitializeResponse
 	unadoptedForkID string
 
+	// updateMu orders streamed deltas with background completion at prompt start.
+	// Dispatch must not hold it: publishing events can wait for the controller.
+	updateMu           sync.Mutex
 	mu                 sync.Mutex
 	sessionID          string
 	reportedSessionID  string
@@ -141,6 +144,10 @@ type conversation struct {
 	skills             []ports.ChatSkill
 	skillsKnown        bool
 	closed             bool
+	// Background output has no ACP prompt. Keep its item IDs until SDK idle or
+	// the next prompt; completion preserves the text already stored by deltas.
+	backgroundMessages  map[string]struct{}
+	backgroundMessageID string
 	// sessionLost records that the agent stopped holding this conversation's
 	// session and the provider was stopped for it. See providerSessionLost.
 	sessionLost bool
@@ -890,8 +897,11 @@ func (c *conversation) StartDeferredTurn(providerTurnID string) error {
 }
 
 func (c *conversation) runTurn(ctx context.Context, sessionID string, turn preparedTurn) {
+	c.updateMu.Lock()
+	c.settleBackgroundMessages()
 	c.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: turn.id})
 	c.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: ports.ChatControllerBusy})
+	c.updateMu.Unlock()
 	// ACP message ids are opaque idempotency/correlation keys. Preserve AO's
 	// durable client id when possible so an agent that echoes it from session/load
 	// can be reconciled without provider-specific knowledge. Some agents (notably
@@ -1191,6 +1201,9 @@ func (c *conversation) Compact(ctx context.Context) (ports.ChatCompactionResult,
 }
 
 func (c *conversation) runCompactionTurn(ctx context.Context, sessionID, turnID string) {
+	c.updateMu.Lock()
+	c.settleBackgroundMessages()
+	c.updateMu.Unlock()
 	messageID := uuid.NewString()
 	prompt := []acpsdk.ContentBlock{
 		acpsdk.TextBlock("/compact"),
@@ -1597,6 +1610,20 @@ func (c *conversation) emit(event ports.ChatEvent) {
 	case c.events <- event:
 	case <-time.After(5 * time.Second):
 		c.log.Error("dropped ACP lifecycle event: consumer stalled", "kind", event.Kind)
+	}
+}
+
+// settleBackgroundMessages requires updateMu. A provider idle may trail the
+// next prompt's start, so it must never finalize that prompt's message buffers.
+func (c *conversation) settleBackgroundMessages() {
+	c.mu.Lock()
+	messages := c.backgroundMessages
+	c.backgroundMessages = nil
+	c.backgroundMessageID = ""
+	c.mu.Unlock()
+	for _, id := range sortedKeys(messages) {
+		// Empty text preserves all durable deltas, including any earlier prefix.
+		c.emit(ports.ChatEvent{Kind: ports.ChatEventMessageCompleted, ProviderItemID: id})
 	}
 }
 

@@ -30,6 +30,51 @@ function withoutPendingApproval(snapshot: ConversationSnapshot): ConversationSna
 	};
 }
 
+describe("background replies between prompted turns", () => {
+	it("keeps an earlier pending approval attached to the live turn after loose output", () => {
+		const turn = { ...chatFixture.turns[1]!, state: "running" as const, plan: undefined };
+		const approval = chatFixture.items.find((item) => item.kind === "activity" && item.activityKind === "approval")!;
+		const reply = chatFixture.items.find((item) => item.kind === "message" && item.role === "assistant")!;
+		const snapshot: ConversationSnapshot = {
+			...chatFixture,
+			turns: [turn],
+			items: [
+				{ ...approval, turnId: turn.id, sequence: 1 },
+				{ ...reply, id: "background", turnId: undefined, sequence: 2 },
+				{ ...reply, id: "reply", turnId: turn.id, sequence: 3 },
+			],
+			latestSequence: 3,
+		};
+		render(<ChatWorkspace snapshot={snapshot} />);
+		expect(screen.getByText("The agent is waiting for your decision.")).toBeInTheDocument();
+	});
+
+	it.each(["running", "completed"] as const)("keeps older turnless text before the %s turn's later reply and plan", (state) => {
+		const turn = { ...chatFixture.turns[1]!, state, anchorSequence: 1 };
+		const message = (id: string, sequence: number, text: string, turnId?: string) => ({
+			kind: "message" as const, id, sequence, text, turnId,
+			role: "assistant" as const, origin: "provider" as const, revision: 0,
+			streaming: false, createdAt: turn.requestedAt,
+		});
+		const snapshot: ConversationSnapshot = {
+			...chatFixture,
+			turns: [turn],
+			items: [
+				{ ...message("prompt", 1, "Queued prompt", turn.id), role: "user", origin: "human" },
+				message("background", 2, "Earlier background reply"),
+				message("reply", 3, "Later prompted reply", turn.id),
+			],
+			latestSequence: 3,
+		};
+		const { container } = render(<ChatWorkspace snapshot={snapshot} />);
+		expect(Array.from(container.querySelectorAll("[data-find-message-id]"))
+			.map((node) => node.getAttribute("data-find-message-id"))).toEqual(["prompt", "background", "reply"]);
+		expect(screen.getAllByRole("region", { name: "Agent plan" })).toHaveLength(1);
+		expect(screen.getByText("Earlier background reply").compareDocumentPosition(screen.getByRole("region", { name: "Agent plan" }))
+			& Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+	});
+});
+
 describe("reasoning", () => {
 	it("keeps provider reasoning out of the conversation chrome", () => {
 		render(<ChatWorkspace snapshot={chatFixture} />);
