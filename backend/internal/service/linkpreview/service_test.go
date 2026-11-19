@@ -1,17 +1,235 @@
 package linkpreview
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestDefaultClientUsesPublicTransport(t *testing.T) {
+	// Proxy-side DNS would bypass destination validation, even on a public proxy.
+	t.Setenv("HTTP_PROXY", "http://proxy.test:8080")
+	t.Setenv("HTTPS_PROXY", "http://proxy.test:8080")
+	client := New(nil).client
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport = %T, want a dedicated *http.Transport", client.Transport)
+	}
+	t.Cleanup(transport.CloseIdleConnections)
+	if transport.Proxy != nil || transport.DialContext == nil || transport.DialTLSContext != nil || transport.DialTLS != nil {
+		t.Fatal("transport permits a proxy or a dial path outside destination validation")
+	}
+	if transport.TLSClientConfig != nil {
+		t.Fatal("transport must retain standard TLS hostname and certificate verification")
+	}
+	// Verify the default wiring, with cancellation preventing real I/O even if
+	// this regresses to the standard, unrestricted dialer.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := transport.DialContext(ctx, "tcp", "127.0.0.1:80"); err == nil || !strings.Contains(err.Error(), "destination is not public") {
+		t.Fatalf("default dialer err = %v, want destination rejection", err)
+	}
+	if !transport.ForceAttemptHTTP2 || transport.MaxIdleConns != 100 || transport.IdleConnTimeout != 90*time.Second || transport.TLSHandshakeTimeout != 10*time.Second || transport.ExpectContinueTimeout != time.Second {
+		t.Fatal("standard transport limits or HTTP/2 support were lost")
+	}
+	if client.Timeout != fetchTimeout || client.CheckRedirect == nil {
+		t.Fatal("fetch timeout or redirect limit was lost")
+	}
+	if err := client.CheckRedirect(nil, make([]*http.Request, maxRedirects)); err == nil {
+		t.Fatal("redirect limit was not enforced")
+	}
+}
+
+func TestPublicDialerRejectsNonPublicAddresses(t *testing.T) {
+	for _, address := range []string{
+		"0.0.0.0", "0.1.2.3", "10.1.2.3", "100.64.0.1", "127.0.0.1",
+		"169.254.169.254", "172.16.0.1", "192.168.1.1", "192.0.0.1",
+		"192.0.2.1", "192.88.99.1", "198.18.0.1", "198.51.100.1", "203.0.113.1",
+		"224.0.0.1", "240.0.0.1", "255.255.255.255", "::", "::1",
+		"::ffff:127.0.0.1", "::ffff:10.0.0.1", "::127.0.0.1", "fc00::1",
+		"fe80::1", "fe80::1%en0", "fec0::1", "ff02::1", "100::1",
+		"64:ff9b::7f00:1", "64:ff9b:1::a00:1", "2001::1", "2001:2::1",
+		"2001:10::1", "2001:20::1", "2001:db8::1", "2002:7f00:1::1",
+		"3ffe::1", "3fff::1", "4000::1", "2606:4700:4700::1111%en0",
+	} {
+		t.Run(address, func(t *testing.T) {
+			ip := netip.MustParseAddr(address)
+			d := publicDialer{
+				lookup: func(context.Context, string, string) ([]netip.Addr, error) {
+					return []netip.Addr{ip}, nil
+				},
+				dial: func(context.Context, string, string) (net.Conn, error) {
+					t.Error("dial reached a non-public destination")
+					return nil, errors.New("unexpected dial")
+				},
+			}
+			// Exercise both DNS answers and literal URLs at the connection boundary.
+			for _, host := range []string{"preview.test", address} {
+				if _, err := d.dialContext(context.Background(), "tcp", net.JoinHostPort(host, "443")); err == nil {
+					t.Errorf("destination %q was accepted", host)
+				}
+			}
+		})
+	}
+}
+
+func TestPublicDialerValidatesEveryDNSAnswerBeforeDialing(t *testing.T) {
+	public := netip.MustParseAddr("8.8.8.8")
+	private := netip.MustParseAddr("10.0.0.1")
+	for name, answers := range map[string][]netip.Addr{
+		"public first":   {public, private},
+		"private first":  {private, public},
+		"mixed families": {public, netip.MustParseAddr("::1")},
+		"invalid answer": {public, {}},
+		"no answers":     nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			d := publicDialer{
+				lookup: func(_ context.Context, network, host string) ([]netip.Addr, error) {
+					if network != "ip" || host != "preview.test" {
+						t.Errorf("lookup(%q, %q), want both address families", network, host)
+					}
+					return answers, nil
+				},
+				dial: func(context.Context, string, string) (net.Conn, error) {
+					t.Error("dial ran before all answers passed validation")
+					return nil, errors.New("unexpected dial")
+				},
+			}
+			if _, err := d.dialContext(context.Background(), "tcp", "preview.test:80"); err == nil {
+				t.Fatal("unsafe DNS answers were accepted")
+			}
+		})
+	}
+}
+
+func TestPublicDialerPinsAddressesAndTriesPublicFallbacks(t *testing.T) {
+	lookups := 0
+	var dialed []string
+	failed := errors.New("fake connection failure")
+	d := publicDialer{
+		lookup: func(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+			if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > fetchTimeout {
+				t.Error("DNS lookup has no bounded deadline")
+			}
+			lookups++
+			return []netip.Addr{
+				netip.MustParseAddr("8.8.8.8"),
+				netip.MustParseAddr("2606:4700:4700::1111"),
+				netip.MustParseAddr("::ffff:1.1.1.1"),
+			}, nil
+		},
+		dial: func(_ context.Context, network, address string) (net.Conn, error) {
+			if network != "tcp" {
+				t.Errorf("network = %q, want tcp", network)
+			}
+			dialed = append(dialed, address)
+			return nil, failed
+		},
+	}
+	_, err := d.dialContext(context.Background(), "tcp", "preview.test:8443")
+	if !errors.Is(err, failed) || lookups != 1 {
+		t.Fatalf("err = %v, lookups = %d; want one lookup and the dial error", err, lookups)
+	}
+	if got := strings.Join(dialed, ","); got != "8.8.8.8:8443,[2606:4700:4700::1111]:8443,1.1.1.1:8443" {
+		t.Fatalf("dialed %q, want only validated numeric addresses with the original port", got)
+	}
+}
+
+// previewResponseConn exercises the real HTTP transport without opening a socket.
+func previewResponseConn(t *testing.T, response string) net.Conn {
+	t.Helper()
+	client, server := net.Pipe()
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+		<-done
+	})
+	go func() {
+		defer close(done)
+		defer func() { _ = server.Close() }()
+		req, err := http.ReadRequest(bufio.NewReader(server))
+		if err != nil {
+			t.Errorf("read fake upstream request: %v", err)
+			return
+		}
+		_ = req.Body.Close()
+		if _, err := io.WriteString(server, response); err != nil {
+			t.Errorf("write fake upstream response: %v", err)
+		}
+	}()
+	return client
+}
+
+func TestPreviewValidatesRedirectConnections(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		target      string
+		answers     []netip.Addr
+		wantSuccess bool
+	}{
+		{"public", "http://next.test/page", []netip.Addr{netip.MustParseAddr("1.1.1.1")}, true},
+		{"public IPv6", "http://[2606:4700:4700::1111]/page", nil, true},
+		{"loopback", "http://127.0.0.1/page", nil, false},
+		{"HTTPS loopback", "https://[::1]/page", nil, false},
+		{"private DNS", "http://next.test/page", []netip.Addr{netip.MustParseAddr("10.0.0.1")}, false},
+		{"mixed DNS", "http://next.test/page", []netip.Addr{netip.MustParseAddr("1.1.1.1"), netip.MustParseAddr("::1")}, false},
+		{"same host rebinding", "http://start.test/page", []netip.Addr{netip.MustParseAddr("127.0.0.1")}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := New(nil)
+			transport, ok := svc.client.Transport.(*http.Transport)
+			if !ok {
+				t.Fatalf("transport = %T", svc.client.Transport)
+			}
+			t.Cleanup(transport.CloseIdleConnections)
+			var lookups, dials atomic.Int32
+			d := publicDialer{
+				lookup: func(context.Context, string, string) ([]netip.Addr, error) {
+					if lookups.Add(1) == 1 {
+						return []netip.Addr{netip.MustParseAddr("8.8.8.8")}, nil
+					}
+					return tc.answers, nil
+				},
+				dial: func(_ context.Context, _, address string) (net.Conn, error) {
+					if dials.Add(1) == 1 {
+						if address != "8.8.8.8:80" {
+							t.Errorf("initial dial = %q", address)
+						}
+						return previewResponseConn(t, "HTTP/1.1 302 Found\r\nLocation: "+tc.target+"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"), nil
+					}
+					if !tc.wantSuccess || (address != "1.1.1.1:80" && address != "[2606:4700:4700::1111]:80") {
+						t.Errorf("unsafe or unresolved redirect dial = %q", address)
+						return nil, errors.New("unexpected redirect dial")
+					}
+					body := "<html><head><title>Public redirect</title></head></html>"
+					return previewResponseConn(t, fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)), nil
+				},
+			}
+			transport.DialContext = d.dialContext
+			p, err := svc.Preview(context.Background(), "http://start.test/start")
+			if tc.wantSuccess {
+				if err != nil || p.URL != tc.target || p.Title != "Public redirect" || dials.Load() != 2 {
+					t.Fatalf("preview = %+v, err = %v, dials = %d", p, err, dials.Load())
+				}
+			} else if !errors.Is(err, ErrFetchFailed) || dials.Load() != 1 {
+				t.Fatalf("err = %v, dials = %d; want fetch failure before redirect dial", err, dials.Load())
+			}
+		})
+	}
+}
 
 func TestParseHeadSkipsScriptBodies(t *testing.T) {
 	doc := []byte(`<html><head>

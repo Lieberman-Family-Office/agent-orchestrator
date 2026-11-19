@@ -291,6 +291,97 @@ func TestAwakeReconnectCandidatesRequireObservedTransportLoss(t *testing.T) {
 	}
 }
 
+// Wait for service retirement, not just projection: candidate registration and
+// controller removal share the service lock.
+func awaitControllerRetired(t *testing.T, svc *chatsvc.Service) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if _, err := svc.Controller(testSession); errors.Is(err, chatsvc.ErrNoController) {
+			return
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal("service did not retire the stopped controller")
+		case <-ticker.C:
+		}
+	}
+}
+
+func TestRetainedProviderDeliberateDetachIsNotAutomaticallyRecovered(t *testing.T) {
+	for _, stoppedEvent := range []bool{false, true} {
+		for _, reason := range []string{"close", "terminate", "drain", "interrupt", "hibernate"} {
+			name := reason + "/omitted-event"
+			if stoppedEvent {
+				name = reason + "/stopped-event"
+			}
+			t.Run(name, func(t *testing.T) {
+				provider := &recoveryDetachedConversation{terminatingConversation: &terminatingConversation{fakeConversation: newFakeConversation()}}
+				var h *harness
+				if reason == "hibernate" {
+					h, _ = hibernationHarnessWith(t, domain.TurnStateCompleted, func(opts *chatsvc.Options) {
+						opts.HibernationEnabled = func() bool { return true }
+						original := opts.Drivers.(fakeRegistry).driver.(fakeDriver).conv.(*hibernationConversation)
+						provider.fakeConversation = original.fakeConversation
+						opts.Drivers = fakeRegistry{driver: fakeDriver{conv: &retainedHibernatingConversation{provider}}}
+					})
+				} else {
+					h = newHarnessWithConversation(t, provider)
+				}
+				provider.retained.Store(true)
+				if stoppedEvent {
+					provider.onClose = sync.OnceFunc(func() {
+						provider.emit(ports.ChatEvent{Kind: ports.ChatEventControllerState, ControllerState: ports.ChatControllerStopped, ProviderRetained: true})
+					})
+				}
+				ctx := t.Context()
+				switch reason {
+				case "close":
+					if err := h.ctrl.Close(ctx); err != nil {
+						t.Fatal(err)
+					}
+				case "terminate":
+					if err := h.ctrl.Terminate(ctx); err != nil {
+						t.Fatal(err)
+					}
+				case "drain", "interrupt":
+					policy := domain.SessionInterfaceTransitionDrain
+					if reason == "interrupt" {
+						policy = domain.SessionInterfaceTransitionInterrupt
+					}
+					if err := h.ctrl.ArmHandoff(ctx, policy); err != nil {
+						t.Fatal(err)
+					}
+					if err := provider.Close(); err != nil {
+						t.Fatal(err)
+					}
+				case "hibernate":
+					if slept, err := h.svc.HibernateChat(ctx, testSession); err != nil || !slept {
+						t.Fatalf("hibernate: slept=%v err=%v", slept, err)
+					}
+				}
+				awaitControllerRetired(t, h.svc)
+				if got := h.svc.InterruptedAwakeAgents(); len(got) != 0 {
+					t.Fatalf("deliberate detach offered for automatic recovery: %+v", got)
+				}
+			})
+		}
+	}
+}
+
+type retainedHibernatingConversation struct{ *recoveryDetachedConversation }
+
+func (c *retainedHibernatingConversation) CanHibernate(context.Context) (bool, error) {
+	return true, nil
+}
+
+func (c *retainedHibernatingConversation) Hibernate() error { return c.Close() }
+
 func TestAwakeReconnectProofIsInvalidatedByExplicitStop(t *testing.T) {
 	for _, shutdownFails := range []bool{false, true} {
 		t.Run(map[bool]string{false: "shutdown succeeds", true: "shutdown fails"}[shutdownFails], func(t *testing.T) {

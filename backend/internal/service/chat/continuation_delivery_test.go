@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -171,6 +172,90 @@ func TestContinuationDeliveryRetryUsesFrozenContextAndMarker(t *testing.T) {
 	if len(snapshot.Turns) != 3 {
 		t.Fatalf("retry changed historical turns: %#v", snapshot.Turns)
 	}
+	settleContinuationTestTurn(t, h, retry, "STOPPED_RETRY_PARTIAL", domain.TurnStateInterrupted)
+	if _, err := h.svc.Send(ctx, testSession, continuationMessage("continue-after-retry")); err != nil {
+		t.Fatal(err)
+	}
+	text := continuationProviderContext(h.conv.sentMessages()[3])
+	if !strings.Contains(text, "TASK_DONE") || !strings.Contains(text, "STOPPED_RETRY_PARTIAL") || strings.Count(text, "Interrupted task context (JSON):") != 1 {
+		t.Fatalf("text-only retry lost or nested its context: %s", text)
+	}
+}
+
+func TestContinuationDeliveryWithAttachmentsAcrossRetries(t *testing.T) {
+	for _, retryCount := range []int{0, 2} {
+		t.Run(fmt.Sprintf("retries-%d", retryCount), func(t *testing.T) {
+			h := newHarness(t)
+			caps := h.conv.Capabilities()
+			caps[ports.ChatCapabilityImages] = true
+			h.conv.setCapabilities(caps)
+			ctx := context.Background()
+			seedContinuationTask(t, h)
+			h.advance(time.Second)
+			request := continuationMessage("continue-attachment")
+			request.Content = []ports.ChatContent{{Type: "image", MIMEType: "image/png", Data: strings.Repeat("YWFh", 100000)}}
+			turn, err := h.svc.Send(ctx, testSession, request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := range retryCount {
+				settleContinuationTestTurn(t, h, turn, fmt.Sprintf("FAILED_PARTIAL_%d", i), domain.TurnStateFailed)
+				h.advance(time.Second)
+				other, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{Text: "UNRELATED_TASK"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				settleContinuationTestTurn(t, h, other, "UNRELATED_RESPONSE", domain.TurnStateCompleted)
+				h.advance(time.Second)
+				source := turn.ID
+				turn, err = h.svc.RetryTurn(ctx, testSession, source)
+				if err != nil {
+					t.Fatal(err)
+				}
+				durable, err := h.st.TurnByID(ctx, turn.ID)
+				if err != nil || durable.RetryOfTurnID != source {
+					t.Fatalf("retry source was not persisted: %+v, %v", durable, err)
+				}
+				snapshot, err := h.st.LoadConversationSnapshot(ctx, h.ctrl.ConversationID())
+				if err != nil {
+					t.Fatal(err)
+				}
+				var retryMessage domain.ConversationMessage
+				for _, message := range snapshot.Messages {
+					if message.TurnID == turn.ID && message.Role == domain.MessageRoleUser {
+						retryMessage = message
+					}
+				}
+				var content []ports.ChatContent
+				if err := json.Unmarshal([]byte(retryMessage.DeliveryContentJSON), &content); err != nil {
+					t.Fatal(err)
+				}
+				if !retryMessage.Continuation || !reflect.DeepEqual(content, request.Content) {
+					t.Fatal("retry did not retain attachments while removing rendered internal context")
+				}
+			}
+			settleContinuationTestTurn(t, h, turn, "LATEST_PARTIAL", domain.TurnStateInterrupted)
+			h.advance(time.Second)
+			if _, err := h.svc.Send(ctx, testSession, continuationMessage("continue-again")); err != nil {
+				t.Fatal(err)
+			}
+			sent := h.conv.sentMessages()
+			text := continuationProviderContext(sent[len(sent)-1])
+			for _, want := range []string{"TASK_DONE", "Keep the", "LATEST_PARTIAL"} {
+				if !strings.Contains(text, want) {
+					t.Fatalf("continued context omitted %q: %s", want, text)
+				}
+			}
+			for i := range retryCount {
+				if !strings.Contains(text, fmt.Sprintf("FAILED_PARTIAL_%d", i)) {
+					t.Fatalf("continued context omitted a retry source response: %s", text)
+				}
+			}
+			if strings.Contains(text, "UNRELATED") || strings.Count(text, "Interrupted task context (JSON):") != 1 {
+				t.Fatalf("retry adopted another task or nested context: %s", text)
+			}
+		})
+	}
 }
 
 func TestContinuationDeliveryQueuedPromptRetainsFrozenContext(t *testing.T) {
@@ -295,6 +380,138 @@ func TestContinuationDeliveryHibernatedQueuePreservesContextAndMarker(t *testing
 	queued, err := h.st.NextQueuedTurn(ctx, h.ctrl.ConversationID())
 	if err != nil || queued.Text != message.Text {
 		t.Fatalf("durable continuation queue lost frozen context: %#v, %v", queued, err)
+	}
+}
+
+func TestContinuationDeliveryAfterPriorityOvertakesQueuedTask(t *testing.T) {
+	provider := newSteerRecorder()
+	h := newHarnessWithConversation(t, provider)
+	h.conv = provider.fakeConversation
+	ctx := context.Background()
+	send := func(text string, priority bool) domain.ConversationTurn {
+		t.Helper()
+		turn, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+			Text: text, ClientMessageID: text, Origin: domain.MessageOriginHuman, InterruptAndSend: priority,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return turn
+	}
+	a := send("UNRELATED_A", false)
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: a.ProviderTurnID})
+	h.advance(time.Second)
+	b := send("ORIGINAL_B", false)
+	h.advance(time.Second)
+	c := send("UNRELATED_C", true)
+	h.advance(time.Second)
+	settleContinuationTestTurn(t, h, a, "UNRELATED_A_RESPONSE", domain.TurnStateInterrupted)
+	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		turn, _ := turnByID(s, c.ID)
+		return turn.State == domain.TurnStateRunning && turn.ProviderTurnID != ""
+	})
+	c, _ = turnByID(snapshot, c.ID)
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: c.ProviderTurnID})
+	h.advance(time.Second)
+	settleContinuationTestTurn(t, h, c, "UNRELATED_C_RESPONSE", domain.TurnStateCompleted)
+	snapshot = h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		turn, _ := turnByID(s, b.ID)
+		return turn.State == domain.TurnStateRunning && turn.ProviderTurnID != ""
+	})
+	b, _ = turnByID(snapshot, b.ID)
+	if !reflect.DeepEqual(provider.sentTexts(), []string{"UNRELATED_A", "UNRELATED_C", "ORIGINAL_B"}) {
+		t.Fatalf("fixture did not dispatch A,C,B: %v", provider.sentTexts())
+	}
+	if len(snapshot.Turns) != 3 || snapshot.Turns[0].ID != a.ID || snapshot.Turns[1].ID != b.ID || snapshot.Turns[2].ID != c.ID {
+		t.Fatalf("fixture lost enqueue-ordered snapshot: %+v", snapshot.Turns)
+	}
+	provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnStarted, ProviderTurnID: b.ProviderTurnID})
+	if _, err := h.svc.Steer(ctx, testSession, ports.ChatUserMessage{
+		Text: "B_GUIDANCE", ClientMessageID: "steer-b", Origin: domain.MessageOriginHuman,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.advance(time.Second)
+	swept := send("UNRELATED_SWEPT", false)
+	if err := h.svc.Interrupt(ctx, testSession); err != nil {
+		t.Fatal(err)
+	}
+	settleContinuationTestTurn(t, h, b, "PARTIAL_B", domain.TurnStateInterrupted)
+	snapshot = h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		turn, _ := turnByID(s, swept.ID)
+		return turn.State == domain.TurnStateInterrupted
+	})
+	if got := chatsvc.ContinuableTurnID(snapshot.Turns); got != b.ID {
+		t.Fatalf("continuable turn = %q, want B %q", got, b.ID)
+	}
+	h.advance(time.Second)
+	continued, err := h.svc.Send(ctx, testSession, continuationMessage("continue-b"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := continuationProviderContext(provider.sentMessages()[3])
+	for _, want := range []string{"ORIGINAL_B", "B_GUIDANCE", "PARTIAL_B"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("Continue omitted %q: %s", want, text)
+		}
+	}
+	if strings.Contains(text, "UNRELATED") {
+		t.Fatalf("Continue mixed unrelated tasks: %s", text)
+	}
+	settleContinuationTestTurn(t, h, continued, "B_DONE", domain.TurnStateCompleted)
+	if _, err := h.svc.Send(ctx, testSession, continuationMessage("stale-continue")); !errors.Is(err, chatsvc.ErrContinuationUnavailable) {
+		t.Fatalf("completed continuation revived old stopped work: %v", err)
+	}
+}
+
+func TestContinuationDeliveryRetainsPromotedAndBatchedHumanGuidance(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		name := "promoted"
+		if batch {
+			name = "batched"
+		}
+		t.Run(name, func(t *testing.T) {
+			h, provider := steerHarness(t)
+			h.conv = provider.fakeConversation
+			ctx := context.Background()
+			h.advance(time.Second)
+			source, err := h.svc.Send(ctx, testSession, ports.ChatUserMessage{
+				Text: "QUEUED_HUMAN_CONSTRAINT", ClientMessageID: "queued-guidance", Origin: domain.MessageOriginHuman,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if batch {
+				_, err = h.svc.Steer(ctx, testSession, ports.ChatUserMessage{
+					Text: "NEWEST_HUMAN_CONSTRAINT", ClientMessageID: "batch-steer", Origin: domain.MessageOriginHuman,
+				})
+			} else {
+				_, err = h.svc.PromoteQueuedTurn(ctx, testSession, source.ID)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := h.svc.Interrupt(ctx, testSession); err != nil {
+				t.Fatal(err)
+			}
+			provider.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: "provider-turn-1", TurnState: domain.TurnStateInterrupted})
+			snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+				return len(s.Turns) == 1 && s.Turns[0].State == domain.TurnStateInterrupted
+			})
+			if got := chatsvc.ContinuableTurnID(snapshot.Turns); got != snapshot.Turns[0].ID {
+				t.Fatalf("promoted source hid interrupted target: %q", got)
+			}
+			if _, err := h.svc.Send(ctx, testSession, continuationMessage("continue-guidance")); err != nil {
+				t.Fatal(err)
+			}
+			text := continuationProviderContext(provider.sentMessages()[1])
+			if !strings.Contains(text, `"originalRequest":"do the long thing"`) || !strings.Contains(text, "QUEUED_HUMAN_CONSTRAINT") {
+				t.Fatalf("Continue lost original request or delivered guidance: %s", text)
+			}
+			if batch && !strings.Contains(text, `"humanGuidance":["QUEUED_HUMAN_CONSTRAINT","NEWEST_HUMAN_CONSTRAINT"]`) {
+				t.Fatalf("Continue lost batch guidance order: %s", text)
+			}
+		})
 	}
 }
 

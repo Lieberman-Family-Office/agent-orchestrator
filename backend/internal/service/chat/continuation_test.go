@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -212,6 +213,376 @@ func TestContinuableTurnIDSurvivesProviderScopeChange(t *testing.T) {
 	rows.Turns = append(rows.Turns, domain.ConversationTurn{ID: "swept", State: domain.TurnStateInterrupted})
 	if ContinuableTurnID(rows.Turns) != "" || stoppedContinuationContext(rows) != "" {
 		t.Fatal("a swept queue resurrected completed work")
+	}
+}
+
+func TestContinuationDispatchOrder(t *testing.T) {
+	base := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	at := func(seconds int) *time.Time {
+		value := base.Add(time.Duration(seconds) * time.Second)
+		return &value
+	}
+	for _, tc := range []struct {
+		name        string
+		legacy      bool
+		scopeChange bool
+		continued   bool
+		provider    bool
+	}{
+		{name: "priority overtakes queued task"},
+		{name: "legacy task without start", legacy: true},
+		{name: "provider scope cleared", scopeChange: true},
+		{name: "continuation chain", continued: true},
+		{name: "provider continuation", provider: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := ConversationRows{
+				Turns: []domain.ConversationTurn{
+					{ID: "a", State: domain.TurnStateInterrupted, RequestedAt: *at(0), StartedAt: at(0), ProviderTurnID: "p-a"},
+					{ID: "b", State: domain.TurnStateInterrupted, RequestedAt: *at(1), StartedAt: at(4), ProviderTurnID: "p-b"},
+					{ID: "c", State: domain.TurnStateCompleted, RequestedAt: *at(2), StartedAt: at(3), ProviderTurnID: "p-c"},
+					{ID: "swept", State: domain.TurnStateInterrupted, RequestedAt: *at(5), CompletedAt: at(6)},
+					{ID: "undone", State: domain.TurnStateCompleted, StartedAt: at(7), RolledBackAt: at(8)},
+				},
+				Messages: []domain.ConversationMessage{
+					{ID: "a-user", TurnID: "a", Sequence: 1, Role: domain.MessageRoleUser, Text: "UNRELATED_A"},
+					{ID: "b-user", TurnID: "b", Sequence: 2, Role: domain.MessageRoleUser, Text: "ORIGINAL_B"},
+					{ID: "c-user", TurnID: "c", Sequence: 3, Role: domain.MessageRoleUser, Text: "UNRELATED_C"},
+					{ID: "c-answer", TurnID: "c", Sequence: 4, Role: domain.MessageRoleAssistant, Text: "UNRELATED_C_RESPONSE"},
+					{ID: "b-answer", TurnID: "b", Sequence: 5, Role: domain.MessageRoleAssistant, Text: "PARTIAL_B"},
+					{ID: "swept-user", TurnID: "swept", Sequence: 6, Role: domain.MessageRoleUser, Text: "UNRELATED_SWEPT"},
+				},
+				Activities: []domain.ConversationActivity{
+					{TurnID: "c", Sequence: 7, Kind: domain.ActivityKindSystem, Detail: []byte(`{"event":"steer","origin":"human","text":"UNRELATED_C_GUIDANCE"}`)},
+					{TurnID: "b", Sequence: 8, Kind: domain.ActivityKindSystem, Detail: []byte(`{"event":"steer","origin":"human","text":"B_GUIDANCE"}`)},
+				},
+			}
+			if tc.legacy {
+				// Legacy rows use RequestedAt, not a missing timestamp treated as newest.
+				rows.Turns[1].StartedAt = nil
+				rows.Turns[1].RequestedAt = *at(4)
+			}
+			if tc.scopeChange {
+				for i := range rows.Turns {
+					rows.Turns[i].ProviderTurnID = ""
+				}
+			}
+			wantID := "b"
+			if tc.continued || tc.provider {
+				wantID = "continued"
+				rows.Turns = append(rows.Turns, domain.ConversationTurn{
+					ID: wantID, State: domain.TurnStateInterrupted, RequestedAt: *at(9), StartedAt: at(9),
+				})
+				if tc.continued {
+					rows.Messages = append(rows.Messages, domain.ConversationMessage{
+						ID: "continue-user", TurnID: wantID, Sequence: 9, Role: domain.MessageRoleUser, Text: "Continue", Continuation: true,
+					})
+				}
+				rows.Messages = append(rows.Messages, domain.ConversationMessage{
+					ID: "continue-answer", TurnID: wantID, Sequence: 10, Role: domain.MessageRoleAssistant, Text: "MORE_B",
+				})
+				rows.Activities = append(rows.Activities, domain.ConversationActivity{
+					TurnID: wantID, Sequence: 11, Kind: domain.ActivityKindSystem, Detail: []byte(`{"event":"steer","origin":"human","text":"NEW_B_GUIDANCE"}`),
+				})
+			}
+			if got := ContinuableTurnID(rows.Turns); got != wantID {
+				t.Fatalf("continuable turn = %q, want %q", got, wantID)
+			}
+			reminder := stoppedContinuationContext(rows)
+			for _, want := range []string{"ORIGINAL_B", "PARTIAL_B", "B_GUIDANCE"} {
+				if !strings.Contains(reminder, want) {
+					t.Fatalf("missing %q in context: %s", want, reminder)
+				}
+			}
+			if strings.Contains(reminder, "UNRELATED") {
+				t.Fatalf("dispatch order mixed tasks: %s", reminder)
+			}
+			if (tc.continued || tc.provider) && (!strings.Contains(reminder, "MORE_B") || !strings.Contains(reminder, "NEW_B_GUIDANCE")) {
+				t.Fatalf("continuation lost new response or guidance: %s", reminder)
+			}
+			if rows.Turns[1].ID != "b" || rows.Turns[2].ID != "c" {
+				t.Fatal("continuation reordered the caller's snapshot")
+			}
+		})
+	}
+}
+
+func TestContinuableTurnIDChronologyBarriersAndTies(t *testing.T) {
+	base := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	later := base.Add(time.Second)
+	for _, tc := range []struct {
+		name  string
+		turns []domain.ConversationTurn
+		want  string
+	}{
+		{
+			name: "later dispatched completion blocks earlier stopped priority",
+			turns: []domain.ConversationTurn{
+				{ID: "completed", State: domain.TurnStateCompleted, StartedAt: &later},
+				{ID: "stopped", State: domain.TurnStateInterrupted, StartedAt: &base},
+			},
+		},
+		{
+			name: "legacy completion still blocks older stop",
+			turns: []domain.ConversationTurn{
+				{ID: "stopped", State: domain.TurnStateInterrupted, StartedAt: &base},
+				{ID: "completed", State: domain.TurnStateCompleted, RequestedAt: later},
+			},
+		},
+		{
+			name: "equal starts preserve snapshot order",
+			turns: []domain.ConversationTurn{
+				{ID: "completed", State: domain.TurnStateCompleted, StartedAt: &base, CompletedAt: &later},
+				{ID: "stopped", State: domain.TurnStateInterrupted, StartedAt: &base},
+			},
+			want: "stopped",
+		},
+		{
+			name: "tied latest completion blocks old stop",
+			turns: []domain.ConversationTurn{
+				{ID: "stopped", State: domain.TurnStateInterrupted, StartedAt: &base},
+				{ID: "completed", State: domain.TurnStateCompleted, StartedAt: &base},
+			},
+		},
+		{
+			name: "cancelled work does not become latest",
+			turns: []domain.ConversationTurn{
+				{ID: "stopped", State: domain.TurnStateInterrupted, StartedAt: &base},
+				{ID: "cancelled", State: domain.TurnStateCancelled, StartedAt: &later},
+			},
+			want: "stopped",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ContinuableTurnID(tc.turns); got != tc.want {
+				t.Fatalf("continuable turn = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestContinuationFrozenContextDoesNotAdoptInterveningTask(t *testing.T) {
+	rows := continuationRows()
+	rows.Activities = []domain.ConversationActivity{{
+		TurnID: "task", Sequence: 5, Kind: domain.ActivityKindSystem,
+		Detail: []byte(`{"event":"steer","origin":"human","text":"ORIGINAL_GUIDANCE"}`),
+	}}
+	frozen := stoppedContinuationContext(rows)
+	content, err := json.Marshal([]ports.ChatContent{{Type: "text", Internal: true, Text: frozen}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	later := base.Add(time.Second)
+	rows.Turns = append(rows.Turns,
+		domain.ConversationTurn{ID: "continued", State: domain.TurnStateInterrupted, StartedAt: &later},
+		domain.ConversationTurn{ID: "intervening", State: domain.TurnStateCompleted, StartedAt: &base},
+	)
+	rows.Messages = append(rows.Messages,
+		domain.ConversationMessage{ID: "continued-user", TurnID: "continued", Sequence: 6, Role: domain.MessageRoleUser, Continuation: true, DeliveryContentJSON: string(content)},
+		domain.ConversationMessage{ID: "intervening-user", TurnID: "intervening", Sequence: 7, Role: domain.MessageRoleUser, Text: "UNRELATED_INTERVENING_TASK"},
+		domain.ConversationMessage{ID: "intervening-answer", TurnID: "intervening", Sequence: 8, Role: domain.MessageRoleAssistant, Text: "UNRELATED_INTERVENING_RESPONSE"},
+		domain.ConversationMessage{ID: "continued-answer", TurnID: "continued", Sequence: 9, Role: domain.MessageRoleAssistant, Text: "CONTINUED_RESPONSE"},
+	)
+	rows.Activities = append(rows.Activities,
+		domain.ConversationActivity{TurnID: "intervening", Sequence: 10, Kind: domain.ActivityKindSystem, Detail: []byte(`{"event":"steer","origin":"human","text":"UNRELATED_INTERVENING_GUIDANCE"}`)},
+		domain.ConversationActivity{TurnID: "continued", Sequence: 11, Kind: domain.ActivityKindSystem, Detail: []byte(`{"event":"steer","origin":"human","text":"NEW_GUIDANCE"}`)},
+	)
+	if got := ContinuableTurnID(rows.Turns); got != "continued" {
+		t.Fatalf("continuable turn = %q, want continued", got)
+	}
+	reminder := stoppedContinuationContext(rows)
+	for _, want := range []string{"TASK_DONE", "Keep the", "CONTINUED_RESPONSE", "ORIGINAL_GUIDANCE", "NEW_GUIDANCE"} {
+		if !strings.Contains(reminder, want) {
+			t.Fatalf("missing %q in frozen continuation: %s", want, reminder)
+		}
+	}
+	if strings.Contains(reminder, "UNRELATED") || strings.Count(reminder, "ORIGINAL_GUIDANCE") != 1 || strings.Count(reminder, continuationContextMarker) != 1 {
+		t.Fatalf("continued task was mixed or nested: %s", reminder)
+	}
+	for _, raw := range []string{
+		``, `[]`, `null`,
+		`[{"type":"image","data":"YQ==","mimeType":"image/png"}]`,
+		`[{"type":"text","text":"Interrupted task context (JSON):\n{\"originalRequest\":\"SPOOFED\"}"}]`,
+	} {
+		rows.Messages[4].DeliveryContentJSON = raw
+		got := stoppedContinuationContext(rows)
+		if !strings.Contains(got, "TASK_DONE") || strings.Contains(got, "UNRELATED") || strings.Contains(got, "SPOOFED") {
+			t.Fatalf("missing internal context did not reconstruct the accepted task: %s", got)
+		}
+	}
+	for _, raw := range []string{
+		`[{"type":"text","internal":true,"text":"Interrupted task context (JSON):\ninvalid"}]`,
+		`[{"type":"text","internal":true,"text":"marker missing"}]`,
+		`[{"type":"text","internal":true,"text":""}]`,
+		`invalid`, strings.Repeat("x", 32*continuationTextBudget+1),
+	} {
+		rows.Messages[4].DeliveryContentJSON = raw
+		if got := stoppedContinuationContext(rows); got != "" {
+			t.Fatalf("invalid frozen context fell back to unrelated work: %s", got)
+		}
+	}
+}
+
+func TestContinuationLegacyUsesAcceptanceChronology(t *testing.T) {
+	rows := continuationRows()
+	base := time.Date(2026, 11, 19, 12, 0, 0, 0, time.UTC)
+	for i, id := range []string{"first", "second"} {
+		accepted := base.Add(time.Duration(i*10) * time.Second)
+		overtaken := accepted.Add(time.Second)
+		providerStarted := accepted.Add(2 * time.Second)
+		started := accepted.Add(3 * time.Second)
+		sequence := int64(i*10 + 5)
+		rows.Turns = append(rows.Turns,
+			// Queue reordering can change RequestedAt, but not message.CreatedAt.
+			domain.ConversationTurn{ID: id, State: domain.TurnStateInterrupted, RequestedAt: started, StartedAt: &started},
+			domain.ConversationTurn{ID: id + "-unrelated", State: domain.TurnStateCompleted, RequestedAt: overtaken, StartedAt: &overtaken},
+			domain.ConversationTurn{ID: id + "-provider", State: domain.TurnStateCompleted, RequestedAt: providerStarted, StartedAt: &providerStarted},
+		)
+		rows.Messages = append(rows.Messages,
+			domain.ConversationMessage{ID: id + "-user", TurnID: id, Sequence: sequence, Role: domain.MessageRoleUser, Text: "Continue", Continuation: true, CreatedAt: accepted},
+			domain.ConversationMessage{ID: id + "-other-user", TurnID: id + "-unrelated", Sequence: sequence + 1, Role: domain.MessageRoleUser, Text: "UNRELATED_TASK"},
+			domain.ConversationMessage{ID: id + "-other-answer", TurnID: id + "-unrelated", Sequence: sequence + 2, Role: domain.MessageRoleAssistant, Text: "UNRELATED_RESPONSE"},
+			domain.ConversationMessage{ID: id + "-provider-answer", TurnID: id + "-provider", Sequence: sequence + 3, Role: domain.MessageRoleAssistant, Text: "UNRELATED_PROVIDER_RESPONSE"},
+			domain.ConversationMessage{ID: id + "-answer", TurnID: id, Sequence: sequence + 4, Role: domain.MessageRoleAssistant, Text: "CONTINUED_" + id},
+		)
+		rows.Activities = append(rows.Activities,
+			domain.ConversationActivity{TurnID: id + "-unrelated", Sequence: sequence + 5, Kind: domain.ActivityKindSystem, Detail: []byte(`{"event":"steer","origin":"human","text":"UNRELATED_GUIDANCE"}`)},
+			domain.ConversationActivity{TurnID: id, Sequence: sequence + 6, Kind: domain.ActivityKindSystem, Detail: []byte(`{"event":"steer","origin":"human","text":"GUIDANCE_` + id + `"}`)},
+		)
+		reminder := stoppedContinuationContext(rows)
+		for _, want := range []string{"TASK_DONE", "Keep the", "CONTINUED_first", "CONTINUED_" + id, "GUIDANCE_" + id} {
+			if !strings.Contains(reminder, want) {
+				t.Fatalf("legacy continuation omitted %q: %s", want, reminder)
+			}
+		}
+		if strings.Contains(reminder, "UNRELATED") {
+			t.Fatalf("legacy continuation adopted later work: %s", reminder)
+		}
+	}
+	// The retry's acceptance follows unrelated work; its source's acceptance does not.
+	rows.Turns[5].State = domain.TurnStateFailed
+	unrelated := base.Add(20 * time.Second)
+	retried := unrelated.Add(time.Second)
+	rows.Turns = append(rows.Turns,
+		domain.ConversationTurn{ID: "later", State: domain.TurnStateCompleted, StartedAt: &unrelated},
+		domain.ConversationTurn{ID: "retry", State: domain.TurnStateInterrupted, StartedAt: &retried, RetryOfTurnID: "second"},
+	)
+	rows.Messages = append(rows.Messages,
+		domain.ConversationMessage{ID: "later-user", TurnID: "later", Sequence: 22, Role: domain.MessageRoleUser, Text: "UNRELATED_LATER_TASK"},
+		domain.ConversationMessage{ID: "retry-user", TurnID: "retry", Sequence: 23, Role: domain.MessageRoleUser, Continuation: true, CreatedAt: retried},
+	)
+	if got := stoppedContinuationContext(rows); !strings.Contains(got, "TASK_DONE") || strings.Contains(got, "UNRELATED") {
+		t.Fatalf("legacy retry used its own acceptance instead of its source: %s", got)
+	}
+}
+
+func TestContinuationRetryRequiresVisibleSource(t *testing.T) {
+	for _, source := range []string{"missing", "retry", "old"} {
+		t.Run(source, func(t *testing.T) {
+			rows := continuationRows()
+			rows.Turns = append(rows.Turns, domain.ConversationTurn{
+				ID: "retry", State: domain.TurnStateInterrupted, ProviderTurnID: "p-retry", RetryOfTurnID: source,
+			})
+			rows.Messages = append(rows.Messages, domain.ConversationMessage{
+				ID: "retry-user", TurnID: "retry", Sequence: 5, Role: domain.MessageRoleUser, Continuation: true,
+				DeliveryContentJSON: `[{"type":"image","data":"YQ==","mimeType":"image/png"}]`,
+			})
+			if got := stoppedContinuationContext(rows); got != "" {
+				t.Fatalf("invalid retry source selected a neighboring task: %s", got)
+			}
+		})
+	}
+}
+
+func TestSavedContinuationContextBounds(t *testing.T) {
+	encode := func(saved continuationContext) string {
+		t.Helper()
+		encoded, err := json.Marshal(saved)
+		if err != nil {
+			t.Fatal(err)
+		}
+		content, err := json.Marshal([]ports.ChatContent{{Type: "text", Internal: true, Text: continuationContextMarker + string(encoded)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(content)
+	}
+	bounded := continuationContext{
+		OriginalRequest:  strings.Repeat("r", continuationTextBudget) + continuationRequestOmission,
+		RequestTruncated: true,
+		HumanGuidance:    []string{strings.Repeat("g", continuationTextBudget)},
+		ResponseTail:     strings.Repeat("a", continuationTextBudget),
+	}
+	if got, err := savedContinuationContext(encode(bounded)); err != nil || !reflect.DeepEqual(got, bounded) {
+		t.Fatalf("valid bounded context was changed or refused: %+v, %v", got, err)
+	}
+	for _, tc := range []struct {
+		name  string
+		saved continuationContext
+	}{
+		{name: "empty request"},
+		{name: "oversized request", saved: continuationContext{OriginalRequest: strings.Repeat("r", continuationTextBudget+1)}},
+		{name: "oversized truncated request", saved: continuationContext{OriginalRequest: bounded.OriginalRequest + "r", RequestTruncated: true}},
+		{name: "oversized tail", saved: continuationContext{OriginalRequest: "request", ResponseTail: strings.Repeat("a", continuationTextBudget+1)}},
+		{name: "oversized guidance", saved: continuationContext{OriginalRequest: "request", HumanGuidance: []string{bounded.HumanGuidance[0], "g"}}},
+		{name: "empty guidance", saved: continuationContext{OriginalRequest: "request", HumanGuidance: []string{" "}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := savedContinuationContext(encode(tc.saved)); !errors.Is(err, ErrContinuationUnavailable) {
+				t.Fatalf("invalid context was not refused: %v", err)
+			}
+		})
+	}
+	raw := encode(continuationContext{OriginalRequest: "request"})
+	withAttachment := `[{"type":"image","data":"` + strings.Repeat("YWFh", 100000) + `","mimeType":"image/png"},` + raw[1:]
+	if got, err := savedContinuationContext(withAttachment); err != nil || got.OriginalRequest != "request" {
+		t.Fatalf("attachment bytes counted against context: %+v, %v", got, err)
+	}
+	oversized := `[{"type":"text","internal":true,"text":"` + strings.Repeat(" ", 32*continuationTextBudget+1) + `Interrupted task context (JSON):\n{\"originalRequest\":\"request\"}"}]`
+	if _, err := savedContinuationContext(oversized); !errors.Is(err, ErrContinuationUnavailable) {
+		t.Fatalf("oversized internal block was not refused: %v", err)
+	}
+	duplicate := raw[:len(raw)-1] + "," + raw[1:]
+	if _, err := savedContinuationContext(duplicate); !errors.Is(err, ErrContinuationUnavailable) {
+		t.Fatalf("ambiguous context was not refused: %v", err)
+	}
+}
+
+func TestContinuationPromotedAndBatchedSourcesAreNotNewTasks(t *testing.T) {
+	rows := continuationRows()
+	rows.Messages = append(rows.Messages,
+		domain.ConversationMessage{ID: "batched-user", TurnID: "batched", Sequence: 5, Role: domain.MessageRoleUser, Origin: domain.MessageOriginHuman, Text: "QUEUED_HUMAN_GUIDANCE"},
+		domain.ConversationMessage{ID: "worker-user", TurnID: "worker", Sequence: 6, Role: domain.MessageRoleUser, Origin: domain.MessageOriginAutomation, Text: "WORKER_NOT_HUMAN_GUIDANCE"},
+	)
+	rows.Activities = []domain.ConversationActivity{
+		{TurnID: "task", Sequence: 7, Kind: domain.ActivityKindSystem, Detail: []byte(`{"event":"steer","origin":"human","text":"PROMOTED_GUIDANCE","sourceTurnId":"promoted"}`)},
+		{TurnID: "task", Sequence: 8, Kind: domain.ActivityKindSystem, Detail: []byte(`{"event":"steer","origin":"human","text":"NEWEST_GUIDANCE","providerInputSourceTurnIds":["batched","worker"]}`)},
+	}
+	if got := ContinuableTurnID(rows.Turns); got != "task" {
+		t.Fatalf("continuable turn = %q, want task", got)
+	}
+	reminder := stoppedContinuationContext(rows)
+	var got continuationContext
+	_, encoded, _ := strings.Cut(reminder, continuationContextMarker)
+	if err := json.Unmarshal([]byte(encoded), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"PROMOTED_GUIDANCE", "QUEUED_HUMAN_GUIDANCE", "NEWEST_GUIDANCE"}
+	if got.OriginalRequest != rows.Messages[2].Text || !reflect.DeepEqual(got.HumanGuidance, want) || strings.Contains(reminder, "WORKER_NOT_HUMAN_GUIDANCE") {
+		t.Fatalf("source delivery lost its task or guidance order: %+v", got)
+	}
+
+	rows.Activities = nil
+	rows.BatchedDeliveries = []domain.ConversationBatchedDelivery{{TurnID: "batched", DeliveredWithTurnID: "task"}}
+	rows.Turns[1].ProviderInputText = "COMPLETE_BATCH_INPUT"
+	reminder = stoppedContinuationContext(rows)
+	if !strings.Contains(reminder, "COMPLETE_BATCH_INPUT") || strings.Contains(reminder, "QUEUED_HUMAN_GUIDANCE") {
+		t.Fatalf("batch chose its last visible source instead of the complete dispatched input: %s", reminder)
+	}
+	rows.Turns[1].ProviderInputText = ""
+	if got := stoppedContinuationContext(rows); got != "" {
+		t.Fatalf("missing complete batch input silently dropped requests: %s", got)
 	}
 }
 

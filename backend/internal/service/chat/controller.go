@@ -531,7 +531,7 @@ func (c *Controller) recoverPendingInterrupts() {
 		return
 	}
 	for _, turn := range turns {
-		if err := c.finishInterruptSend(ctx, turn.ID); err != nil {
+		if _, err := c.finishInterruptSend(ctx, turn.ID); err != nil {
 			c.log.Error("pending interrupt-send recovery did not complete; prompt remains durable", "session", c.sessionID, "error", err)
 		}
 	}
@@ -1691,6 +1691,37 @@ func (c *Controller) interruptAndSend(ctx context.Context, msg ports.ChatUserMes
 	if !c.Capabilities().Has(ports.ChatCapabilityInterrupt) {
 		return domain.ConversationTurn{}, ports.ErrChatUnsupported
 	}
+	if err := ctx.Err(); err != nil {
+		return domain.ConversationTurn{}, err
+	}
+	c.mu.Lock()
+	target := c.pendingTurnID
+	c.mu.Unlock()
+	// A retry belongs to its original target, never whichever turn runs now.
+	// sendLocked still validates the payload and admits the durable intent.
+	if msg.ClientMessageID != "" {
+		stored, found, err := c.store.ConversationMessageByClientID(ctx, c.conversation.ID, msg.ClientMessageID)
+		if err != nil {
+			return domain.ConversationTurn{}, err
+		}
+		if found {
+			prior, err := c.store.TurnByID(ctx, stored.TurnID)
+			if err != nil {
+				return domain.ConversationTurn{}, fmt.Errorf("%w: %w", ErrInterruptSendUncertain, err)
+			}
+			target = prior.InterruptTargetProviderTurnID
+			if prior.State != domain.TurnStateQueued || prior.InterruptDelivered {
+				target = ""
+			}
+		}
+	}
+	restore := c.withdrawInterruptSteers(target)
+	interrupted := ""
+	defer func() {
+		if restore != nil && interrupted != target {
+			restore()
+		}
+	}()
 	c.sendMu.Lock()
 	turn, err := c.sendLocked(ctx, msg, true, nil, nil)
 	if err == nil && turn.ID == "" && msg.ClientMessageID != "" {
@@ -1708,22 +1739,49 @@ func (c *Controller) interruptAndSend(ctx context.Context, msg ports.ChatUserMes
 		}
 		return turn, err
 	}
-	if err := c.finishInterruptSend(ctx, turn.ID); err != nil {
+	interrupted, err = c.finishInterruptSend(ctx, turn.ID)
+	if err != nil {
 		return turn, fmt.Errorf("%w: %w", ErrInterruptSendUncertain, err)
 	}
 	return turn, nil
 }
 
-func (c *Controller) finishInterruptSend(ctx context.Context, turnID string) error {
+// withdrawInterruptSteers releases a waiting steer before sendMu is acquired.
+// The dispatch marker prevents an old target from withdrawing a successor's steer.
+func (c *Controller) withdrawInterruptSteers(target string) func() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if target == "" || c.pendingTurnID != target || c.dispatchingTurnID != "" ||
+		c.handoff != controllerHandoffNone || c.preserveProviderOnStop {
+		return nil
+	}
+	if withdrawer, ok := c.conv.(ports.ChatSteerWithdrawer); ok {
+		return withdrawer.WithdrawPendingSteers()
+	}
+	return nil
+}
+
+// finishInterruptSend returns the target whose cancellation was accepted, even
+// when recording that acceptance fails. Only an unaccepted withdrawal is restored.
+func (c *Controller) finishInterruptSend(ctx context.Context, turnID string) (interrupted string, err error) {
 	c.interruptSendMu.Lock()
 	defer c.interruptSendMu.Unlock()
 	turn, err := c.store.TurnByID(ctx, turnID)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if turn.State != domain.TurnStateQueued || turn.InterruptTargetProviderTurnID == "" {
-		return nil
+		return "", nil
 	}
+	var restore func()
+	if !turn.InterruptDelivered {
+		restore = c.withdrawInterruptSteers(turn.InterruptTargetProviderTurnID)
+	}
+	defer func() {
+		if restore != nil && interrupted == "" {
+			restore()
+		}
+	}()
 	c.sendMu.Lock()
 	c.mu.Lock()
 	handoff := c.handoff != controllerHandoffNone || c.preserveProviderOnStop
@@ -1733,23 +1791,26 @@ func (c *Controller) finishInterruptSend(ctx context.Context, turnID string) err
 	if err != nil || handoff {
 		c.sendMu.Unlock()
 		if err != nil {
-			return err
+			return "", err
 		}
-		return ErrControllerHandoff
+		return "", ErrControllerHandoff
 	}
 	if target.State == domain.TurnStateCompleted || target.State == domain.TurnStateInterrupted {
 		defer c.sendMu.Unlock()
-		return c.drainLocked(ctx, true)
+		return "", c.drainLocked(ctx, true)
 	}
 	c.sendMu.Unlock()
-	if target.State != domain.TurnStateRunning || !active || turn.InterruptDelivered {
-		return nil
+	if target.State != domain.TurnStateRunning || !active {
+		return "", nil
+	}
+	if turn.InterruptDelivered {
+		return turn.InterruptTargetProviderTurnID, nil
 	}
 	if !c.awaitTurnAcknowledged(ctx, turn.InterruptTargetProviderTurnID) {
-		return nil
+		return "", nil
 	}
 	if err := ctx.Err(); err != nil {
-		return err
+		return "", err
 	}
 	c.sendMu.Lock()
 	c.mu.Lock()
@@ -1758,23 +1819,24 @@ func (c *Controller) finishInterruptSend(ctx context.Context, turnID string) err
 	c.mu.Unlock()
 	c.sendMu.Unlock()
 	if handoff {
-		return ErrControllerHandoff
+		return "", ErrControllerHandoff
 	}
 	if !active {
-		return nil
+		return "", nil
 	}
 	if err := c.conv.Interrupt(ctx, turn.InterruptTargetProviderTurnID); err != nil {
 		// Inactivity cannot distinguish completed, interrupted and failed targets.
 		// Keep the prompt queued until its exact durable outcome is known.
 		if errors.Is(err, ports.ErrChatNoActiveTurn) {
-			return nil
+			return "", nil
 		}
-		return fmt.Errorf("interrupt accepted prompt target: %w", err)
+		return "", fmt.Errorf("interrupt accepted prompt target: %w", err)
 	}
+	interrupted = turn.InterruptTargetProviderTurnID
 	if err := c.store.MarkTurnInterruptDelivered(context.WithoutCancel(ctx), turn.ID); err != nil {
-		return fmt.Errorf("record interrupt acceptance: %w", err)
+		return interrupted, fmt.Errorf("record interrupt acceptance: %w", err)
 	}
-	return nil
+	return interrupted, nil
 }
 
 func (c *Controller) sendLocked(
@@ -3473,7 +3535,10 @@ func (c *Controller) project(flushInterval time.Duration) {
 	c.mu.Lock()
 	c.state = ports.ChatControllerStopped
 	suppressStoppedActivity := c.suppressStoppedActivity
-	c.preserveProviderOnStop = c.preserveProviderOnStop || c.retainedProvider()
+	if c.retainedProvider() {
+		c.preserveProviderOnStop = true
+		c.transportInterrupted = !c.explicitClose && c.handoff == controllerHandoffNone && !suppressStoppedActivity
+	}
 	preserveProvider := c.preserveProviderOnStop
 	hibernating := c.handoff == controllerHandoffHibernate
 	c.mu.Unlock()
@@ -3528,7 +3593,8 @@ func (c *Controller) projectUnit(
 		// its turn/request correlation and queued intake for a replacement.
 		c.mu.Lock()
 		preserver, persistentProvider := c.conv.(ports.ChatProviderPreserver)
-		c.transportInterrupted = !c.explicitClose && persistentProvider && preserver.PreservesProviderOnClose()
+		c.transportInterrupted = !c.explicitClose && c.handoff == controllerHandoffNone &&
+			!c.suppressStoppedActivity && persistentProvider && preserver.PreservesProviderOnClose()
 		c.preserveProviderOnStop = true
 		c.state = ports.ChatControllerStopped
 		suppressStoppedActivity := c.suppressStoppedActivity
@@ -3542,6 +3608,7 @@ func (c *Controller) projectUnit(
 	if event.Kind == ports.ChatEventControllerState && event.ControllerState == ports.ChatControllerStopped && (event.ProviderRetained || c.retainedProvider()) {
 		if preserver, ok := c.conv.(ports.ChatProviderPreserver); ok && preserver.PreservesProviderOnClose() {
 			c.preserveProviderOnStop = true
+			c.transportInterrupted = !c.explicitClose && c.handoff == controllerHandoffNone && !c.suppressStoppedActivity
 			c.state = ports.ChatControllerStopped
 		}
 	}

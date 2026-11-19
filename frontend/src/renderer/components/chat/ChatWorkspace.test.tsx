@@ -5147,6 +5147,34 @@ describe("automation visibility in chat", () => {
 		expect(localStorage.getItem("ao.chat.hideAutomationMessages")).toBe("true");
 	});
 
+	it("restores an automation-only turn's task and unknown outcome when the controller stops", () => {
+		useUiStore.setState({ hideAutomationMessages: true });
+		const at = "2026-10-07T12:00:00Z";
+		const snapshot: ConversationSnapshot = {
+			...chatFixtureEmpty, controller: { state: "busy" }, latestSequence: 2,
+			turns: [{ id: "orphaned", state: "running", requestedAt: at, startedAt: at, providerTurnId: "provider-orphaned" }],
+			items: [
+				{ ...humanMessage("Audit the queued worker report"), id: "orphaned-card", turnId: "orphaned", origin: "automation" },
+				{ ...humanMessage("Unrelated routine automation"), id: "routine-card", turnId: undefined, origin: "automation", sequence: 2 },
+			],
+		};
+		const onRollback = vi.fn();
+		const { rerender, container } = render(<ChatWorkspace snapshot={snapshot} onRollback={onRollback} />);
+		expect(screen.queryByText("Audit the queued worker report")).not.toBeInTheDocument();
+		expect(screen.getByText("2 automation messages hidden")).toBeInTheDocument();
+
+		rerender(<ChatWorkspace snapshot={{ ...snapshot, controller: { state: "stopped" } }} onRollback={onRollback} />);
+
+		expect(screen.getByText("The agent stopped before this turn finished")).toBeInTheDocument();
+		expect(screen.getByText("Audit the queued worker report")).toBeInTheDocument();
+		expect(container.querySelector('[data-turn-outcome="unknown"]')).toBeInTheDocument();
+		expect(screen.queryByText("Unrelated routine automation")).not.toBeInTheDocument();
+		expect(screen.getByText("1 automation message hidden")).toBeInTheDocument();
+		expect(screen.getByRole("button", { name: "Hide automation messages" })).toHaveAttribute("aria-pressed", "true");
+		expect(screen.queryByTestId("live-working-label")).not.toBeInTheDocument();
+		expect(screen.queryByRole("button", { name: "Roll back to here" })).not.toBeInTheDocument();
+	});
+
 	it("preserves an automation-only recovered turn and its unknown-outcome notice", async () => {
 		const user = userEvent.setup();
 		const snapshot: ConversationSnapshot = {
@@ -5188,7 +5216,11 @@ describe("automation visibility in chat", () => {
 		expect(screen.getByText("Not delivered")).toBeInTheDocument();
 	});
 
-	it("deduplicates spawn actions without counting them as hidden automation or dropping recovered outcomes", async () => {
+	it.each([
+		["recovered", "recovered", "This turn was recovered from an earlier session"],
+		["unknown", "running", "The agent stopped before this turn finished"],
+		["not_run", "failed", "This message was not run"],
+	] as const)("deduplicates spawn actions without counting them as hidden automation or dropping %s outcomes", async (outcome, state, notice) => {
 		const at = "2026-10-07T12:00:00Z";
 		const spawn: ConversationActivity = {
 			kind: "activity", id: "duplicate-spawn", turnId: "duplicate-turn", sequence: 2, revision: 0,
@@ -5197,26 +5229,27 @@ describe("automation visibility in chat", () => {
 		};
 		const snapshot: ConversationSnapshot = {
 			...idleSnapshot(), latestSequence: 5,
+			controller: { state: outcome === "unknown" ? "stopped" : "ready" },
 			turns: [
 				{ id: "duplicate-turn", state: "completed", requestedAt: at, completedAt: at },
-				{ id: "recovered-turn", state: "recovered", requestedAt: at, completedAt: at },
+				{ id: "outcome-turn", state, requestedAt: at, completedAt: state === "running" ? undefined : at, notRun: outcome === "not_run" },
 			],
 			items: [
 				{ ...spawn, id: "spawn-command", turnId: undefined, sequence: 1, activityKind: "command", summary: "ao spawn project task", detail: { command: "ao spawn project task", output: 'spawned session worker-1 "Worker" (running)' } },
 				spawn,
 				{ ...humanMessage("Routine automation after spawning"), id: "routine", origin: "automation", sequence: 3 },
-				{ ...spawn, id: "recovered-spawn", turnId: "recovered-turn", sequence: 4 },
+				{ ...spawn, id: "outcome-spawn", turnId: "outcome-turn", sequence: 4 },
 				{ ...spawn, id: "warning", turnId: undefined, sequence: 5, activityKind: "error", status: "failed", summary: "Independent warning stays", detail: undefined },
 			],
 		};
 		const original = structuredClone(snapshot);
 		const { container } = render(<ChatWorkspace snapshot={snapshot} sessionRole="orchestrator" />);
 		expect(container.querySelector('[data-chat-turn^="duplicate-turn-"]')).toBeNull();
-		expect(screen.getByText("This turn was recovered from an earlier session")).toBeInTheDocument();
+		expect(screen.getByText(notice)).toBeInTheDocument();
 		await userEvent.click(screen.getByRole("button", { name: "Hide automation messages" }));
 		expect(screen.getByText("1 automation message hidden")).toBeInTheDocument();
 		expect(container.querySelector('[data-chat-turn^="duplicate-turn-"]')).toBeNull();
-		expect(screen.getByText("This turn was recovered from an earlier session")).toBeInTheDocument();
+		expect(screen.getByText(notice)).toBeInTheDocument();
 		expect(screen.getByText("Independent warning stays")).toBeInTheDocument();
 		expect(snapshot).toEqual(original);
 	});
