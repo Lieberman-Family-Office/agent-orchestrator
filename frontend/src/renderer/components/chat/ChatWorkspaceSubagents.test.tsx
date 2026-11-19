@@ -303,6 +303,114 @@ describe("ChatWorkspace subagents", () => {
 		expect(screen.queryByText(/Ran \d+ tool call/)).not.toBeInTheDocument();
 	});
 
+	it.each([[true, true], [true, false], [false, true], [false, false]])(
+		"preserves child-only continuation controls without empty groups (plan: %s, rollback: %s)", async (hasPlan, rollbackable) => {
+			const current = snapshot("completed");
+			current.items = [
+				text("prompt", 1, "user", "Audit the storefront with a subagent"),
+				launch("pages", 2, "Audit: info pages"),
+				inTurn(text("background", 3, "assistant", "Earlier background reply"), undefined),
+				child("p1", 4, "tool-pages", "cd /repo; cat src/app/faq/page.tsx"),
+			];
+			current.latestSequence = 4;
+			current.turns = current.turns.map((turn) => ({
+				...turn,
+				...(hasPlan ? { plan: { steps: [{ text: "Audit the FAQ", status: "completed" as const }] } } : {}),
+				...(rollbackable ? { providerTurnId: "provider-turn-subagents" } : {}),
+			}));
+			const onRollback = vi.fn();
+			const { container } = render(<ChatWorkspace snapshot={current} onRollback={onRollback} />);
+
+			expect(screen.getByText("Audit the storefront with a subagent")).toBeInTheDocument();
+			expect(screen.getByText("Earlier background reply")).toBeInTheDocument();
+			expect(screen.queryByText(/Ran \d+ tool call/)).not.toBeInTheDocument();
+			expect(container.querySelectorAll("[data-chat-turn]")).toHaveLength(hasPlan || rollbackable ? 3 : 2);
+			expect(screen.queryAllByRole("region", { name: "Agent plan" })).toHaveLength(hasPlan ? 1 : 0);
+			expect(screen.queryAllByRole("button", { name: "Roll back to here" })).toHaveLength(rollbackable ? 1 : 0);
+			if (hasPlan) {
+				await userEvent.click(screen.getByRole("button", { name: "Expand plan" }));
+				expect(screen.getByText("Audit the FAQ")).toBeInTheDocument();
+			}
+			if (rollbackable) {
+				await userEvent.click(screen.getByRole("button", { name: "Roll back to here" }));
+				expect(onRollback).not.toHaveBeenCalled();
+				await userEvent.click(screen.getByRole("button", { name: "Roll back" }));
+				expect(onRollback).toHaveBeenCalledWith(turnId, undefined);
+			}
+		},
+	);
+
+	it.each([
+		["turnless", true], ["turnless", false], ["steer", true], ["steer", false],
+	] as const)("keeps one changed-file result across a %s split (plan and rollback: %s)", (split, hasControls) => {
+		const current = snapshot("completed");
+		const assistant = text("reply", 3, "assistant", "Updated the storefront.");
+		current.items = [
+			text("prompt", 1, "user", "Audit the storefront with a subagent"),
+			launch("pages", 2, "Audit: info pages"),
+			assistant,
+			child("p1", 5, "tool-pages", "cd /repo; cat src/app/faq/page.tsx"),
+		];
+		current.latestSequence = 5;
+		current.turns = current.turns.map((turn) => ({
+			...turn,
+			diff: { files: [{ path: "src/storefront.ts", status: "modified" as const, additions: 1, deletions: 0 }] },
+			...(hasControls ? {
+				plan: { steps: [{ text: "Audit the FAQ", status: "completed" as const }] },
+				providerTurnId: "provider-turn-subagents",
+			} : {}),
+		}));
+		const onRollback = vi.fn();
+		const { rerender, container } = render(<ChatWorkspace snapshot={current} onRollback={onRollback} />);
+		expect(screen.getAllByText("1 File Changed")).toHaveLength(1);
+		expect(screen.getAllByText("storefront.ts")).toHaveLength(1);
+
+		const boundary = split === "turnless"
+			? inTurn(text("background", 4, "assistant", "Unrelated background reply"), undefined)
+			: steer("steer", 4, "Check the FAQ too");
+		const splitSnapshot = { ...current, items: [...current.items.slice(0, 3), boundary, current.items[3]!] };
+		rerender(<ChatWorkspace snapshot={splitSnapshot} onRollback={onRollback} />);
+		expect(screen.getAllByText("1 File Changed")).toHaveLength(1);
+		expect(screen.getAllByText("storefront.ts")).toHaveLength(1);
+		expect(screen.getByText("1 File Changed").closest("[data-chat-turn]")).toBe(container.querySelector("[data-chat-turn]:last-child"));
+		expect(screen.queryAllByRole("region", { name: "Agent plan" })).toHaveLength(hasControls ? 1 : 0);
+		expect(screen.queryAllByRole("button", { name: "Roll back to here" })).toHaveLength(hasControls ? 1 : 0);
+
+		// Only earlier prose changes; the final segment must not reuse stale eligibility.
+		rerender(<ChatWorkspace snapshot={{
+			...splitSnapshot,
+			items: splitSnapshot.items.map((item) => item === assistant ? text("reply", 3, "assistant", " \n ") : item),
+		}} onRollback={onRollback} />);
+		expect(screen.queryByText("1 File Changed")).not.toBeInTheDocument();
+
+		// No result content means no extra child-only continuation, even with eligible prose.
+		rerender(<ChatWorkspace snapshot={{
+			...splitSnapshot,
+			turns: splitSnapshot.turns.map((turn) => ({ ...turn, diff: { files: [] } })),
+		}} onRollback={onRollback} />);
+		expect(screen.queryByText("1 File Changed")).not.toBeInTheDocument();
+		if (split === "turnless" && !hasControls) expect(container.querySelectorAll("[data-chat-turn]")).toHaveLength(2);
+	});
+
+	it("does not qualify tool-only results through an unrelated turnless assistant", () => {
+		const current = snapshot("completed");
+		current.items = [
+			text("prompt", 1, "user", "Audit the storefront with a subagent"),
+			launch("pages", 2, "Audit: info pages"),
+			inTurn(text("background", 3, "assistant", "Unrelated background reply"), undefined),
+			child("p1", 4, "tool-pages", "cd /repo; cat src/app/faq/page.tsx"),
+		];
+		current.latestSequence = 4;
+		current.turns = current.turns.map((turn) => ({
+			...turn,
+			diff: { files: [{ path: "src/storefront.ts", status: "modified" as const, additions: 1, deletions: 0 }] },
+		}));
+		const { container } = render(<ChatWorkspace snapshot={current} />);
+		expect(screen.getByText("Unrelated background reply")).toBeInTheDocument();
+		expect(screen.queryByText("1 File Changed")).not.toBeInTheDocument();
+		expect(container.querySelectorAll("[data-chat-turn]")).toHaveLength(2);
+	});
+
 	it("keeps a later turn's failure in view when that turn held only a child's steps", () => {
 		// The child's steps move under its launch, so the later turn has nothing else to
 		// draw, but how it ended still belongs on the timeline.

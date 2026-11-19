@@ -59,7 +59,7 @@ import { STANDALONE_WORKSPACE_ID, sessionIsActive, type WorkspaceSession } from 
 import { ComposerErrorNotice, switchEffort, type PendingAgentSwitch } from "./AgentSwitchPicker";
 import { AGENT_SWITCH_FAILED } from "./ChatComposer";
 import { useUiStore } from "../../stores/ui-store";
-import { CONTINUE_STOPPED_TURN_PROMPT, ChatWorkspace, SENT_OUTSIDE_TRANSCRIPT, continuableTurnId, type ChatFindRequest } from "./ChatWorkspace";
+import { CONTINUE_STOPPED_TURN_PROMPT, ChatWorkspace, SENT_OUTSIDE_TRANSCRIPT, continuableTurnId, type ChatFindRequest, type ChatWorkspaceProps } from "./ChatWorkspace";
 import { startingConversationSnapshot } from "./OrchestratorStartingChat";
 import { hasProviderPermissionMode, withUltracode } from "./TurnSettingsBar";
 
@@ -678,6 +678,23 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 		);
 	}
 
+	const sendToSide: NonNullable<ChatWorkspaceProps["onInterruptSend"]> = async (text, attachments, clientMessageId, excerpts, fileReferences) => {
+		// Resolve AO-owned commands before choosing main-turn delivery mode.
+		const btw = sideCreationEnabled ? /^\/btw(?:\s+|$)/i.exec(text) : null;
+		if (!btw) return;
+		if (fileReferences?.length) {
+			throw Object.assign(new Error("File annotations cannot be sent to side chats yet. Send in the main chat or remove the file annotations."), { code: "CHAT_FILE_REFERENCES_SIDE_UNSUPPORTED" });
+		}
+		openSideInspector();
+		const side = await sideChats.create(undefined, true, clientMessageId);
+		const question = text.slice(btw[0].length).trim();
+		if (question || excerpts?.length || attachments?.length) {
+			// A failed handoff must retain the draft, never fall back to the main task.
+			await sideChats.send(side.id, question, attachments, excerpts, true, clientMessageId);
+		}
+		return SENT_OUTSIDE_TRANSCRIPT;
+	};
+
 	return (
 		<div className="relative h-full min-h-0">
 			{refreshError && !hostUnreachable ? <p role="alert" className="px-4 py-2 text-xs text-destructive">{refreshError}</p> : null}
@@ -746,31 +763,18 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 				loadingOlder={isLoadingOlder}
 				onLoadOlder={loadOlder}
 				busy={commands.busy}
-				onInterruptSend={can(renderSnapshot, "interrupt_send") ? (text, attachments, clientMessageId, excerpts, fileReferences) =>
-					commands.send({ text, attachments, clientMessageId, interruptAndSend: true, fileReferences,
+				onInterruptSend={can(renderSnapshot, "interrupt_send") ? async (text, attachments, clientMessageId, excerpts, fileReferences) => {
+					const side = await sendToSide(text, attachments, clientMessageId, excerpts, fileReferences);
+					if (side === SENT_OUTSIDE_TRANSCRIPT) return side;
+					return commands.send({ text, attachments, clientMessageId, interruptAndSend: true, fileReferences,
 						excerpts: excerpts?.map((excerpt) => ({id:excerpt.id,order:excerpt.order,snapshot:excerpt.snapshot,conversationId:excerpt.conversationId,messageId:excerpt.messageId,revision:excerpt.revision,text:excerpt.text,comment:excerpt.comment})),
-					}) : undefined}
+					});
+				} : undefined}
 				excerptsEnabled
 				fileReferencesEnabled={Boolean(renderSnapshot.supportsFileReferences)}
 				onSend={async (text, attachments, clientMessageId, excerpts, fileReferences) => {
-					// Only claim /btw where side chats can open. Elsewhere the
-					// text goes to the agent as typed (it may be the harness's own skill),
-					// so a failed side launch can never strand the main draft.
-					const btw = sideCreationEnabled ? /^\/btw(?:\s+|$)/i.exec(text) : null;
-     if (btw && fileReferences?.length) {
-      throw Object.assign(new Error("File annotations cannot be sent to side chats yet. Send in the main chat or remove the file annotations."), { code: "CHAT_FILE_REFERENCES_SIDE_UNSUPPORTED" });
-     }
-     if (btw) {
-						openSideInspector();
-						const side = await sideChats.create(undefined, true, clientMessageId);
-						const question = text.slice(btw[0].length).trim();
-						if (question || excerpts?.length || attachments?.length) {
-							// Retain the main draft if handing the request to the side fails.
-							await sideChats.send(side.id, question, attachments, excerpts, true, clientMessageId);
-						}
-						// The main transcript keeps the reader's place: /btw is for asking aside.
-						return SENT_OUTSIDE_TRANSCRIPT;
-					}
+					const side = await sendToSide(text, attachments, clientMessageId, excerpts, fileReferences);
+					if (side === SENT_OUTSIDE_TRANSCRIPT) return side;
 					const viaClaude = (pendingSwitch?.harness ?? currentHarness) === "claude-code";
 					const message = {
 						text: viaClaude && (pendingSwitch ? pendingSwitch.ultracode : ultracode.on) ? withUltracode(text) : text,

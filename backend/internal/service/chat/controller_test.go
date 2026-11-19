@@ -6600,6 +6600,15 @@ func testAdapterRecoveryDetachPreservesRunningTurnForAdoption(t *testing.T, stop
 	if err != nil || queued.State != domain.TurnStateQueued {
 		t.Fatalf("queue: %+v %v", queued, err)
 	}
+	provider.emit(ports.ChatEvent{
+		Kind: ports.ChatEventInputRequested, ProviderTurnID: running.ProviderTurnID, RequestID: "retained-question",
+		Input: &ports.ChatInputRequest{Mode: ports.ChatInputModeForm, Message: "Which approach?", Schema: map[string]any{
+			"type": "object", "properties": map[string]any{"choice": map[string]any{"type": "string"}},
+		}},
+	})
+	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
+		return len(s.Activities) == 1 && s.Activities[0].Status == domain.ActivityStatusPending
+	})
 	// A receipt failure makes the adapter detach itself, not Controller.Close.
 	provider.retained.Store(stoppedEvent != "event-only")
 	if stoppedEvent != "omitted" {
@@ -6617,8 +6626,18 @@ func testAdapterRecoveryDetachPreservesRunningTurnForAdoption(t *testing.T, stop
 	if states["keep running"] != domain.TurnStateRunning || states["after recovery"] != domain.TurnStateQueued {
 		t.Fatalf("recovery detach destroyed durable ownership: %+v", states)
 	}
+	if len(before.Activities) != 1 || before.Activities[0].Status != domain.ActivityStatusPending {
+		t.Fatalf("recovery detach settled the unanswered question: %+v", before.Activities)
+	}
 	if provider.terminated.Load() || h.hostStops.Load() != 0 {
 		t.Fatal("recovery terminated the retained provider")
+	}
+	awaitControllerRetired(t, h.svc)
+	candidates := h.svc.InterruptedAwakeAgents()
+	if len(candidates) != 1 || candidates[0].SessionID != testSession ||
+		candidates[0].Owner.ControllerGeneration != h.ctrl.Generation() ||
+		candidates[0].Owner.ProviderConversationID != provider.ProviderConversationID() {
+		t.Fatalf("adapter detachment lost automatic recovery ownership: %+v", candidates)
 	}
 	adopted := &liveReconnectedConversation{nativeHistoryConversation: &nativeHistoryConversation{fakeConversation: newFakeConversation()}}
 	var ids atomic.Int32

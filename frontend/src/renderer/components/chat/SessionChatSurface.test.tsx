@@ -1,4 +1,5 @@
 import type { ChatDraftExcerptReference } from "../../lib/chat-drafts";
+import type { ChatFileReference } from "../../../shared/chat-file-reference";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -98,10 +99,10 @@ const sideMocks = vi.hoisted(() => ({
 	agentSwitch: undefined as AgentSwitchProps | undefined,
 	workspaceSend: undefined as
 		| undefined
-		| ((text: string, attachments: undefined, clientMessageId: string, excerpts?: ChatDraftExcerptReference[]) => Promise<unknown>),
+		| ((text: string, attachments: undefined, clientMessageId: string, excerpts?: ChatDraftExcerptReference[], fileReferences?: ChatFileReference[]) => Promise<unknown>),
 	workspaceInterruptSend: undefined as
 		| undefined
-		| ((text: string, attachments: undefined, clientMessageId: string, excerpts?: ChatDraftExcerptReference[]) => Promise<unknown>),
+		| ((text: string, attachments: undefined, clientMessageId: string, excerpts?: ChatDraftExcerptReference[], fileReferences?: ChatFileReference[]) => Promise<unknown>),
 	sentOutsideTranscript: Symbol("chat.sentOutsideTranscript"),
 }));
 vi.mock("./IndependentSideChats", () => ({
@@ -1399,7 +1400,7 @@ describe("SessionChatSurface continuation identity", () => {
 describe("side command routing", () => {
 	beforeEach(() => {
 		useUiStore.setState({ developerMode: true, sideChats: true });
-		conversationState.snapshot = { ...conversationState.snapshot, capabilities: ["resume"] };
+		conversationState.snapshot = { ...conversationState.snapshot, capabilities: ["resume", "interrupt_send"] };
 	});
 	afterEach(() => {
 		useUiStore.setState({ developerMode: false, sideChats: false });
@@ -1425,9 +1426,9 @@ describe("side command routing", () => {
 		expect(mainSend).toHaveBeenCalledWith(expect.objectContaining({ text: "/btw what is this?", clientMessageId: "submission-main" }));
 	});
 
-	it(
-		"/btw creates a new side for every new submission and reuses a retry key",
-		async () => {
+	it.each(["workspaceSend", "workspaceInterruptSend"] as const)(
+		"/btw creates a new side for every new submission and reuses a retry key through %s",
+		async (send) => {
 			sideMocks.create.mockReset().mockImplementation(async (_excerpt, _force, key) => ({ id: `side-${key}` }));
 			sideMocks.send.mockReset().mockResolvedValue(undefined);
 			const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -1438,10 +1439,11 @@ describe("side command routing", () => {
 			);
 			const results: unknown[] = [];
 			await act(async () => {
-				results.push(await sideMocks.workspaceSend!("/btw first", undefined, "submission-1"));
-				results.push(await sideMocks.workspaceSend!("/btw second", undefined, "submission-2"));
-				results.push(await sideMocks.workspaceSend!("/btw second", undefined, "submission-2"));
+				results.push(await sideMocks[send]!("/btw first", undefined, "submission-1"));
+				results.push(await sideMocks[send]!("/btw second", undefined, "submission-2"));
+				results.push(await sideMocks[send]!("/btw second", undefined, "submission-2"));
 			});
+			expect(conversationCommandState.send).not.toHaveBeenCalled();
 			// None went to the main transcript, so none moves its reader to the end.
 			expect(results).toEqual([sideMocks.sentOutsideTranscript, sideMocks.sentOutsideTranscript, sideMocks.sentOutsideTranscript]);
 			expect(sideMocks.create.mock.calls).toEqual([
@@ -1469,6 +1471,50 @@ describe("side command routing", () => {
 			);
 		},
 	);
+	it.each(["workspaceSend", "workspaceInterruptSend"] as const)("rejects side file annotations before dispatch through %s", async (send) => {
+		sideMocks.create.mockReset();
+		sideMocks.send.mockReset();
+		const reference: ChatFileReference = {
+			id: "file-reference", order: 1, sessionId: session.id, source: { kind: "workspace" },
+			path: "src/main.ts", side: "file", line: 1, endLine: 1, truncated: false,
+			lines: [{ kind: "context", oldNo: null, newNo: 1, text: "const answer = 42;" }],
+		};
+		render(<Wrapper client={new QueryClient()}><SessionChatSurface session={session} /></Wrapper>);
+		await act(async () => {
+			await expect(sideMocks[send]!("/btw explain this", undefined, "annotated-side", undefined, [reference]))
+				.rejects.toMatchObject({ code: "CHAT_FILE_REFERENCES_SIDE_UNSUPPORTED" });
+		});
+		expect(sideMocks.create).not.toHaveBeenCalled();
+		expect(sideMocks.send).not.toHaveBeenCalled();
+		expect(conversationCommandState.send).not.toHaveBeenCalled();
+	});
+
+	it.each(["create", "send"] as const)("does not interrupt the main task when side %s fails", async (operation) => {
+		sideMocks.create.mockReset().mockResolvedValue({ id: "side-interrupt" });
+		sideMocks.send.mockReset().mockResolvedValue(undefined);
+		const failure = new Error("side unavailable");
+		sideMocks[operation].mockRejectedValueOnce(failure);
+		render(<Wrapper client={new QueryClient()}><SessionChatSurface session={session} /></Wrapper>);
+		await act(async () => {
+			await expect(sideMocks.workspaceInterruptSend!("/btw explain this", undefined, "side-interrupt"))
+				.rejects.toBe(failure);
+		});
+		expect(conversationCommandState.send).not.toHaveBeenCalled();
+	});
+
+	it("keeps /btw as an interrupting provider command when side chats are disabled", async () => {
+		useUiStore.setState({ sideChats: false });
+		sideMocks.create.mockReset();
+		render(<Wrapper client={new QueryClient()}><SessionChatSurface session={session} /></Wrapper>);
+		await act(async () => {
+			await sideMocks.workspaceInterruptSend!("/btw explain this", undefined, "provider-interrupt");
+		});
+		expect(sideMocks.create).not.toHaveBeenCalled();
+		expect(conversationCommandState.send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+			text: "/btw explain this", clientMessageId: "provider-interrupt", interruptAndSend: true,
+		}));
+	});
+
 	it.each(["/side", "/side question"])("sends literal %s to the main agent even when side creation is available", async text => {
 		sideMocks.create.mockReset();
 		const mainSend=vi.fn().mockResolvedValue(undefined);

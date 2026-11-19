@@ -4510,6 +4510,10 @@ export function Timeline({
 		const protectedTurns = new Set(snapshot.turns.filter((entry) =>
 			entry.state === "failed" || entry.state === "interrupted" || entry.state === "cancelled" || entry.state === "recovered",
 		).map((entry) => entry.id));
+		// Displayed outcomes include unknown turns the daemon still records as running.
+		for (const group of placed) {
+			if (group.turnId && group.outcome && group.outcome.state !== "completed") protectedTurns.add(group.turnId);
+		}
 		let hiddenAutomationCount = 0;
 		const grouped = placed.flatMap((group) => {
 			const visibleItems = group.items.filter((item) => {
@@ -4521,7 +4525,7 @@ export function Timeline({
 			});
 			if (visibleItems.length === group.items.length) return [group];
 			if (!visibleItems.length && !group.live && !group.blocked && !group.plan && !group.diff &&
-				group.outcome?.state !== "failed" && group.outcome?.state !== "interrupted" && group.outcome?.state !== "recovered") return [];
+				(!group.outcome || group.outcome.state === "completed")) return [];
 			return [{ ...group, items: visibleItems }];
 		});
 		return { grouped, hiddenAutomationCount };
@@ -6430,7 +6434,7 @@ const TurnGroup = memo(function TurnGroup({
 			{group.plan ? <TurnPlan plan={group.plan} live={group.live} /> : null}
 			{/* Changed-files review is a settled result, not live activity. Keep it
 			    below the completed assistant response and its bottom action row. */}
-			{(group.diff || group.artifacts?.length) && group.outcome?.state === "completed" && copyableMessageId ? (
+			{(group.diff || group.artifacts?.length) && group.outcome?.state === "completed" && group.resultsEligible ? (
 				<TurnResults
 					diff={group.diff}
 					reportedArtifacts={group.artifacts}
@@ -6795,6 +6799,7 @@ function sameGroup(a: TimelineGroup, b: TimelineGroup): boolean {
 		a.live === b.live &&
 		a.liveStartupLabel === b.liveStartupLabel &&
 		a.rollbackable === b.rollbackable &&
+		a.resultsEligible === b.resultsEligible &&
 		sameContent(a.outcome, b.outcome) &&
 		sameContent(a.diff, b.diff) &&
 		sameContent(a.plan, b.plan) &&
@@ -6908,6 +6913,8 @@ type TimelineGroup = {
 	diff?: TurnDiff;
 	/** The session artifacts the turn created or edited, whatever wrote them. */
 	artifacts?: TurnArtifactChange[];
+	/** This turn has nonblank assistant prose; only its final segment owns results. */
+	resultsEligible?: boolean;
 	/** The agent's plan for this turn, when it made one. */
 	plan?: ConversationPlan;
 	/** The turn is still running, so its diff and plan can still change. */
@@ -7443,6 +7450,7 @@ function groupByTurn(snapshot: ConversationSnapshot, { controllerStopped = false
 		// off, are the useful parts.
 		group.diff = turn.diff;
 		group.artifacts = turn.artifacts;
+		group.resultsEligible = turnItems.some((item) => item.kind === "message" && item.role === "assistant" && item.text.trim() !== "");
 		// A later turn or run carries a newer copy of a list that spans turns.
 		group.plan = turn.plan?.steps.length && !turn.plan.superseded ? turn.plan : undefined;
 		const orphaned = controllerStopped && turn.state === "running";
@@ -7490,11 +7498,13 @@ function groupByTurn(snapshot: ConversationSnapshot, { controllerStopped = false
 	return groups.flatMap((group) =>
 		splitAtSteers(group)
 			.map((segment) => withSubagentSteps(segment, conversation))
-			// A part made only of steps that moved under a launch elsewhere has nothing
-			// left to draw. A live one keeps its Working row, and one whose turn did not
-			// simply complete keeps how it ended: a failure must not vanish with its steps.
+			// Drop child-only parts unless they still draw live state, an outcome, a plan,
+			// results or the tool-only rollback action. Those belong to the final segment.
 			.filter((segment) =>
 				segment.live
+				|| segment.plan
+				|| segment.rollbackable
+				|| (segment.resultsEligible && segment.outcome?.state === "completed" && (segment.diff?.files.length || segment.artifacts?.length))
 				|| (segment.outcome !== undefined && segment.outcome.state !== "completed")
 				|| segment.items.some((item) => !conversation.stepIds.has(item.id))),
 	);

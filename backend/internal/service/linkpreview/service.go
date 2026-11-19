@@ -12,7 +12,9 @@ import (
 	"io"
 	"log"
 	"mime"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"runtime/debug"
 	"strings"
@@ -109,11 +111,28 @@ type Service struct {
 	flight singleflight.Group
 }
 
-// New returns a Service. A nil client gets the default: a short timeout, a
-// redirect limit, and the standard transport.
+// New returns a Service. A nil client gets a short timeout, a redirect limit,
+// and a public-only transport. An injected client owns its transport policy.
 func New(client *http.Client) *Service {
 	if client == nil {
+		dialer := publicDialer{
+			lookup: net.DefaultResolver.LookupNetIP,
+			dial:   (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		}
 		client = &http.Client{
+			// Use standard transport defaults without inheriting mutable global
+			// proxy, TLS, or dial hooks that could bypass destination validation.
+			Transport: &http.Transport{
+				// ponytail: Direct connections only; proxy support needs pinned
+				// destination enforcement at the proxy, not just proxy validation.
+				Proxy:                 nil,
+				DialContext:           dialer.dialContext,
+				ForceAttemptHTTP2:     true,
+				MaxIdleConns:          100,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: time.Second,
+			},
 			Timeout: fetchTimeout,
 			CheckRedirect: func(_ *http.Request, via []*http.Request) error {
 				if len(via) >= maxRedirects {
@@ -129,6 +148,104 @@ func New(client *http.Client) *Service {
 		now:          time.Now,
 		entries:      map[string]cacheEntry{},
 	}
+}
+
+// publicDialer keeps DNS validation and connection establishment together.
+// The two function fields let tests exercise the transport without real DNS/TCP.
+type publicDialer struct {
+	lookup func(context.Context, string, string) ([]netip.Addr, error)
+	dial   func(context.Context, string, string) (net.Conn, error)
+}
+
+func (d publicDialer) dialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	// Transport can detach dials from the request deadline. Bound DNS and all
+	// fallback attempts together, not just each individual TCP connection.
+	ctx, cancel := context.WithTimeout(ctx, fetchTimeout)
+	defer cancel()
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	var addresses []netip.Addr
+	if ip, parseErr := netip.ParseAddr(host); parseErr == nil {
+		addresses = []netip.Addr{ip}
+	} else {
+		addresses, err = d.lookup(ctx, "ip", host)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if len(addresses) == 0 {
+		return nil, errors.New("linkpreview: destination has no addresses")
+	}
+	// Reject the whole answer set before dialing, not just the chosen address.
+	for _, ip := range addresses {
+		if !isPublicAddress(ip) {
+			return nil, errors.New("linkpreview: destination is not public")
+		}
+	}
+	deadline, _ := ctx.Deadline() // WithTimeout above always supplies a deadline.
+	for i, ip := range addresses {
+		// Share the remaining budget so one unreachable address cannot prevent
+		// fallback to the other validated addresses.
+		attempt, cancelAttempt := context.WithTimeout(ctx, time.Until(deadline)/time.Duration(len(addresses)-i))
+		// Never pass the hostname to DialContext: a second lookup could rebind
+		// it to an address that was not validated. TLS still uses the URL host.
+		conn, dialErr := d.dial(attempt, network, net.JoinHostPort(ip.Unmap().String(), port))
+		cancelAttempt()
+		if dialErr == nil {
+			return conn, nil
+		}
+		err = dialErr
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+	return nil, err
+}
+
+// IsGlobalUnicast includes private and special-purpose space. Exclude special
+// ranges too, including IPv6 transition mechanisms that can embed private IPv4.
+// ponytail: Deny special blocks conservatively, including public exceptions;
+// add narrow exceptions only when a preview needs a verified public service.
+var nonPublicPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.88.99.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("2001::/23"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("3ffe::/16"),
+	netip.MustParsePrefix("3fff::/20"),
+}
+
+var publicIPv6Prefix = netip.MustParsePrefix("2000::/3")
+
+func isPublicAddress(ip netip.Addr) bool {
+	if ip.Zone() != "" {
+		return false
+	}
+	ip = ip.Unmap()
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		return false
+	}
+	// ponytail: Native IPv6 global unicast only; review new allocations before
+	// extending this boundary. Translation/local-use prefixes stay blocked.
+	if ip.Is6() && !publicIPv6Prefix.Contains(ip) {
+		return false
+	}
+	for _, prefix := range nonPublicPrefixes {
+		if prefix.Contains(ip) {
+			return false
+		}
+	}
+	return true
 }
 
 // Preview returns the cached or freshly fetched metadata for rawURL. rawURL
