@@ -7362,18 +7362,13 @@ function openingTurnSettled(snapshot: ConversationSnapshot, controllerStopped: b
  * Group items by the turn that produced them, so a completed turn can be closed
  * off with its outcome.
  *
- * A turn is one block, even when its items are not contiguous in sequence. That
- * matters because of the send queue: a message typed mid-turn is recorded
- * immediately, so its sequence lands before the answers to everything ahead of
- * it. Reading strictly by sequence would stack every queued question at the top
- * and every answer below, separating each question from its own reply.
+ * Queued prompts do not split turns: each prompt stays with its reply instead of
+ * stacking every queued question above every answer. Within a segment, items
+ * stay in sequence order and the turn's anchor decides the segment's position.
  *
- * Sequence still decides order — a turn takes the position of its first item, and
- * items inside a turn stay in sequence order. Nothing is re-derived: this is the
- * daemon's ordering, grouped.
- *
- * Items with no turn (an automation relay that arrived between turns) form their
- * own group and keep their sequence position.
+ * Turnless items form their own group and split a turn into continuation segments.
+ * Later output stays after them, even when its prompt was queued earlier.
+ * Only the final segment owns the turn's outcome, live indicator and plan.
  *
  * With the controller really stopped, a turn the daemon still holds as running is
  * not live: nothing is working on it. It settles with an unknown outcome instead
@@ -7385,10 +7380,13 @@ function groupByTurn(snapshot: ConversationSnapshot, { controllerStopped = false
 	const byTurn = new Map(snapshot.turns.map((turn) => [turn.id, turn]));
 	const groups: TimelineGroup[] = [];
 	const groupForTurn = new Map<string, TimelineGroup>();
+	const itemsForTurn = new Map<string, ConversationItem[]>();
+	let looseSequence = -Infinity;
 
 	for (const item of snapshot.items) {
 		const turnId = carriedInto.get(item) ?? item.turnId;
 		if (turnId === undefined) {
+			looseSequence = item.sequence;
 			// Consecutive turn-less items share one group rather than getting one each.
 			// A provider can run a turn AO never dispatched — a compaction, or a turn
 			// resumed inside the provider's own history — and every item it emits then
@@ -7409,17 +7407,23 @@ function groupByTurn(snapshot: ConversationSnapshot, { controllerStopped = false
 			});
 			continue;
 		}
+		const turnItems = itemsForTurn.get(turnId);
+		if (turnItems) turnItems.push(item);
+		else itemsForTurn.set(turnId, [item]);
 		const existing = groupForTurn.get(turnId);
-		if (existing) {
+		if (existing && existing.items.at(-1)!.sequence > looseSequence) {
 			existing.items.push(item);
 			continue;
 		}
+		// Background output has no prompt owner. Do not pull a later reply above
+		// it just because that reply's prompt was queued earlier.
+		const anchor = byTurn.get(turnId)?.anchorSequence ?? item.sequence;
 		const group: TimelineGroup = {
 			// A turn opened by a keyed human message keeps the key its echo had.
-			key: itemKey(item) === item.id ? byTurn.get(turnId)?.groupKey ?? `${turnId}-${item.sequence}` : itemKey(item),
+			key: existing ? `${turnId}:after:${looseSequence}` : itemKey(item) === item.id ? byTurn.get(turnId)?.groupKey ?? `${turnId}-${item.sequence}` : itemKey(item),
 			turnId,
-			// A turn that began above the loaded history sorts where it began.
-			anchor: byTurn.get(turnId)?.anchorSequence ?? item.sequence,
+			// A partial-history anchor must not pull an answer across loose output.
+			anchor: existing || anchor < looseSequence ? item.sequence : anchor,
 			items: [item],
 		};
 		groupForTurn.set(turnId, group);
@@ -7429,9 +7433,11 @@ function groupByTurn(snapshot: ConversationSnapshot, { controllerStopped = false
 	groups.sort((a, b) => a.anchor - b.anchor);
 
 	for (const group of groups) {
-		if (!group.turnId) continue;
+		// The final segment owns the turn's outcome, live indicator and plan.
+		if (!group.turnId || groupForTurn.get(group.turnId) !== group) continue;
 		const turn = byTurn.get(group.turnId);
 		if (!turn) continue;
+		const turnItems = itemsForTurn.get(group.turnId)!;
 		// The diff and the plan are attached whether or not the turn has finished: a
 		// running turn's changed-file list growing, and its checklist ticking itself
 		// off, are the useful parts.
@@ -7442,13 +7448,13 @@ function groupByTurn(snapshot: ConversationSnapshot, { controllerStopped = false
 		const orphaned = controllerStopped && turn.state === "running";
 		group.live = turn.state === "running" && !orphaned;
 		group.liveStartedAt = turn.startedAt ?? turn.requestedAt;
-		group.blocked = group.items.some(
+		group.blocked = turnItems.some(
 			(item) =>
 				item.kind === "activity" &&
 				(item.activityKind === "approval" || item.activityKind === "user_input") &&
 				item.status === "pending",
 		);
-		group.liveProviderFailure = [...group.items]
+		group.liveProviderFailure = [...turnItems]
 			.reverse()
 			.find(
 				(item): item is ConversationActivity =>
@@ -7463,7 +7469,7 @@ function groupByTurn(snapshot: ConversationSnapshot, { controllerStopped = false
 		}
 		if (turn.state === "running" || turn.state === "queued" || turn.state === "cancelled") continue;
 		group.rollbackable = Boolean(turn.providerTurnId);
-		group.accountSwitched = group.items.some((item) => item.kind === "activity" && item.detail?.event === "account.switched");
+		group.accountSwitched = turnItems.some((item) => item.kind === "activity" && item.detail?.event === "account.switched");
 		group.outcome = {
 			state: turn.notRun ? "not_run" : turn.state,
 			usageLimit: turn.usageLimit,
@@ -7471,7 +7477,7 @@ function groupByTurn(snapshot: ConversationSnapshot, { controllerStopped = false
 			// queued one a Stop or a switch ended before it was sent.
 			durationMs: turn.notRun || (turn.state === "interrupted" && !turn.startedAt) ? undefined : settledTurnDuration(turn),
 			error: turn.errorMessage || (turn.state === "failed"
-				? [...group.items].reverse().find(
+				? [...turnItems].reverse().find(
 					(item): item is ConversationActivity => item.kind === "activity" && item.activityKind === "error",
 				)?.summary
 				: undefined),
@@ -7522,7 +7528,8 @@ function subagentsOfConversation(items: ConversationItem[], groups: readonly Tim
 	if (launches.length === 0) return undefined;
 	const { steps } = partitionSubagentSteps(items);
 	const stepIds = new Set([...steps.values()].flat().map((step) => step.id));
-	const liveItems = new Set(groups.flatMap((group) => (group.live ? group.items.map((item) => item.id) : [])));
+	const liveTurns = new Set(groups.filter((group) => group.live && group.turnId).map((group) => group.turnId));
+	const liveItems = new Set(groups.flatMap((group) => (group.live || liveTurns.has(group.turnId) ? group.items.map((item) => item.id) : [])));
 	const live = new Set(
 		launches
 			.filter((launch) => liveItems.has(launch.id) || steps.get(launch.id)?.some((step) => liveItems.has(step.id)))

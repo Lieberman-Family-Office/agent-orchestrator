@@ -51,6 +51,39 @@ func TestAssistantDeltaKeepsTerminalTurnSettled(t *testing.T) {
 	}
 }
 
+func TestTurnlessMessageCompletionPreservesDurableText(t *testing.T) {
+	s, session, conversation := conversationFixture(t)
+	ctx := context.Background()
+	if err := s.AppendAssistantDelta(ctx, conversation, "background", "", "background reply", "message", histClock); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AdoptProviderTurn(ctx, conversation, session, "gen-1", "next", "next-provider", histClock); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendAssistantDelta(ctx, conversation, "next-reply", "next-provider", "still working", "next-message", histClock); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SettleAssistantMessage(ctx, conversation, "background", "", "", "unused", histClock.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := s.LoadConversationSnapshot(ctx, conversation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Messages) != 2 {
+		t.Fatalf("expected two messages, got %+v", snapshot.Messages)
+	}
+	for _, message := range snapshot.Messages {
+		if message.ProviderItemID == "background" {
+			if message.Streaming || message.TurnID != "" || message.Text != "background reply" {
+				t.Errorf("background completion changed ownership or text: %+v", message)
+			}
+		} else if !message.Streaming || message.TurnID != "next" {
+			t.Errorf("background completion settled the next prompt: %+v", message)
+		}
+	}
+}
+
 func TestAssistantDeltaStillStreamsActiveAndUnboundTurns(t *testing.T) {
 	for _, providerTurn := range []string{"running", "unknown", ""} {
 		t.Run("turn="+providerTurn, func(t *testing.T) {

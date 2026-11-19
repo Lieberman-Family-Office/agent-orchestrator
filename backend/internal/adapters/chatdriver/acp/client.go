@@ -841,6 +841,11 @@ func (c *conversation) handleClaudeSDKMessage(params json.RawMessage) error {
 	if loadingHistory {
 		return nil
 	}
+	c.updateMu.Lock()
+	defer c.updateMu.Unlock()
+	if status == domain.ThreadStatusIdle {
+		c.settleBackgroundMessages()
+	}
 	event := ports.ChatEvent{Kind: ports.ChatEventProviderState, ThreadState: &ports.ChatThreadState{Status: status}}
 	if eventID := stableACPEventID(payload.Meta); eventID != "" {
 		event.ProviderEventID = eventID + ":0"
@@ -852,6 +857,8 @@ func (c *conversation) handleClaudeSDKMessage(params json.RawMessage) error {
 // processUpdate runs the full ACP -> AO normalization for one update: live
 // notifications and replayed updates during the post-load drain.
 func (c *conversation) processUpdate(params acpsdk.SessionNotification) error {
+	c.updateMu.Lock()
+	defer c.updateMu.Unlock()
 	if c.prepareHistoryUpdate(params.Update) {
 		return nil
 	}
@@ -906,6 +913,27 @@ func (c *conversation) processUpdate(params acpsdk.SessionNotification) error {
 		}
 		id := c.providerItemID(segmentedMessageID(update.AgentMessageChunk.MessageId, "assistant", turnID, segment))
 		if delta := contentText(update.AgentMessageChunk.Content); delta != "" {
+			if turnID == "" && parentID == "" {
+				c.mu.Lock()
+				if c.backgroundMessages == nil {
+					c.backgroundMessages = make(map[string]struct{})
+				}
+				if update.AgentMessageChunk.MessageId == nil || *update.AgentMessageChunk.MessageId == "" {
+					if c.backgroundMessageID == "" {
+						seed := sourceID
+						if seed == "" {
+							// ponytail: no replay identity exists; native message IDs remain authoritative when supplied.
+							seed = uuid.NewString()
+						}
+						c.backgroundMessageID = c.providerItemID("background-" + seed)
+					}
+					id = c.backgroundMessageID
+				}
+				c.backgroundMessages[id] = struct{}{}
+				c.mu.Unlock()
+				emit(ports.ChatEvent{Kind: ports.ChatEventMessageDelta, ProviderItemID: id, Delta: delta})
+				break
+			}
 			if parentID != "" {
 				c.mu.Lock()
 				item, existed := c.nestedMessages[id]
