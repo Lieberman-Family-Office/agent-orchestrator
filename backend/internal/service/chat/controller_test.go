@@ -7296,13 +7296,10 @@ func TestInterruptAndSendPrioritizesNewPromptAndPreservesQueue(t *testing.T) {
 		t.Fatalf("duplicate while cancellation pending: err=%v attempts=%d", err, conv.attemptCount())
 	}
 	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: first.ProviderTurnID, TurnState: domain.TurnStateInterrupted})
+	// Queue claims become running before dispatch binds the provider ID used below.
 	snapshot := h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
-		for _, turn := range s.Turns {
-			if turn.ID == accepted.ID && turn.State == domain.TurnStateRunning {
-				return true
-			}
-		}
-		return false
+		turn, _ := turnByID(s, accepted.ID)
+		return turn.State == domain.TurnStateRunning && turn.ProviderTurnID != ""
 	})
 	old, _ := turnByID(snapshot, queued.ID)
 	if old.State != domain.TurnStateQueued || !reflect.DeepEqual(conv.sentTexts(), []string{"running", "new interrupt prompt"}) {
@@ -7315,7 +7312,7 @@ func TestInterruptAndSendPrioritizesNewPromptAndPreservesQueue(t *testing.T) {
 	conv.emit(ports.ChatEvent{Kind: ports.ChatEventTurnCompleted, ProviderTurnID: active.ProviderTurnID, TurnState: domain.TurnStateCompleted})
 	h.awaitSnapshot(t, func(s store.ConversationSnapshot) bool {
 		old, _ := turnByID(s, queued.ID)
-		return old.State == domain.TurnStateRunning
+		return old.State == domain.TurnStateRunning && old.ProviderTurnID != ""
 	})
 	if !reflect.DeepEqual(conv.sentTexts(), []string{"running", "new interrupt prompt", "older queue"}) {
 		t.Fatalf("older queue not preserved in order: %v", conv.sentTexts())
