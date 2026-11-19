@@ -4486,10 +4486,9 @@ describe("ChatWorkspace timeline", () => {
 		).not.toBeNull();
 	});
 
-	it("keeps a turn as one block, positioned by its first item", () => {
-		// The fixture's automation relay carries sequence 8, in the middle of turn-2's
-		// items. Reading strictly by sequence would split turn-2 around it; the rule is
-		// that a turn takes the position of its first item and stays contiguous.
+	it("keeps a turnless relay between the prompt and its later reply", () => {
+		// The relay at sequence 8 follows the prompt at 7 and precedes the reply at 12.
+		// Later turn output must not pull that relay below the reply.
 		render(<ChatWorkspace snapshot={chatFixture} />);
 		const log = screen.getByRole("log");
 		const text = log.textContent ?? "";
@@ -4498,12 +4497,36 @@ describe("ChatWorkspace timeline", () => {
 		const relay = text.indexOf("Checks failed on the base branch");
 
 		expect(question).toBeGreaterThan(-1);
-		expect(answer).toBeGreaterThan(question);
-		expect(relay).toBeGreaterThan(answer);
+		expect(relay).toBeGreaterThan(question);
+		expect(answer).toBeGreaterThan(relay);
 
 		const relayCard = screen.getByText(/Checks failed on the base branch/).closest(".cursor-chat-origin-message");
 		expect(relayCard).toHaveClass("border-l-logo-accent/60");
 		expect(relayCard?.querySelector("svg")).toHaveClass("text-logo-accent");
+	});
+
+	it("keeps queued prompts with their replies when no turnless item intervenes", () => {
+		const message = (id: string, turnId: string, sequence: number, role: "user" | "assistant"): ConversationMessage => ({
+			...humanMessage(id), id, turnId, sequence, role,
+			origin: role === "user" ? "human" : "provider",
+		});
+		const snapshot: ConversationSnapshot = {
+			...chatFixtureEmpty,
+			controller: { state: "ready" },
+			turns: ["first", "second"].map((id) => ({ id, state: "completed", requestedAt: "2026-08-08T00:00:00Z" })),
+			items: [
+				message("First question", "first", 1, "user"),
+				message("Second question", "second", 2, "user"),
+				message("First answer", "first", 3, "assistant"),
+				message("Second answer", "second", 4, "assistant"),
+			],
+		};
+		render(<ChatWorkspace snapshot={snapshot} />);
+		const text = screen.getByRole("log").textContent ?? "";
+		expect(text.indexOf("First question")).toBeGreaterThan(-1);
+		expect(text.indexOf("First answer")).toBeGreaterThan(text.indexOf("First question"));
+		expect(text.indexOf("Second question")).toBeGreaterThan(text.indexOf("First answer"));
+		expect(text.indexOf("Second answer")).toBeGreaterThan(text.indexOf("Second question"));
 	});
 
 	it("offers Jump to latest only once the reader has scrolled away from the bottom", async () => {

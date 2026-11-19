@@ -7362,18 +7362,13 @@ function openingTurnSettled(snapshot: ConversationSnapshot, controllerStopped: b
  * Group items by the turn that produced them, so a completed turn can be closed
  * off with its outcome.
  *
- * A turn is one block, even when its items are not contiguous in sequence. That
- * matters because of the send queue: a message typed mid-turn is recorded
- * immediately, so its sequence lands before the answers to everything ahead of
- * it. Reading strictly by sequence would stack every queued question at the top
- * and every answer below, separating each question from its own reply.
+ * Queued prompts do not split turns: each prompt stays with its reply instead of
+ * stacking every queued question above every answer. Within a segment, items
+ * stay in sequence order and the turn's anchor decides the segment's position.
  *
- * Sequence still decides order — a turn takes the position of its first item, and
- * items inside a turn stay in sequence order. Nothing is re-derived: this is the
- * daemon's ordering, grouped.
- *
- * Items with no turn (an automation relay that arrived between turns) form their
- * own group and keep their sequence position.
+ * Turnless items form their own group and split a turn into continuation segments.
+ * Later output stays after them, even when its prompt was queued earlier.
+ * Only the final segment owns the turn's outcome, live indicator and plan.
  *
  * With the controller really stopped, a turn the daemon still holds as running is
  * not live: nothing is working on it. It settles with an unknown outcome instead
