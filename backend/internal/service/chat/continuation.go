@@ -136,6 +136,7 @@ func stoppedContinuationContext(rows ConversationRows) string {
 	// through continuation/provider-started turns to their dispatched request.
 	// Promoted sources are absent from Turns, even when their messages remain.
 	var original domain.ConversationMessage
+	var request string
 	var saved continuationContext
 	var acceptedAt time.Time
 	var acceptedSequence int64
@@ -180,14 +181,15 @@ func stoppedContinuationContext(rows ConversationRows) string {
 			}
 			// A queued Continue can run after unrelated work. Its accepted context,
 			// not its new execution neighbor, identifies the task it continues.
-			message.Text = saved.OriginalRequest
+			request = saved.OriginalRequest
 		} else {
+			request = message.Text
 			for _, delivery := range rows.BatchedDeliveries {
 				if delivery.DeliveredWithTurnID == turn.ID && delivery.SteerActivityID == "" {
 					if turn.ProviderInputText == "" {
 						return "" // Do not silently omit part of the dispatched batch.
 					}
-					message.Text = turn.ProviderInputText
+					request = turn.ProviderInputText
 					break
 				}
 			}
@@ -264,7 +266,6 @@ func stoppedContinuationContext(rows ConversationRows) string {
 		}
 	}
 
-	request := original.Text
 	requestTruncated := saved.RequestTruncated || len(request) > continuationTextBudget
 	if len(request) > continuationTextBudget && !saved.RequestTruncated {
 		request = truncateUTF8Head(request, continuationTextBudget/2) +
