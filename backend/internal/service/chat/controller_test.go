@@ -6502,7 +6502,10 @@ func TestServiceLiveReconnectKeepsDurableRunningTurnBusy(t *testing.T) {
 		fakeConversation: newFakeConversation(),
 	}}
 	second := chatsvc.New(chatsvc.Options{
-		Store: st, Reader: reader, Sessions: st,
+		Store: st, Sessions: st,
+		Reader: chatsvc.SnapshotReaderFunc(func(context.Context, string) (chatsvc.ConversationRows, error) {
+			return chatsvc.ConversationRows{}, errors.New("full history is unavailable during reconnect")
+		}),
 		Drivers: fakeRegistry{driver: fakeDriver{conv: secondProvider}},
 		Log:     slog.New(slog.DiscardHandler), NewID: newID,
 	})
