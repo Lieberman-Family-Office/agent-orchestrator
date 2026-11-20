@@ -964,16 +964,18 @@ func (s *Service) startLocked(ctx context.Context, cfg StartConfig) (*Controller
 			return nil, err
 		}
 	}
-	var liveRows ConversationRows
+	var liveTurns []domain.ConversationTurn
 	if liveReconnect {
-		if s.reader == nil {
-			_ = cleanupUnpublishedConversation(conv, false)
-			return nil, fmt.Errorf("%w: durable conversation snapshot is unavailable", ports.ErrChatRecoveryInconclusive)
+		// Reattachment needs turn ownership, not message or activity payloads.
+		liveTurns, err = s.store.ConversationTurns(ctx, conversation.ID)
+		if err == nil {
+			var rows ConversationRows
+			rows, err = s.nativeReplayRows(ctx, activeBranch, ConversationRows{Turns: liveTurns})
+			liveTurns = rows.Turns
 		}
-		liveRows, err = s.reader.LoadConversationSnapshot(ctx, conversation.ID)
 		if err != nil {
 			_ = cleanupUnpublishedConversation(conv, false)
-			return nil, fmt.Errorf("%w: load live conversation before reconnect: %w", ports.ErrChatRecoveryInconclusive, err)
+			return nil, fmt.Errorf("%w: load live turns before reconnect: %w", ports.ErrChatRecoveryInconclusive, err)
 		}
 	}
 	if owner.Kind == domain.ConversationOwnerReview && !liveReconnect {
@@ -1026,7 +1028,7 @@ func (s *Service) startLocked(ctx context.Context, cfg StartConfig) (*Controller
 		// A provider may have accepted a prompt before its ID could be bound.
 		// Its replayed events will be adopted separately; leave bound live work
 		// and queued intake intact while closing the unbound visible spinner.
-		for _, turn := range liveRows.Turns {
+		for _, turn := range liveTurns {
 			if turn.State != domain.TurnStateRunning || turn.ProviderTurnID != "" || turn.RolledBackAt != nil {
 				continue
 			}
@@ -1084,7 +1086,7 @@ func (s *Service) startLocked(ctx context.Context, cfg StartConfig) (*Controller
 			_ = cleanupUnpublishedConversation(conv, false)
 			return nil, fmt.Errorf("settle uncertain queued batch: %w", err)
 		}
-		providerTurnID := controller.restoreLiveTurnOwnership(liveRows.Turns)
+		providerTurnID := controller.restoreLiveTurnOwnership(liveTurns)
 		if activator, ok := conv.(ports.ChatLiveReconnectActivator); ok {
 			if err := activator.ActivateLiveReconnect(ctx, providerTurnID); err != nil {
 				_ = cleanupUnpublishedConversation(conv, false)
