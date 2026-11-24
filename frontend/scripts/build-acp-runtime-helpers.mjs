@@ -407,7 +407,7 @@ function aoObserveBackgroundTasks(session, message) {
 			record = { id: message.task_id, runId: message.run_id, observedAt: now, startedAt: new Date(now).toISOString() };
 			known.set(message.task_id, record);
 		}
-		if (record && (!message.run_id || !record.runId || record.runId === message.run_id)) {
+		if (!message.run_id || !record.runId || record.runId === message.run_id) {
 			record.ambient ||= message.ambient === true || message.skip_transcript === true;
 			if (record.ambient) live.delete(record.id);
 		}
