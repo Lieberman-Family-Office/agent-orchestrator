@@ -20,6 +20,7 @@ import {
 	patchClaudeFoldedPromptSettlement,
 	patchClaudeHibernationCheck,
 	patchClaudeQueuedStop,
+	patchClaudeBackgroundTasks,
 	patchClaudeRetryDetails,
 	patchClaudeStaleIdleDebt,
 	patchClaudeSteerSettlement,
@@ -98,6 +99,7 @@ patchClaudeContextWindowProbe(claudeAdapter);
 patchClaudeHibernationCheck(claudeAdapter);
 patchClaudeWorkerSteering(claudeAdapter);
 patchClaudeQueuedStop(join(outDir, "node_modules", "@anthropic-ai", "claude-agent-sdk", "sdk.mjs"));
+patchClaudeBackgroundTasks(claudeAdapter);
 patchClaudeFoldedPromptSettlement(claudeAdapter);
 patchClaudeStaleIdleDebt(claudeAdapter);
 patchClaudeSteerSettlement(claudeAdapter);

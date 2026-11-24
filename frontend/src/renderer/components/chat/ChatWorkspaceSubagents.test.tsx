@@ -376,6 +376,13 @@ describe("ChatWorkspace subagents", () => {
 		expect(screen.queryAllByRole("region", { name: "Agent plan" })).toHaveLength(hasControls ? 1 : 0);
 		expect(screen.queryAllByRole("button", { name: "Roll back to here" })).toHaveLength(hasControls ? 1 : 0);
 
+		// An unfinished earlier reply must not qualify results on the final segment.
+		rerender(<ChatWorkspace snapshot={{
+			...splitSnapshot,
+			items: splitSnapshot.items.map((item) => item === assistant ? { ...item, streaming: true } : item),
+		}} onRollback={onRollback} />);
+		expect(screen.queryByText("1 File Changed")).not.toBeInTheDocument();
+
 		// Only earlier prose changes; the final segment must not reuse stale eligibility.
 		rerender(<ChatWorkspace snapshot={{
 			...splitSnapshot,

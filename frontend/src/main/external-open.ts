@@ -1,3 +1,4 @@
+import { AoError } from "../../../packages/shared/telemetry/ao-error";
 import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { PRIVACY_PANE_URLS } from "./privacy-guide";
@@ -23,7 +24,7 @@ export function isAllowedAppExternalURL(rawUrl: string): boolean {
 
 export async function openAllowedAppExternalURL(rawUrl: string, opener: ExternalOpener): Promise<void> {
 	if (!isAllowedAppExternalURL(rawUrl)) {
-		throw new Error("Unsupported external URL");
+		throw new AoError("EXTERNAL_URL_UNSUPPORTED", "Unsupported external URL");
 	}
 	await opener.openExternal(rawUrl);
 }
@@ -34,11 +35,11 @@ export async function openSessionFileInDefaultApp(
 	resolveRoot:(sessionId:string,source:"workspace"|"artifact")=>Promise<string>,
 	opener:{openPath:(file:string)=>Promise<string>},
 ):Promise<void> {
-	if(typeof sessionId!=="string" || !sessionId || typeof reference!=="string" || !reference || reference.includes("\0") || (source!=="workspace" && source!=="artifact")) throw new Error("Invalid session file request");
+	if(typeof sessionId!=="string" || !sessionId || typeof reference!=="string" || !reference || reference.includes("\0") || (source!=="workspace" && source!=="artifact")) throw new AoError("SESSION_FILE_INVALID_REQUEST", "Invalid session file request");
 	const root=await realpath(await resolveRoot(sessionId,source));
 	const target=await realpath(path.resolve(root,reference));
 	const relative=path.relative(root,target);
-	if(!relative || relative===".." || relative.startsWith(".."+path.sep) || path.isAbsolute(relative) || !(await stat(target)).isFile()) throw new Error("File is outside the session root or is not a regular file");
+	if(!relative || relative===".." || relative.startsWith(".."+path.sep) || path.isAbsolute(relative) || !(await stat(target)).isFile()) throw new AoError("SESSION_FILE_OUTSIDE_ROOT", "File is outside the session root or is not a regular file");
 	const error=await opener.openPath(target);
-	if(error) throw new Error(error);
+	if(error) throw new AoError("SESSION_FILE_OPEN_FAILED", error);
 }
