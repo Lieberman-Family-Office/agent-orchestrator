@@ -20,6 +20,7 @@ def _deliver(name, payload):
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError):
+        # Hook delivery is best-effort; failure must not interrupt Tau's lifecycle.
         pass
 
 
