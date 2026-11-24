@@ -228,7 +228,7 @@ func repairTimestampBatchMode(ctx context.Context, db *sql.DB, columns []timesta
 		}
 		defer func() { _, _ = tx.ExecContext(context.Background(), "ROLLBACK") }()
 		query := strings.Join([]string{"UPDATE", table, "SET", strings.Join(sets, ","), "WHERE rowid=? AND", strings.Join(checks, " AND ")}, " ")
-		if columns[0].table == "sessions" {
+		if columns[0].table == "sessions" || columns[0].table == "projects" {
 			query += " RETURNING revision"
 		}
 		stmt, err := tx.PrepareContext(ctx, query)
@@ -376,16 +376,28 @@ func preserveRejectedTimestamp(err error) bool {
 	return errors.As(err, &constraint) && constraint.Code() == 275 // SQLITE_CONSTRAINT_CHECK
 }
 
-// applyTimestampUpdate counts only direct writes and the session revision
-// compensation. Collision handling is reserved for the constraint fallback.
+// applyTimestampUpdate counts direct writes, session revision compensation,
+// and the guarded project revision increment. Other trigger writes still fail.
 func applyTimestampUpdate(ctx context.Context, tx *sql.Conn, stmt *sql.Stmt, columns []timestampColumn, values []any) (int64, bool, error) {
-	if columns[0].table == "sessions" {
+	if columns[0].table == "sessions" || columns[0].table == "projects" {
 		var revision int64
 		if err := stmt.QueryRowContext(ctx, values...).Scan(&revision); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return 0, false, nil
 			}
 			return 0, false, err
+		}
+		if columns[0].table == "projects" {
+			// RETURNING precedes the AFTER trigger. Project revisions cannot be
+			// restored: their guard forbids resets. Verify its one extra write.
+			var current int64
+			if err := tx.QueryRowContext(ctx, `SELECT revision FROM projects WHERE rowid=?`, values[len(columns)]).Scan(&current); err != nil {
+				return 0, false, err
+			}
+			if revision == math.MaxInt64 || current != revision+1 {
+				return 0, false, fmt.Errorf("project timestamp repair revision: got %d, want one increment from %d", current, revision)
+			}
+			return 2, true, nil
 		}
 		result, err := tx.ExecContext(ctx, `UPDATE sessions SET revision=? WHERE rowid=? AND revision<>?`, revision, values[len(columns)], revision)
 		if err != nil {
