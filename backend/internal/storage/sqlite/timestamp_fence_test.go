@@ -98,7 +98,7 @@ func TestTimestampRepairTriggerInventory(t *testing.T) {
 		}
 	}
 	// Every trigger on a repaired table must be reviewed for representation-only
-	// updates. CDC is removed transactionally; only sessions changes revision.
+	// updates. CDC is removed transactionally; sessions and projects change revision.
 	rows, err := db.Query(`SELECT name,sql FROM sqlite_master WHERE type='trigger'
  AND tbl_name IN (SELECT m.name FROM sqlite_master m,pragma_table_info(m.name) p
  WHERE m.type='table' AND upper(p.type) IN ('TIMESTAMP','DATETIME','DATE')) ORDER BY name`)
@@ -120,7 +120,9 @@ func TestTimestampRepairTriggerInventory(t *testing.T) {
 	// review_run_worker_notice_pending only fires on status updates. Timestamp
 	// repair preserves notice state (TestTimestampRepairPreservesReviewDoneNotices).
 	// pr_cdc_update also watches the merge queue columns, which repair never writes.
-	const reviewed = "8334d7f191681c65126ad44e76801d29b30c1900e266f3fd58d9680f67e06761"
+	// Fork project guards add one verified revision write per repaired project.
+	// TestRepairProjectRevisionWritesRemainGuarded covers that write and rejects extras.
+	const reviewed = "083bb4da1cc86d43a62f38d0194ca33c46b3b1e66eb289dbbcae02d036e1f8e9"
 	if got := fmt.Sprintf("%x", hash.Sum(nil)); got != reviewed {
 		t.Fatalf("timestamp trigger inventory changed; review preservation logic before updating fingerprint: %s", got)
 	}
