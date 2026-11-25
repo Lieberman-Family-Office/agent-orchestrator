@@ -13,6 +13,10 @@ import { agentReadinessQueryKey } from "../../hooks/useAgentReadinessQuery";
 import type { AgentSwitchProps } from "./AgentSwitchPicker";
 import { useConversationConfigOptions, useConversationModels, useConversationSkills } from "../../hooks/useConversation";
 
+// Background-task queries have their own hook/component and browser coverage.
+// Keep model-picker API fixtures scoped to the model-picker behavior here.
+vi.mock("../BackgroundTasks", () => ({ SessionBackgroundTasks: () => null }));
+
 const LINK = "http://localhost:5173";
 const REPORT_LINK = "reports/new-report.html";
 
@@ -94,9 +98,13 @@ const sideMocks = vi.hoisted(() => ({
 	show: vi.fn(),
 	addReference: vi.fn(),
 	sides: [] as { id: string; hasWork: boolean }[],
+	loaded: false,
+	pending: false,
 	activeId: "existing-side" as string | undefined,
 	attach: undefined as undefined | ((excerpt: ChatDraftExcerptReference) => Promise<void>),
 	agentSwitch: undefined as AgentSwitchProps | undefined,
+	stageAttachments: undefined as unknown,
+	settingsReady: undefined as boolean | undefined,
 	workspaceSend: undefined as
 		| undefined
 		| ((text: string, attachments: undefined, clientMessageId: string, excerpts?: ChatDraftExcerptReference[], fileReferences?: ChatFileReference[]) => Promise<unknown>),
@@ -105,6 +113,7 @@ const sideMocks = vi.hoisted(() => ({
 		| ((text: string, attachments: undefined, clientMessageId: string, excerpts?: ChatDraftExcerptReference[], fileReferences?: ChatFileReference[]) => Promise<unknown>),
 	sentOutsideTranscript: Symbol("chat.sentOutsideTranscript"),
 }));
+const stageAttachmentsMock = vi.hoisted(() => vi.fn());
 vi.mock("./IndependentSideChats", () => ({
 	useIndependentSideChats: () => ({ ...sideMocks, panel: null }),
 }));
@@ -153,7 +162,7 @@ vi.mock("../../hooks/useConversation", () => ({
 	}),
 	useConversationModels: vi.fn(() => ({ models: [], loaded: true })),
 	useConversationSkills: vi.fn(() => ({ skills: [] })),
-	useStageAttachments: () => undefined,
+	useStageAttachments: () => stageAttachmentsMock,
 	useWorkspaceFilePaths: () => ({ paths: workspacePathsState.paths, truncated: false }),
 }));
 
@@ -184,6 +193,8 @@ vi.mock("./ChatWorkspace", async () => {
 			onAddToSideChat,
 			onSend,
 			onInterruptSend,
+			onStageAttachments,
+			settingsReady,
 			composerNotice,
 			importBlock,
 			findRequest,
@@ -192,6 +203,8 @@ vi.mock("./ChatWorkspace", async () => {
 			importBlock?: string;
 			onSend: typeof sideMocks.workspaceSend;
 			onInterruptSend?: typeof sideMocks.workspaceInterruptSend;
+			onStageAttachments?: unknown;
+			settingsReady?: boolean;
 			onAddToSideChat?: typeof sideMocks.attach;
 			composerNotice?: ReactNode;
 			findRequest?: { id: string; query: string; messageId?: string };
@@ -215,6 +228,8 @@ vi.mock("./ChatWorkspace", async () => {
 		}) => {
 			sideMocks.workspaceSend = onSend;
 			sideMocks.workspaceInterruptSend = onInterruptSend;
+			sideMocks.stageAttachments = onStageAttachments;
+			sideMocks.settingsReady = settingsReady;
 			sideMocks.attach = onAddToSideChat;
 			sideMocks.agentSwitch = agentSwitch;
 			const [mountedSessionId] = useState(snapshot.sessionId);
@@ -263,6 +278,7 @@ vi.mock("./ChatWorkspace", async () => {
 	};
 });
 
+import { sessionUiKey } from "../../lib/hosts";
 import { SessionChatSurface } from "./SessionChatSurface";
 import {
 	peekSessionSearchReveal,
@@ -304,6 +320,8 @@ beforeEach(() => {
 	sideMocks.agentSwitch = undefined;
 	sideMocks.activeId = "existing-side";
 	sideMocks.attach = undefined;
+	sideMocks.stageAttachments = undefined;
+	sideMocks.settingsReady = undefined;
 	clearCatalogsMock.mockReset();
 	invalidateCatalogsMock.mockReset();
 	conversationState.snapshot = { capabilities: [] };
@@ -328,6 +346,9 @@ afterEach(() => {
 	vi.useRealTimers();
 });
 
+// The skills hook also takes the remembered list; these tests are about gating.
+const catalogCall = (hook: unknown) => (hook as ReturnType<typeof vi.fn>).mock.lastCall?.slice(0, 3);
+
 describe("SessionChatSurface recovery", () => {
 	it.each<[string, WorkspaceSession, boolean]>([
 		["a live session", session, false],
@@ -335,7 +356,34 @@ describe("SessionChatSurface recovery", () => {
 		["a session read as terminated", { ...session, status: "terminated" }, true],
 	])("tells the commands whether %s can only be restored", (_name, target, terminated) => {
 		render(<Wrapper client={new QueryClient()}><SessionChatSurface session={target} /></Wrapper>);
-		expect(conversationCommandArgs.at(-1)).toEqual([target.id, undefined, terminated]);
+		expect(conversationCommandArgs.at(-1)).toEqual([target.id, undefined, terminated, false, undefined]);
+	});
+
+	it("takes files only once an archived session is back", () => {
+		const client = new QueryClient();
+		const view = render(<Wrapper client={client}><SessionChatSurface session={{ ...session, isTerminated: true }} /></Wrapper>);
+		expect(sideMocks.stageAttachments).toBeUndefined();
+		view.rerender(<Wrapper client={client}><SessionChatSurface session={session} /></Wrapper>);
+		expect(sideMocks.stageAttachments).toEqual(expect.any(Function));
+	});
+
+	it("shows an archived chat's saved settings before a message restores it", () => {
+		conversationState.snapshot = { ...snapshotFor(session.id), controller: { state: "stopped" }, settings: { model: "gpt-5" } };
+		const client = new QueryClient();
+		const view = render(<Wrapper client={client}><SessionChatSurface session={session} /></Wrapper>);
+		// A live session's stopped agent has no settings to show.
+		expect(sideMocks.settingsReady).toBe(false);
+		view.rerender(<Wrapper client={client}><SessionChatSurface session={{ ...session, isTerminated: true }} /></Wrapper>);
+		expect(sideMocks.settingsReady).toBe(true);
+	});
+
+	it("tells the commands which turn is active", () => {
+		conversationState.snapshot = {
+			capabilities: [],
+			turns: [{ id: "turn-1", state: "running", requestedAt: "2026-11-16T00:00:00Z" }],
+		};
+		render(<Wrapper client={new QueryClient()}><SessionChatSurface session={session} /></Wrapper>);
+		expect(conversationCommandArgs.at(-1)).toEqual([session.id, undefined, false, true, "turn-1"]);
 	});
 });
 
@@ -557,6 +605,30 @@ describe("SessionChatSurface search reveal", () => {
 		await waitFor(() => expect(screen.getByTestId("annotation-request")).toHaveTextContent("msg-2"));
 		expect(screen.getByTestId("annotation-text")).toHaveTextContent("timeout");
 		expect(peekSessionSearchReveal("sess-1")).toBeUndefined();
+	});
+
+	// A match on another machine is keyed by host and id. This machine's open
+	// session with the same id must not take it, and that machine's session must.
+	it("takes only its own machine's search target", async () => {
+		const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		const remoteKey = sessionUiKey("sess-1", "h_air");
+		requestSessionSearchReveal(remoteKey, { messageId: "msg-remote", text: "flaky", find: true });
+		const local = render(
+			<Wrapper client={client}>
+				<SessionChatSurface session={session} />
+			</Wrapper>,
+		);
+		expect(screen.getByTestId("annotation-request")).not.toHaveTextContent("msg-remote");
+		expect(peekSessionSearchReveal(remoteKey)).toMatchObject({ messageId: "msg-remote" });
+		local.unmount();
+
+		render(
+			<Wrapper client={client}>
+				<SessionChatSurface session={session} hostId="h_air" />
+			</Wrapper>,
+		);
+		await waitFor(() => expect(screen.getByTestId("annotation-request")).toHaveTextContent("msg-remote"));
+		expect(peekSessionSearchReveal(remoteKey)).toBeUndefined();
 	});
 
 	// Main's find in chat (useChatFind) searches the whole history; a result
@@ -1293,13 +1365,13 @@ describe("controller catalogs during an interface handoff", () => {
 		const client = new QueryClient();
 		const { rerender } = render(<Wrapper client={client}><SessionChatSurface session={session} controllerTransitioning /></Wrapper>);
 		for (const hook of [useConversationConfigOptions, useConversationModels, useConversationSkills]) {
-			expect(hook).toHaveBeenLastCalledWith(session.id, false, undefined);
+			expect(catalogCall(hook)).toEqual([session.id, false, undefined]);
 		}
 
 		conversationState.snapshot = { capabilities: ["config_options"], controller: { state: "ready" } };
 		rerender(<Wrapper client={client}><SessionChatSurface session={session} /></Wrapper>);
 		for (const hook of [useConversationConfigOptions, useConversationModels, useConversationSkills]) {
-			expect(hook).toHaveBeenLastCalledWith(session.id, true, undefined);
+			expect(catalogCall(hook)).toEqual([session.id, true, undefined]);
 		}
 	});
 
@@ -1315,18 +1387,18 @@ describe("controller catalogs during an interface handoff", () => {
 		const client = new QueryClient();
 		const { rerender } = render(<Wrapper client={client}><SessionChatSurface session={session} agentResuming /></Wrapper>);
 		for (const hook of [useConversationConfigOptions, useConversationModels, useConversationSkills]) {
-			expect(hook).toHaveBeenLastCalledWith(session.id, false, undefined);
+			expect(catalogCall(hook)).toEqual([session.id, false, undefined]);
 		}
 
 		rerender(<Wrapper client={client}><SessionChatSurface session={{ ...session, needsResume: true }} agentResuming /></Wrapper>);
 		for (const hook of [useConversationConfigOptions, useConversationModels, useConversationSkills]) {
-			expect(hook).toHaveBeenLastCalledWith(session.id, false, undefined);
+			expect(catalogCall(hook)).toEqual([session.id, false, undefined]);
 		}
 
 		conversationState.snapshot = { capabilities: ["config_options"], controller: { state: "ready" } };
 		rerender(<Wrapper client={client}><SessionChatSurface session={{ ...session, needsResume: true }} agentResuming /></Wrapper>);
 		for (const hook of [useConversationConfigOptions, useConversationModels, useConversationSkills]) {
-			expect(hook).toHaveBeenLastCalledWith(session.id, true, undefined);
+			expect(catalogCall(hook)).toEqual([session.id, true, undefined]);
 		}
 	});
 
@@ -1334,7 +1406,7 @@ describe("controller catalogs during an interface handoff", () => {
 		conversationState.snapshot = { capabilities: ["config_options"], controller: { state: "stopped" } };
 		render(<Wrapper client={new QueryClient()}><SessionChatSurface session={session} /></Wrapper>);
 		for (const hook of [useConversationConfigOptions, useConversationModels, useConversationSkills]) {
-			expect(hook).toHaveBeenLastCalledWith(session.id, false, undefined);
+			expect(catalogCall(hook)).toEqual([session.id, false, undefined]);
 		}
 	});
 });
@@ -1399,24 +1471,22 @@ describe("SessionChatSurface continuation identity", () => {
 
 describe("side command routing", () => {
 	beforeEach(() => {
-		useUiStore.setState({ developerMode: true, sideChats: true });
+		// Developer mode stays off: side chats do not depend on it.
+		useUiStore.setState({ developerMode: false });
 		conversationState.snapshot = { ...conversationState.snapshot, capabilities: ["resume", "interrupt_send"] };
-	});
-	afterEach(() => {
-		useUiStore.setState({ developerMode: false, sideChats: false });
 	});
 
 	it.each([
-		["side chats are off", { developerMode: true, sideChats: false }, "codex"],
-		["Developer mode is off", { developerMode: false, sideChats: true }, "codex"],
-	] as const)("sends /btw to the main chat when %s", async (_case, flags, provider) => {
-		useUiStore.setState(flags);
+		["the harness cannot resume", [], undefined],
+		["the session is on another machine", ["resume"], "h_air"],
+	] as const)("sends /btw to the main chat when %s", async (_case, capabilities, hostId) => {
+		conversationState.snapshot = { ...conversationState.snapshot, capabilities: [...capabilities] };
 		sideMocks.create.mockReset();
 		const mainSend = conversationCommandState.send;
 		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 		render(
 			<Wrapper client={queryClient}>
-				<SessionChatSurface session={{ ...session, provider }} />
+				<SessionChatSurface session={{ ...session, provider: "codex" }} hostId={hostId} />
 			</Wrapper>,
 		);
 		await act(async () => {
@@ -1424,6 +1494,35 @@ describe("side command routing", () => {
 		});
 		expect(sideMocks.create).not.toHaveBeenCalled();
 		expect(mainSend).toHaveBeenCalledWith(expect.objectContaining({ text: "/btw what is this?", clientMessageId: "submission-main" }));
+	});
+
+	it("reports whether the session has side chats, and is creating one, only once their list has loaded", () => {
+		const onSideChatsChange = vi.fn();
+		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+		const surface = () => (
+			<Wrapper client={queryClient}>
+				{/* A fresh session object rerenders the memoized surface. */}
+				<SessionChatSurface session={{ ...session }} onSideChatsChange={onSideChatsChange} />
+			</Wrapper>
+		);
+		try {
+			const view = render(surface());
+			expect(onSideChatsChange).not.toHaveBeenCalled();
+			sideMocks.loaded = true;
+			view.rerender(surface());
+			expect(onSideChatsChange).toHaveBeenLastCalledWith({ present: false, creating: false });
+			sideMocks.pending = true;
+			view.rerender(surface());
+			expect(onSideChatsChange).toHaveBeenLastCalledWith({ present: false, creating: true });
+			sideMocks.pending = false;
+			sideMocks.sides = [{ id: "side-1", hasWork: false }];
+			view.rerender(surface());
+			expect(onSideChatsChange).toHaveBeenLastCalledWith({ present: true, creating: false });
+		} finally {
+			sideMocks.loaded = false;
+			sideMocks.pending = false;
+			sideMocks.sides = [];
+		}
 	});
 
 	it.each(["workspaceSend", "workspaceInterruptSend"] as const)(
@@ -1502,10 +1601,13 @@ describe("side command routing", () => {
 		expect(conversationCommandState.send).not.toHaveBeenCalled();
 	});
 
-	it("keeps /btw as an interrupting provider command when side chats are disabled", async () => {
-		useUiStore.setState({ sideChats: false });
+	it.each([
+		["the harness cannot resume", ["interrupt_send"], undefined],
+		["the session is on another machine", ["resume", "interrupt_send"], "h_air"],
+	] as const)("keeps /btw as an interrupting provider command when %s", async (_case, capabilities, hostId) => {
+		conversationState.snapshot = { ...conversationState.snapshot, capabilities: [...capabilities] };
 		sideMocks.create.mockReset();
-		render(<Wrapper client={new QueryClient()}><SessionChatSurface session={session} /></Wrapper>);
+		render(<Wrapper client={new QueryClient()}><SessionChatSurface session={session} hostId={hostId} /></Wrapper>);
 		await act(async () => {
 			await sideMocks.workspaceInterruptSend!("/btw explain this", undefined, "provider-interrupt");
 		});
@@ -1573,7 +1675,6 @@ describe("SessionChatSurface startup recovery", () => {
 describe("selection side-chat operation ownership", () => {
 	const excerpt: ChatDraftExcerptReference = { id: "selection-operation", conversationId: "conv-sess-1", messageId: "message", revision: 1, text: "selected text", role: "assistant" };
 	function mount() {
-		useUiStore.setState({ developerMode:true, sideChats:true });
 		conversationState.snapshot = { ...snapshotFor(session.id), capabilities:["resume"] };
 		sideMocks.create.mockReset(); sideMocks.addReference.mockReset(); sideMocks.show.mockReset();
 		sideMocks.activeId = undefined; sideMocks.sides = [];

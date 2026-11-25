@@ -64,12 +64,15 @@ func TestSettleOpenItemsUsesStableSnapshots(t *testing.T) {
 			messages:       map[string]string{"a": "first", "b": "before"},
 			thoughts:       map[string]string{"thought": "before"},
 			nestedMessages: map[string]nestedMessageState{"nested": {text: "before", parentID: "parent"}},
-			tools:          map[string]*toolState{"tool": {id: "tool", title: "before", status: acpsdk.ToolCallStatusInProgress}},
-			events:         make(chan ports.ChatEvent),
-			log:            slog.New(slog.DiscardHandler),
+			tools: map[string]*toolState{
+				"tool":     {id: "tool", title: "before", status: acpsdk.ToolCallStatusInProgress},
+				"finished": {id: "finished", status: acpsdk.ToolCallStatusInProgress},
+			},
+			events: make(chan ports.ChatEvent),
+			log:    slog.New(slog.DiscardHandler),
 		}
 		go func() {
-			conv.settleOpenItems("turn")
+			conv.settleOpenItems("turn", nil)
 			close(conv.events)
 		}()
 		// Stop at the first event, after the settlement snapshot was taken.
@@ -80,7 +83,7 @@ func TestSettleOpenItemsUsesStableSnapshots(t *testing.T) {
 		conv.thoughts["late"] = "after"
 		conv.nestedMessages["nested"] = nestedMessageState{text: "after", parentID: "other"}
 		conv.tools["tool"].title = "after"
-		conv.tools["tool"].status = acpsdk.ToolCallStatusCompleted
+		conv.tools["finished"].status = acpsdk.ToolCallStatusCompleted
 		conv.mu.Unlock()
 
 		got := make(map[string]string)

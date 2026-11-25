@@ -20,7 +20,7 @@ import (
 // Four statements keep a turn only when the active lineage holds one of its
 // messages or activities at or before the fork point. The fork's indexes let
 // that EXISTS seek by globally unique turn_id and sequence. Without those
-// indexes, the conversation_id bound lets it seek the conversation's range.
+// indexes, it can seek upstream's turn_id indexes or the conversation's range.
 // Neither path may scan unrelated turns or conversations. The SQL must retain
 // both conversation_id bounds regardless of the index chosen.
 const (
@@ -320,7 +320,8 @@ func TestLineageTurnQueriesAreBoundByConversation(t *testing.T) {
 						}
 						found = true
 						conversationSeek := strings.Contains(line, "(conversation_id=?")
-						turnSeek := strings.Contains(line, "(turn_id=? AND sequence<?)") || strings.Contains(line, "(turn_id=?)")
+						// An AUTOMATIC index on turn_id is built by reading the whole table.
+						turnSeek := (strings.Contains(line, "(turn_id=? AND sequence<?)") || strings.Contains(line, "(turn_id=?)")) && !strings.Contains(line, "AUTOMATIC")
 						if !strings.HasPrefix(line, "SEARCH "+table+" ") || (!conversationSeek && !turnSeek) || strings.Contains(line, "ANY(") {
 							t.Errorf("%s does not seek by conversation or turn: %q\nfull plan:\n%s", table, line, plan)
 						}

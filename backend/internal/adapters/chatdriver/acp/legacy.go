@@ -35,6 +35,7 @@ type legacyACPTransport struct {
 	reader                *io.PipeReader
 	updateProcessed       <-chan string
 	streamDone            <-chan struct{}
+	asyncTask             func(json.RawMessage) bool
 	toolCallToRPCID       map[string]string
 	latestPermissionRPCID string
 	pendingAnswers        map[string]map[string]string
@@ -78,6 +79,7 @@ type legacyACPEnvelope struct {
 	Method  string               `json:"method,omitempty"`
 	Result  json.RawMessage      `json:"result,omitempty"`
 	Error   *acpsdk.RequestError `json:"error,omitempty"`
+	Params  json.RawMessage      `json:"params,omitempty"`
 }
 
 const localNotificationBarrierMethod = "_ao/local_notification_barrier"
@@ -115,6 +117,12 @@ func (t *legacyACPTransport) forward(source io.Reader) {
 		var intercepted bool
 		if decoded {
 			intercepted = t.interceptEnvelope(notification, line)
+			// Only native async-task notifications bypass the SDK. Ordinary
+			// frames retain their bytes and the ordered acknowledgment barrier.
+			if !intercepted && notification.ID == nil && notification.Method == acpsdk.ClientMethodSessionUpdate &&
+				t.asyncTask != nil && bytes.Contains(notification.Params, []byte("async_task")) {
+				intercepted = t.asyncTask(notification.Params)
+			}
 		} else {
 			// Legacy responses historically ignore unrelated malformed envelope fields.
 			intercepted = t.intercept(line)

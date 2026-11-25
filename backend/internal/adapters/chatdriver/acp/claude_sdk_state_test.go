@@ -20,6 +20,7 @@ func TestClaudeSDKIdleSettlesOnlyTurnlessOutput(t *testing.T) {
 		t.Run(fmt.Sprint(active), func(t *testing.T) {
 			conv, _ := replayBoundaryConversation(t)
 			conv.mu.Lock()
+			conv.providerReportsState = true
 			if !active {
 				conv.activeTurn = ""
 			}
@@ -62,6 +63,7 @@ func TestBackgroundReplySurvivesNextPromptAndUsesDistinctFallbackIDs(t *testing.
 	conv, _ := replayBoundaryConversation(t)
 	conv.mu.Lock()
 	conv.activeTurn = ""
+	conv.providerReportsState = true
 	conv.mu.Unlock()
 	var previousID string
 	for range 2 {
@@ -75,12 +77,14 @@ func TestBackgroundReplySurvivesNextPromptAndUsesDistinctFallbackIDs(t *testing.
 			t.Fatalf("background cycles share a message identity: %+v", delta)
 		}
 		previousID = delta.ProviderItemID
-		// A new prompt resets only its own buffers. A trailing SDK idle must
-		// still settle the background reply, never the new prompt's output.
+		// Detach before resetting buffers, as StartDeferredTurn does. A trailing
+		// SDK idle must never settle the new prompt's output.
 		conv.mu.Lock()
+		ended := conv.detachProviderCycleLocked()
 		conv.activeTurn = "next-turn"
 		conv.messages = map[string]string{"next-message": "still working"}
 		conv.mu.Unlock()
+		conv.settleEndedCycle(ended)
 		if err := conv.handleClaudeSDKMessage([]byte(`{"sessionId":"review-session","message":{"type":"system","subtype":"session_state_changed","state":"idle"}}`)); err != nil {
 			t.Fatal(err)
 		}
@@ -102,6 +106,7 @@ func TestNextPromptFinalizesBackgroundReplyBeforeStarting(t *testing.T) {
 	conv, _ := replayBoundaryConversation(t)
 	conv.mu.Lock()
 	conv.activeTurn = ""
+	conv.providerReportsState = true
 	conv.prepared = &preparedTurn{id: "next-turn"}
 	conv.mu.Unlock()
 	if err := conv.processUpdate(acpsdk.SessionNotification{
@@ -120,6 +125,48 @@ func TestNextPromptFinalizesBackgroundReplyBeforeStarting(t *testing.T) {
 	}
 	if event := nextEvent(t, conv.Events()); event.Kind != ports.ChatEventTurnStarted || event.ProviderTurnID != "next-turn" {
 		t.Fatalf("prompt start was reordered: %+v", event)
+	}
+}
+
+func TestBackgroundReplyRetainsReceiptIdentityAcrossAttachments(t *testing.T) {
+	for _, scope := range []string{"", "provider-scope"} {
+		t.Run(scope, func(t *testing.T) {
+			for range 2 {
+				conv, _ := replayBoundaryConversation(t)
+				conv.mu.Lock()
+				conv.activeTurn = ""
+				conv.providerReportsState = true
+				conv.providerScopeID = scope
+				conv.mu.Unlock()
+				// Reasoning can open the cycle before its first assistant message.
+				if err := conv.processUpdate(acpsdk.SessionNotification{
+					SessionId: "review-session", Meta: map[string]any{persistenthost.ACPEventIDMetaKey: "reasoning-receipt"},
+					Update: acpsdk.UpdateAgentThoughtText("checking"),
+				}); err != nil {
+					t.Fatal(err)
+				}
+				_ = nextEvent(t, conv.Events())
+				_ = nextEvent(t, conv.Events())
+				if err := conv.processUpdate(acpsdk.SessionNotification{
+					SessionId: "review-session", Meta: map[string]any{persistenthost.ACPEventIDMetaKey: "message-receipt"},
+					Update: acpsdk.UpdateAgentMessageText("retained tail"),
+				}); err != nil {
+					t.Fatal(err)
+				}
+				delta := nextEvent(t, conv.Events())
+				if delta.Kind != ports.ChatEventMessageDelta || delta.ProviderItemID != conv.providerItemID("background-message-receipt") ||
+					delta.ProviderEventID != "message-receipt:0" || delta.ProviderTurnID != "" {
+					t.Fatalf("host replay identity changed: %+v", delta)
+				}
+				if err := conv.handleClaudeSDKMessage([]byte(`{"sessionId":"review-session","message":{"type":"system","subtype":"session_state_changed","state":"idle"}}`)); err != nil {
+					t.Fatal(err)
+				}
+				settled := nextEvent(t, conv.Events())
+				if settled.Kind != ports.ChatEventMessageCompleted || settled.ProviderItemID != delta.ProviderItemID || settled.Text != "" {
+					t.Fatalf("replayed tail could overwrite the durable prefix: %+v", settled)
+				}
+			}
+		})
 	}
 }
 
